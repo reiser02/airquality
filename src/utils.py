@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from lightgbm import LGBMRegressor
+from sktime.forecasting.compose import make_reduction
 
 class UnsupportedFileFormatError(Exception):
     """Exception raised when the file format is not supported."""
