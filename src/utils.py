@@ -70,7 +70,7 @@ def load_to_df(file_path: str, name_from_path: bool = True) -> Optional[pd.DataF
         return None
     
 
-def apply_symmetric_gaps(df, num_gaps, size_k):
+def apply_symmetric_gaps(df: pd.DataFrame, num_gaps: int, size_k: int) -> pd.DataFrame:
     """
     Applies symmetric gaps (NaN values) to a DataFrame at random non-overlapping positions.
     """
@@ -110,7 +110,7 @@ def apply_symmetric_gaps(df, num_gaps, size_k):
     return df_noisy
 
 
-def impute_prophet(series):
+def impute_prophet(series: pd.Series) -> pd.Series:
     forecaster = Prophet(
         add_country_holidays={"country_name": "Spain"},
         yearly_seasonality=False,
@@ -144,7 +144,7 @@ def impute_prophet(series):
     return series
 
 
-def impute_iterative(df):
+def impute_iterative(df: pd.DataFrame) -> pd.DataFrame:
     # Save indices and columns
     cols = df.columns
     idx = df.index
@@ -163,7 +163,7 @@ def impute_iterative(df):
     return df_imputed
 
 
-def impute_lgbm(series, window_length=10):
+def impute_lgbm(series: pd.Series, window_length:int = 10) -> pd.Series:
     y_train = series.dropna()
     
     if len(y_train) < (window_length * 2):
