@@ -215,3 +215,13 @@ def impute_lgbm(series: pd.Series, window_length:int = 10) -> pd.Series:
         return series
         
     return series
+
+
+def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Calculate the Symmetric Mean Absolute Percentage Error.
+    """
+    return np.mean(
+        2 * np.abs(y_pred - y_true) /
+        (np.abs(y_true) + np.abs(y_pred) + 1e-8)
+    ) * 100
