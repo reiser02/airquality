@@ -109,13 +109,16 @@ def get_longest_segment(df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame
             print(f"Estación {df.columns.values[0]}:")
             print(f"Range: {df_copy.index.min()} to {df_copy.index.max()}")
             print(f"Total time points recovered: {len(df_copy)}")
-            print("-" * 40)
 
     return df_copy
 
 
 
-def apply_symmetric_gaps(df: pd.DataFrame, num_gaps: int, size_k: int) -> pd.DataFrame:
+def apply_symmetric_gaps(df: pd.DataFrame, 
+                         num_gaps: int, 
+                         size_k: int,
+                         rng: np.random.Generator
+                         ) -> pd.DataFrame:
     """
     Applies symmetric gaps (NaN values) to a DataFrame at random non-overlapping positions.
     """
@@ -138,7 +141,7 @@ def apply_symmetric_gaps(df: pd.DataFrame, num_gaps: int, size_k: int) -> pd.Dat
         if not possible_indices:
             break
             
-        new_start = np.random.choice(possible_indices)
+        new_start = rng.choice(possible_indices)
         start_points.append(new_start)
         
         # REMOVE nearby indices to avoid overlap
