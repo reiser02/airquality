@@ -70,6 +70,51 @@ def load_to_df(file_path: str, name_from_path: bool = True) -> Optional[pd.DataF
         return None
     
 
+def get_longest_segment(df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
+    """
+    Identifies and returns the longest continuous period of non-null values
+
+    Args:
+        df (pd.DataFrame): A DataFrame (typically with a DatetimeIndex) containing 
+            the time series data.
+        verbose (bool): If True, prints a summary including the station name, 
+            the date range of the recovered segment, and the total points found.
+
+    Returns:
+        pd.DataFrame: A new DataFrame containing only the longest continuous 
+            block of valid data.
+    """
+    df_copy = df.copy().sort_index().asfreq('h')
+
+    # Calculate the maximum level of real coincidence
+    # Counts how many columns have a real value (not NaN) in each row
+    coincidence_count = df_copy.notna().sum(axis=1)
+    max_coincidences = int(coincidence_count.max())
+
+    # Create a mask for rows that meet the requirement
+    valid_rows = (coincidence_count == max_coincidences)
+
+    # Identify continuous blocks
+    # We compare each row with the previous one to see where a block starts/ends
+    blocks = (valid_rows != valid_rows.shift()).cumsum()
+    valid_blocks = blocks[valid_rows]
+
+    # Find the longest block
+    longest_block_id = valid_blocks.value_counts().idxmax()
+
+    # Extract that block
+    df_copy = df_copy.loc[blocks == longest_block_id].copy()
+
+    if verbose:
+            print(f"Estación {df.columns.values[0]}:")
+            print(f"Range: {df_copy.index.min()} to {df_copy.index.max()}")
+            print(f"Total time points recovered: {len(df_copy)}")
+            print("-" * 40)
+
+    return df_copy
+
+
+
 def apply_symmetric_gaps(df: pd.DataFrame, num_gaps: int, size_k: int) -> pd.DataFrame:
     """
     Applies symmetric gaps (NaN values) to a DataFrame at random non-overlapping positions.
