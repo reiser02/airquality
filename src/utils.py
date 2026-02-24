@@ -70,47 +70,105 @@ def load_to_df(file_path: str, name_from_path: bool = True) -> Optional[pd.DataF
         return None
     
 
-def get_longest_segment(df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
+def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: float = 0.6, w_row: float = 0.4, verbose: bool = True) -> pd.DataFrame:
     """
-    Identifies and returns the longest continuous period of non-null values
+    Identifies and returns the optimal continuous segment of non-null values based on a weighted score or a mandatory end-point.
 
     Args:
-        df (pd.DataFrame): A DataFrame (typically with a DatetimeIndex) containing 
-            the time series data.
-        verbose (bool): If True, prints a summary including the station name, 
-            the date range of the recovered segment, and the total points found.
+        dfs (list[pd.DataFrame]): A list of DataFrames to be concatenated and analyzed.
+        force_end (bool): If True, only considers the continuous block connected to 
+            the most recent timestamp. If False, searches for the best segment 
+            anywhere in the timeline.
+        w_col (float): Weight assigned to the number of columns (width) when 
+            calculating the segment score. Defaults to 0.6.
+        w_row (float): Weight assigned to the number of rows (length) when 
+            calculating the segment score. Defaults to 0.4.
+        verbose (bool): If True, prints a summary of the winning segment's 
+            dimensions, recovered columns, and date range.
 
     Returns:
-        pd.DataFrame: A new DataFrame containing only the longest continuous 
-            block of valid data.
+        pd.DataFrame: A DataFrame containing the selected continuous block of 
+            valid data and its corresponding complete columns.
     """
-    df_copy = df.copy().sort_index().asfreq('h')
 
-    # Calculate the maximum level of real coincidence
-    # Counts how many columns have a real value (not NaN) in each row
-    coincidence_count = df_copy.notna().sum(axis=1)
-    max_coincidences = int(coincidence_count.max())
+    df_concat = (
+        pd.concat(dfs, axis=1, join='outer')
+        .sort_index()
+        .asfreq('h')
+    )
 
-    # Create a mask for rows that meet the requirement
-    valid_rows = (coincidence_count == max_coincidences)
+    if force_end:
+        # Last timestamp
+        last_time = df_concat.index.max()
 
-    # Identify continuous blocks
-    # We compare each row with the previous one to see where a block starts/ends
-    blocks = (valid_rows != valid_rows.shift()).cumsum()
-    valid_blocks = blocks[valid_rows]
+        # Non-NaN columns at the last timestamp
+        active_cols = df_concat.loc[last_time].dropna().index
 
-    # Find the longest block
-    longest_block_id = valid_blocks.value_counts().idxmax()
+        # Mask for valid rows
+        valid_rows = df_concat[active_cols].notna().all(axis=1)
 
-    # Extract that block
-    df_copy = df_copy.loc[blocks == longest_block_id].copy()
+        # Continuous blocks
+        blocks = (valid_rows != valid_rows.shift()).cumsum()
 
-    if verbose:
-            print(f"Estación {df.columns.values[0]}:")
-            print(f"Range: {df_copy.index.min()} to {df_copy.index.max()}")
-            print(f"Total time points recovered: {len(df_copy)}")
+        # Identify the block containing the last timestamp
+        last_block_id = blocks.loc[last_time]
 
-    return df_copy
+        # Extract block
+        best_df = df_concat.loc[blocks == last_block_id, active_cols].copy()
+
+        if verbose:
+            print(f"Number of matching series: {best_df.shape[1]}")
+            print(f"Range: {best_df.index.min()} to {best_df.index.max()}")
+            print(f"Total time points recovered: {len(best_df)}")
+
+        return best_df
+    else:
+        # Pre-calculate data presence
+        coincidence_count = df_concat.notna().sum(axis=1)
+        max_possible_cols = int(coincidence_count.max())
+        
+        best_score = 0
+        best_df = pd.DataFrame()
+
+        # Search for the best compromise
+        for n_cols in range(1, max_possible_cols + 1):
+            # Filter rows that have at least 'n_cols'
+            valid_mask = (coincidence_count >= n_cols)
+            
+            if not valid_mask.any():
+                continue
+                
+            # Group continuous blocks
+            blocks = (valid_mask != valid_mask.shift()).cumsum()
+            valid_blocks = blocks[valid_mask]
+            
+            # Iterate through each continuous block found for this n_cols
+            for block_id in valid_blocks.unique():
+                df_block = df_concat.loc[blocks == block_id]
+                
+                # KEY IDENTIFICATION: 
+                # Keep only columns that are 100% complete in this block
+                complete_cols = df_block.columns[df_block.notna().all()]
+                
+                # If the number of complete columns is >= our current requirement
+                actual_n_cols = len(complete_cols)
+                actual_rows = len(df_block)
+                score = (actual_n_cols ** w_col) * (actual_rows ** w_row)
+                
+                if score > best_score:
+                    best_score = score
+                    # Return only the columns that won the consensus
+                    best_df = df_block[complete_cols].copy()
+
+        if verbose and not best_df.empty:
+            print(f"--- Winning Segment ---")
+            print(f"Dimensions: {best_df.shape[0]} rows x {best_df.shape[1]} columns")
+            print(f"Recovered columns: {list(best_df.columns)}")
+            print(f"Range: {best_df.index.min()} to {best_df.index.max()}")
+            print(f"Score (Total area): {best_score}")
+            print(f"------------------------")
+        
+        return best_df
 
 
 
