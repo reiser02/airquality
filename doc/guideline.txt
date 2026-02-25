@@ -1,0 +1,19 @@
+1- Contexto: 
+	- Definición de Smart city
+	- Problemática de air quality e impacto en la sociedad 
+	- Definición de low-cost air quality stations y la necesidad de monitorización de grano fino a nivel de localización
+	- Problemas asociados a los sensores low-cost
+
+2- Related work 
+	- Preparación de datos y predicción basada en low-cost sensors 
+
+3- Scope y objetivos 
+	- Basado en el related work, definir los objetivos del TFG 
+
+4- Descripción de tecnologías implicadas: introducir cada tecnología con referencias (no tiene que ser muy extenso, máx 1 página por tecnología). 
+
+5- El trabajo del TFG: 
+	- Introducción y organización de las siguientes subsecciones 
+	- Para cada sistema hecho, introducción, esquema, resultados y evaluación. 
+
+6- Conclusiones generales y future work.   
