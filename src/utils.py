@@ -77,7 +77,7 @@ def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: 
     Args:
         dfs (list[pd.DataFrame]): A list of DataFrames to be concatenated and analyzed.
         force_end (bool): If True, only considers the continuous block connected to 
-            the most recent timestamp. If False, searches for the best segment 
+            the most recent timestamp. If False, searches for the best segment Added weights to prioritize more columns or more rows in global search.
             anywhere in the timeline.
         w_col (float): Weight assigned to the number of columns (width) when 
             calculating the segment score. Defaults to 0.6.
@@ -120,8 +120,6 @@ def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: 
             print(f"Number of matching series: {best_df.shape[1]}")
             print(f"Range: {best_df.index.min()} to {best_df.index.max()}")
             print(f"Total time points recovered: {len(best_df)}")
-
-        return best_df
     else:
         # Pre-calculate data presence
         coincidence_count = df_concat.notna().sum(axis=1)
@@ -168,7 +166,7 @@ def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: 
             print(f"Score (Total area): {best_score}")
             print(f"------------------------")
         
-        return best_df
+    return best_df
 
 
 
@@ -213,7 +211,7 @@ def apply_symmetric_gaps(df: pd.DataFrame,
     for start in start_points:
         df_noisy.iloc[start : start + size_k, :] = np.nan
         
-    return df_noisy
+    return df_noisy, start_points
 
 
 def impute_prophet(series: pd.Series) -> pd.Series:
