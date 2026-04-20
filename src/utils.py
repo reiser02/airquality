@@ -11,8 +11,7 @@ from sktime.forecasting.fbprophet import Prophet
 from sklearn.preprocessing import StandardScaler
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from lightgbm import LGBMRegressor
-from sktime.forecasting.compose import make_reduction
+
 
 class UnsupportedFileFormatError(Exception):
     """Exception raised when the file format is not supported."""
@@ -170,48 +169,6 @@ def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: 
 
 
 
-def apply_symmetric_gaps(df: pd.DataFrame, 
-                         num_gaps: int, 
-                         size_k: int,
-                         rng: np.random.Generator
-                         ) -> pd.DataFrame:
-    """
-    Applies symmetric gaps (NaN values) to a DataFrame at random non-overlapping positions.
-    """
-    df_noisy = df.copy()
-    n = len(df_noisy)
-    
-    # Define margins and distances
-    # margin: distance to the dataset boundaries
-    # min_separation: distance between the end of one gap and the start of the next
-    margin = size_k + 20
-    min_separation = size_k + 5 
-    
-    possible_indices = list(range(margin, n - margin - size_k))
-    start_points = []
-    
-    # Selection of points without overlapping
-    # Attempt to find points until reaching num_gaps or running out of options
-    attempts = 0
-    while len(start_points) < num_gaps and attempts < 1000:
-        if not possible_indices:
-            break
-            
-        new_start = rng.choice(possible_indices)
-        start_points.append(new_start)
-        
-        # REMOVE nearby indices to avoid overlap
-        # Delete all indices that would cause the next gap 
-        # to be too close to the one just created
-        forbidden_zone = range(new_start - min_separation, new_start + min_separation)
-        possible_indices = [i for i in possible_indices if i not in forbidden_zone]
-        attempts += 1
-
-    # Apply the gaps
-    for start in start_points:
-        df_noisy.iloc[start : start + size_k, :] = np.nan
-        
-    return df_noisy, start_points
 
 
 def impute_prophet(series: pd.Series) -> pd.Series:
