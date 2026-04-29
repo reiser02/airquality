@@ -35,7 +35,7 @@ def get_prediction_time_window(
 def plot_predictions_by_gap(
     plot_store: dict[int, dict[str, Any]],
     series_name: str = "all",
-    show_naive_mase_plot: bool = True,
+    show_naive_mase_plot: bool = False,
     grid_by_gap: bool = False,
     grid_n_cols: int = 2,
     grid_cell_width: float = 7.5,
@@ -179,7 +179,7 @@ def plot_predictions_by_gap(
                     ps.values,
                     lw=1.2,
                     label=label,
-                    style="points" if render_style == "mixed" else render_style,
+                    style="points",
                 )
                 if render_style == "mixed" and len(gap_real) > 0:
                     common_idx = gap_real.index.intersection(ps.index)
@@ -301,7 +301,7 @@ def plot_predictions_by_method_grid(
     Grafica un grid por metodo con una serie de test por subplot.
 
     Soporta dos formatos de `plot_store`:
-    1) Formato por gap (legacy):
+    1) Formato por gap (benchmark de imputacion):
        {gap: {"series": {serie: {"actual":..., "preds": {metodo: pred}}}}}
     2) Formato por metodo (execute_complete_pipeline actual):
        {metodo: {serie: {"actual":..., "prediction":...}}}
@@ -365,6 +365,15 @@ def plot_predictions_by_method_grid(
 
         actual_clean = actual.dropna()
         pred_clean = pred.dropna()
+        mae_value = float("nan")
+
+        aligned_idx = actual_clean.index.intersection(pred_clean.index)
+        if len(aligned_idx) > 0:
+            y_true = actual_clean.reindex(aligned_idx).to_numpy(dtype=float)
+            y_pred = pred_clean.reindex(aligned_idx).to_numpy(dtype=float)
+            valid = np.isfinite(y_true) & np.isfinite(y_pred)
+            if np.any(valid):
+                mae_value = float(np.mean(np.abs(y_true[valid] - y_pred[valid])))
 
         if len(pred_clean) > 0:
             pred_start = pd.Timestamp(pred_clean.index.min())
@@ -435,9 +444,14 @@ def plot_predictions_by_method_grid(
             )
 
         if gap is None:
-            ax.set_title(f"Serie: {serie}")
+            title = f"Serie: {serie}"
         else:
-            ax.set_title(f"Serie: {serie} | Gap={gap}")
+            title = f"Serie: {serie} | Gap={gap}"
+
+        if np.isfinite(mae_value):
+            title = f"{title} | MAE={mae_value:.3f}"
+
+        ax.set_title(title)
         ax.set_xlabel("Tiempo")
         ax.set_ylabel("NO2")
         ax.legend(loc="best")
