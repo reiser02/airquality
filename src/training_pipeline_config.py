@@ -11,7 +11,6 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
 from darts.models import (
-    Chronos2Model,
     DLinearModel,
     LinearRegressionModel,
     NHiTSModel,
