@@ -4,20 +4,34 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
-import numpy as np
-import warnings
-import logging
-from sktime.forecasting.fbprophet import Prophet
-from sklearn.preprocessing import StandardScaler
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer
+from airquality.config import cfg_get_str
+
 
 
 class UnsupportedFileFormatError(Exception):
     """Exception raised when the file format is not supported."""
     pass
 
-def load_dataset_paths(base_path: str = "../../data/*/", key_word: str = "CO_media_horaria", file_extension: str = "json") -> List[str]:
+
+def ensure_datetime_series(series: pd.Series, *, freq: str, name: str) -> pd.Series:
+    """Validate and normalize one pandas series to a regular datetime grid."""
+    if not isinstance(series, pd.Series):
+        raise TypeError(f"La serie '{name}' debe ser pd.Series; recibido: {type(series)}")
+    if not isinstance(series.index, pd.DatetimeIndex):
+        raise TypeError(f"La serie '{name}' debe tener DatetimeIndex")
+
+    out = series.sort_index().copy()
+    out = out[~out.index.duplicated(keep="last")]
+    out = out.asfreq(freq)
+    out.name = str(series.name) if series.name is not None else name
+    return out.astype(float)
+
+
+def load_dataset_paths(
+    base_path: str = cfg_get_str("data", "base_path_glob", "../../data/*/"),
+    key_word: str = cfg_get_str("data", "key_word", "CO_media_horaria"),
+    file_extension: str = cfg_get_str("data", "file_extension", "json"),
+) -> List[str]:
     """
     Search for files in the base_path whose names include key_word 
     and return a list of paths.
@@ -69,7 +83,7 @@ def load_to_df(file_path: str, name_from_path: bool = True) -> Optional[pd.DataF
         return None
     
 
-def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: float = 0.6, w_row: float = 0.4, verbose: bool = True) -> pd.DataFrame:
+def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = False, w_col: float = 0.6, w_row: float = 0.4, verbose: bool = False) -> pd.DataFrame:
     """
     Identifies and returns the optimal continuous segment of non-null values based on a weighted score or a mandatory end-point.
 
@@ -166,123 +180,3 @@ def get_longest_segment(dfs: list[pd.DataFrame], force_end: bool = True, w_col: 
             print(f"------------------------")
         
     return best_df
-
-
-
-
-
-def impute_prophet(series: pd.Series) -> pd.Series:
-    forecaster = Prophet(
-        add_country_holidays={"country_name": "Spain"},
-        yearly_seasonality=False,
-        weekly_seasonality=True,
-        daily_seasonality=True,
-        verbose=False
-    )
-    
-    # Train with known data (removing NaNs)
-    # y_train maintains the original index
-    y_train = series.dropna()
-    
-    if len(y_train) < 2: # Avoid errors if there are too many gaps
-        return series
-    
-    logging.getLogger('prophet').setLevel(logging.ERROR)
-    forecaster.fit(y_train)
-    
-    # Identify missing points (NaNs)
-    missing_points = series[series.isna()].index
-    
-    if not missing_points.empty:
-        # Predict for those points
-        y_pred = forecaster.predict(fh=missing_points)
-        
-        # Combine: original values + predictions in the gaps
-        imputed_series = series.copy()
-        imputed_series.update(y_pred)
-        return imputed_series
-    
-    return series
-
-
-def impute_iterative(df: pd.DataFrame) -> pd.DataFrame:
-    # Save indices and columns
-    cols = df.columns
-    idx = df.index
-    
-    # Normalize
-    scaler = StandardScaler()
-    df_scaled = pd.DataFrame(scaler.fit_transform(df), columns=cols, index=idx)
-    
-    # Impute
-    imputer = IterativeImputer(max_iter=10, random_state=42)
-    df_imputed_scaled = pd.DataFrame(imputer.fit_transform(df_scaled), columns=cols, index=idx)
-    
-    # Denormalize
-    df_imputed = pd.DataFrame(scaler.inverse_transform(df_imputed_scaled), columns=cols, index=idx)
-    
-    return df_imputed
-
-
-def impute_lgbm(series: pd.Series, window_length:int = 10) -> pd.Series:
-    y_train = series.dropna()
-    
-    if len(y_train) < (window_length * 2):
-        return series
-    
-    # Index reconstruction for sktime
-    # Create a simple integer index (0, 1, 2...) for training.
-    # This avoids issues with hourly frequency and NaNs,
-    # allowing LightGBM to learn only from the value sequence.
-    y_train_idx = y_train.copy()
-    y_train_idx.index = range(len(y_train))
-    
-    try:
-        regressor = LGBMRegressor(
-            n_estimators=100,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=616,
-            verbosity=-1,
-            n_jobs=1
-        )
-        
-        # We use strategy="recursive". Sktime will treat the integer index
-        # as time steps (t, t+1, t+2...)
-        forecaster = make_reduction(regressor, window_length=window_length, strategy="recursive")
-        forecaster.fit(y_train_idx)
-        
-        # Identify missing points and their locations
-        missing_points = series[series.isna()].index
-        
-        if not missing_points.empty:
-            # To predict, we need to tell sktime how many steps into the future to look.
-            # fh (forecasting horizon) relative to the end of y_train_idx
-            fh = list(range(1, len(missing_points) + 1))
-            
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-                y_pred = forecaster.predict(fh=fh)
-            
-            # Reassign predicted values to original indices (dates)
-            imputed_series = series.copy()
-            # Convert y_pred back to actual date indices
-            final_predictions = pd.Series(y_pred.values, index=missing_points)
-            
-            imputed_series.update(final_predictions)
-            return imputed_series
-            
-    except Exception:
-        return series
-        
-    return series
-
-
-def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """
-    Calculate the Symmetric Mean Absolute Percentage Error.
-    """
-    return np.mean(
-        2 * np.abs(y_pred - y_true) /
-        (np.abs(y_true) + np.abs(y_pred) + 1e-8)
-    ) * 100

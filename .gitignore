@@ -1,0 +1,29 @@
+/couta/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local tooling
+.python-version
+
+# ML/artifacts
+/models/
+
+# Project data and large binary outputs
+/data/
+*.zip
+*.png
+*.pdf

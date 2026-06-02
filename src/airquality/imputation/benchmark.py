@@ -12,6 +12,9 @@ from pandas.tseries.frequencies import (
 )  # Frequency-aware timestamp arithmetic.
 
 from darts import TimeSeries  # Darts time series container used across the module.
+from airquality.data.io import resolve_device, to_pd_series
+from airquality.modeling.training_config import DatasetBundle
+from airquality.data.utils import ensure_datetime_series
 
 
 try:
@@ -55,34 +58,12 @@ class GapContextFailure:
     reason: str
 
 
-def _ensure_datetime_series(series: pd.Series, *, freq: str, name: str) -> pd.Series:
-    """Validate and normalize one pandas series to a regular datetime grid.
-
-    Parameters
-    ----------
-    series : pd.Series
-        Series to validate.
-    freq : str
-        Frequency string used to regularize the index (`asfreq`).
-    name : str
-        Logical name used in error messages.
-    """
-    if not isinstance(series, pd.Series):
-        raise TypeError(f"{name} debe ser pd.Series; recibido: {type(series)}")
-    if not isinstance(series.index, pd.DatetimeIndex):
-        raise TypeError(f"{name} debe tener DatetimeIndex")
-
-    out = series.sort_index().copy()
-    out = out[~out.index.duplicated(keep="last")]
-    out = out.asfreq(freq)
-    out.name = str(series.name) if series.name is not None else name
-    return out.astype(float)
+_ensure_datetime_series = ensure_datetime_series
 
 
 def _ts_to_series(ts: TimeSeries, *, freq: str, name: str) -> pd.Series:
     """Convert Darts `TimeSeries` into normalized `pd.Series`."""
-    out = ts.to_series()
-    out.name = name
+    out = to_pd_series(ts, freq=freq, name=name)
     return _ensure_datetime_series(out, freq=freq, name=name)
 
 
@@ -185,12 +166,12 @@ def _normalize_series_collection(
 
 
 def _extract_test_series_from_dataset_bundle(
-    dataset_bundle: Mapping[str, Any], *, freq: str
+    dataset_bundle: DatasetBundle, *, freq: str
 ) -> tuple[dict[str, pd.Series], dict[str, pd.Series], dict[str, Any]]:
     """Build unscaled/scaled test series from project `dataset_bundle`."""
-    valid_cols = list(dataset_bundle["valid_cols"])
-    series_test = list(dataset_bundle["series_test"])
-    dict_scalers = dict(dataset_bundle.get("dict_scalers", {}))
+    valid_cols = list(dataset_bundle.valid_cols)
+    series_test = list(dataset_bundle.series_test)
+    dict_scalers = dict(dataset_bundle.dict_scalers)
 
     if len(valid_cols) != len(series_test):
         raise ValueError("`valid_cols` y `series_test` deben tener la misma longitud")
@@ -687,28 +668,6 @@ def build_tspulse_context_frame(
     return frame, pd.DatetimeIndex(test_clean.index)
 
 
-def _torch_cuda_available() -> bool:
-    """Return CUDA availability without hard dependency on torch import."""
-    try:
-        import torch
-
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
-def _torch_mps_available() -> bool:
-    """Return MPS availability without hard dependency on torch import."""
-    try:
-        import torch
-
-        return bool(
-            getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-        )
-    except Exception:
-        return False
-
-
 class TSPulseHistoricalImputer:
     """Adapter exposing TSPulse imputation via a Darts-like API.
 
@@ -721,6 +680,7 @@ class TSPulseHistoricalImputer:
         *,
         model_id: str = "ibm-granite/granite-timeseries-tspulse-r1",
         revision: str = "tspulse-hybrid-dualhead-512-p8-r1",
+        model_path: str | os.PathLike[str] | None = None,
         context_length: int = 512,
         freq: str = "h",
         batch_size: int = 1000,
@@ -733,20 +693,12 @@ class TSPulseHistoricalImputer:
         """Store adapter configuration and optional pre-loaded model instance."""
         self.model_id = str(model_id)
         self.revision = str(revision)
+        self.model_path = str(model_path) if model_path is not None else None
         self.context_length = int(context_length)
         self.freq = str(freq)
         self.batch_size = int(batch_size)
-        self.device = (
-            device
-            if device is not None
-            else (
-                "cuda"
-                if _torch_cuda_available()
-                else "mps"
-                if _torch_mps_available()
-                else "cpu"
-            )
-        )
+        preferred = "cpu" if device is None else str(device)
+        self.device = resolve_device(preferred)
         self.scaling = bool(scaling)
         self.model = model
         self.hf_token = hf_token if hf_token is not None else os.getenv("HF_TOKEN")
@@ -762,14 +714,17 @@ class TSPulseHistoricalImputer:
                 "tsfm_public no esta disponible en este entorno"
             ) from TSFM_PUBLIC_IMPORT_ERROR
 
-        self.model = TSPulseForReconstruction.from_pretrained(
-            self.model_id,
-            revision=self.revision,
-            num_input_channels=int(num_input_channels),
-            mask_type="user",
-            token=self.hf_token,
-            local_files_only=self.local_files_only,
-        )
+        source = self.model_path if self.model_path is not None else self.model_id
+        load_kwargs: dict[str, Any] = {
+            "num_input_channels": int(num_input_channels),
+            "mask_type": "user",
+            "token": self.hf_token,
+            "local_files_only": self.local_files_only,
+        }
+        if self.model_path is None:
+            load_kwargs["revision"] = self.revision
+
+        self.model = TSPulseForReconstruction.from_pretrained(source, **load_kwargs)
         return self.model
 
     def _impute_full_series(
@@ -912,7 +867,7 @@ def execute_complete_pipeline(
     | pd.Series
     | TimeSeries
     | None = None,
-    dataset_bundle: Mapping[str, Any] | None = None,
+    dataset_bundle: DatasetBundle | None = None,
     predict_on_scaled_series: bool = True,
     gap_sizes: Sequence[int] = (1, 2, 5, 10),
     num_gaps: int = 3,
@@ -925,7 +880,7 @@ def execute_complete_pipeline(
     random_seed: int = 42,
     config_workers: Mapping[str, Any] | None = None,
 ) -> tuple[
-    pd.DataFrame, dict[int, dict[str, dict[str, pd.Series]]], dict[int, dict[str, Any]]
+    pd.DataFrame, dict[int, dict[str, Any]]
 ]:
     """Execute imputation benchmark across TSPulse and Darts models.
 
@@ -942,10 +897,9 @@ def execute_complete_pipeline(
 
     Returns
     -------
-    tuple[pd.DataFrame, dict, dict]
-        `(results_df, predictions, plot_store)` where:
+    tuple[pd.DataFrame, dict]
+        `(results_df, plot_store)` where:
         - `results_df` has columns `Modelo, Serie, Gap_Size, [metricas...]`.
-        - `predictions` is `{gap_size: {model_name: {series_name: pred_series}}}`.
         - `plot_store` matches existing plotting helpers in `complete_pipeline.py`.
     """
     if not model_dict:
@@ -980,7 +934,7 @@ def execute_complete_pipeline(
 
     bundle_all_series_map: dict[str, pd.Series] = {}
     if dataset_bundle is not None:
-        bundle_all_series = dataset_bundle.get("all_series_unscaled")
+        bundle_all_series = dataset_bundle.all_series_unscaled
         if bundle_all_series is not None:
             bundle_all_series_map = _build_all_series_map(bundle_all_series, freq=freq)
 
@@ -1011,7 +965,6 @@ def execute_complete_pipeline(
 
     rng = np.random.default_rng(int(random_seed))
     rows: list[dict[str, Any]] = []
-    predictions: dict[int, dict[str, dict[str, pd.Series]]] = {}
     plot_store: dict[int, dict[str, Any]] = {}
     failures_by_gap: dict[int, list[GapContextFailure]] = {}
 
@@ -1054,7 +1007,6 @@ def execute_complete_pipeline(
             ]
             gaps_per_series[series_name] = windows
 
-        predictions[gap_size] = {}
         plot_store[gap_size] = {"series": {}}
         failures_by_gap[gap_size] = []
         mask_index_by_series: dict[str, pd.DatetimeIndex] = {}
@@ -1130,7 +1082,6 @@ def execute_complete_pipeline(
             }
 
         for model_name, model in model_dict.items():
-            predictions[gap_size][model_name] = {}
             use_scaled_for_model = bool(
                 predict_on_scaled_series
                 and bundle_scalers
@@ -1209,7 +1160,6 @@ def execute_complete_pipeline(
                     .astype(float)
                 )
 
-                predictions[gap_size][model_name][series_name] = pred_mask
                 plot_store[gap_size]["series"][series_name]["preds"][model_name] = (
                     pred_mask
                 )
@@ -1245,7 +1195,7 @@ def execute_complete_pipeline(
         if col not in results_df.columns:
             results_df[col] = float("nan")
 
-    return results_df[ordered_cols], predictions, plot_store
+    return results_df[ordered_cols], plot_store
 
 
 __all__ = [

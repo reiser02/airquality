@@ -1,57 +1,37 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
-import logging
 import os
 from pathlib import Path
 from typing import Any, Sequence
 
 import pandas as pd
+from airquality.data.io import configure_warnings, load_and_normalize_series, resolve_device
+from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
 
-from imputation_benchmark_pipeline import (
+from airquality.imputation.benchmark import (
     TSFM_PUBLIC_AVAILABLE,
     TSPulseHistoricalImputer,
     execute_complete_pipeline,
 )
-from training_pipeline import build_train_val_test_series
-from training_pipeline_config import build_model_configs
-from utils import get_longest_segment, load_dataset_paths, load_to_df
-
-
-DEFAULT_MODEL_NAMES = (
-    "TiDE",
-    "NHiTS",
-    "TCN",
-    "TSMixer",
-    "RNN",
-    "NLinear",
-    "DLinear",
+from airquality.modeling.training import build_train_val_test_series
+from airquality.modeling.training_config import (
+    DatasetBundle,
+    build_lightning_trainer_kwargs,
+    build_model_configs,
 )
+from airquality.data.utils import get_longest_segment
 
 
-def configure_quiet_runtime(quiet: bool = True) -> None:
-    if not quiet:
-        return
-
-    logging.getLogger().setLevel(logging.WARNING)
-    for logger_name in (
-        "pytorch_lightning",
-        "lightning",
-        "lightning.pytorch",
-        "lightning_fabric",
-        "transformers",
-        "transformers.pipelines",
-        "transformers.pipelines.base",
-        "darts",
-    ):
-        logging.getLogger(logger_name).setLevel(logging.ERROR)
-
-    try:
-        from transformers.utils import logging as transformers_logging
-
-        transformers_logging.set_verbosity_error()
-    except Exception:
-        pass
+DEFAULT_MODEL_NAMES = cfg_get_csv_list(
+    "benchmark",
+    "model_names",
+    ("TiDE", "NHiTS", "TCN", "TSMixer", "RNN", "NLinear", "DLinear"),
+)
+DEFAULT_GAP_SIZES = tuple(
+    int(v) for v in cfg_get_csv_list("benchmark", "gap_sizes", ("1", "2", "5", "10"))
+)
+DEFAULT_METRICS = cfg_get_csv_list("benchmark", "metrics", ("mae", "rmse", "mase"))
 
 
 def _to_float32_timeseries(series: Any) -> Any:
@@ -92,15 +72,6 @@ def _resolve_repo_root(repo_root: str | Path | None = None) -> Path:
     return cwd
 
 
-def _cuda_available() -> bool:
-    try:
-        import torch
-
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
 def _apply_inference_trainer_overrides(model: Any) -> None:
     """Disable training-side logging/checkpointing during inference calls."""
     overrides = {
@@ -121,37 +92,22 @@ def _apply_inference_trainer_overrides(model: Any) -> None:
             pl_kwargs.update(overrides)
 
 
-def load_project_series(
+def load_series(
     *,
     repo_root: Path,
-    key_word: str = "NO2",
-    file_extension: str = "csv",
-    freq: str = "h",
+    base_path_glob: str = cfg_get_str("data", "base_path_glob", "Datos-post-COUTA/*/"),
+    key_word: str = cfg_get_str("data", "key_word", "NO2"),
+    file_extension: str = cfg_get_str("data", "file_extension", "csv"),
+    freq: str = cfg_get_str("data", "freq", "h"),
 ) -> list[pd.DataFrame]:
-    base_path = os.path.join(str(repo_root), "Datos-post-COUTA", "*/")
-    file_paths = sorted(
-        load_dataset_paths(
-            base_path=base_path,
-            key_word=key_word,
-            file_extension=file_extension,
-        )
+    base_path = str((repo_root / base_path_glob).resolve())
+    series_dfs = load_and_normalize_series(
+        base_path=base_path,
+        key_word=key_word,
+        file_extension=file_extension,
+        freq=freq,
+        name_from_path=True,
     )
-    if not file_paths:
-        raise FileNotFoundError(
-            f"No se encontraron archivos en '{base_path}' con keyword='{key_word}' y extension='{file_extension}'."
-        )
-
-    series_dfs: list[pd.DataFrame] = []
-    for path in file_paths:
-        df = load_to_df(path)
-        if df is None or df.empty or len(df.columns) != 1:
-            continue
-
-        col = str(df.columns[0])
-        series = df.iloc[:, 0].astype(float).sort_index()
-        series = series[~series.index.duplicated(keep="last")].asfreq(freq)
-        series_dfs.append(series.to_frame(name=col))
-
     if not series_dfs:
         raise RuntimeError(
             "No se pudieron construir series validas desde los archivos cargados."
@@ -163,16 +119,18 @@ def build_dataset_bundle_for_imputation(
     *,
     repo_root: Path,
     size_k: int,
-    val_size: int = 48,
-    val_context_len: int = 72,
-    min_train_len_base: int = 72,
-    key_word: str = "NO2",
-    file_extension: str = "csv",
-    freq: str = "h",
+    val_size: int = cfg_get_int("benchmark", "val_size", 48),
+    val_context_len: int = cfg_get_int("benchmark", "val_context_len", 72),
+    min_train_len_base: int = cfg_get_int("benchmark", "min_train_len_base", 72),
+    base_path_glob: str = cfg_get_str("data", "base_path_glob", "Datos-post-COUTA/*/"),
+    key_word: str = cfg_get_str("data", "key_word", "NO2"),
+    file_extension: str = cfg_get_str("data", "file_extension", "csv"),
+    freq: str = cfg_get_str("data", "freq", "h"),
     force_end: bool = False,
-) -> dict[str, Any]:
-    series_dfs = load_project_series(
+) -> DatasetBundle:
+    series_dfs = load_series(
         repo_root=repo_root,
+        base_path_glob=base_path_glob,
         key_word=key_word,
         file_extension=file_extension,
         freq=freq,
@@ -198,9 +156,11 @@ def load_darts_models_from_artifacts(
     force_cpu: bool = True,
     strict: bool = False,
 ) -> dict[str, Any]:
-    models_dir = repo_root / "src" / "artifacts" / "models"
+    models_dir = repo_root / "models"
     model_configs = build_model_configs()
-    use_cuda = _cuda_available() and not bool(force_cpu)
+    preferred = "cpu" if force_cpu else "cuda"
+    resolved = resolve_device(preferred)
+    use_cuda = resolved == "cuda"
 
     loaded: dict[str, Any] = {}
     missing: list[str] = []
@@ -219,26 +179,28 @@ def load_darts_models_from_artifacts(
             continue
 
         if use_cuda:
-            trainer_kwargs = {
-                "accelerator": "gpu",
-                "devices": 1,
-                "precision": "32-true",
-                "enable_progress_bar": False,
-                "enable_checkpointing": False,
-                "enable_model_summary": False,
-                "logger": False,
-            }
+            trainer_kwargs = build_lightning_trainer_kwargs(
+                "gpu",
+                use_early_stopping=False,
+                precision="32-true",
+                devices=1,
+                enable_progress_bar=False,
+                enable_checkpointing=False,
+                enable_model_summary=False,
+                logger=False,
+            )
             map_location = "cuda"
         else:
-            trainer_kwargs = {
-                "accelerator": "cpu",
-                "devices": 1,
-                "precision": "32-true",
-                "enable_progress_bar": False,
-                "enable_checkpointing": False,
-                "enable_model_summary": False,
-                "logger": False,
-            }
+            trainer_kwargs = build_lightning_trainer_kwargs(
+                "cpu",
+                use_early_stopping=False,
+                precision="32-true",
+                devices=1,
+                enable_progress_bar=False,
+                enable_checkpointing=False,
+                enable_model_summary=False,
+                logger=False,
+            )
             map_location = "cpu"
 
         try:
@@ -395,6 +357,13 @@ def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, d
     if model_name == "TSPulse":
         model_dict: dict[str, Any] = {
             "TSPulse": TSPulseHistoricalImputer(
+                model_id=str(task["tspulse_model_id"]),
+                revision=str(task["tspulse_revision"]),
+                model_path=(
+                    str(task["tspulse_model_path"])
+                    if task.get("tspulse_model_path") is not None
+                    else None
+                ),
                 freq=str(task["freq"]),
                 local_files_only=bool(task["local_files_only"]),
                 hf_token=task.get("hf_token"),
@@ -409,7 +378,7 @@ def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, d
             strict=False,
         )
 
-    results_df, _, plot_store = execute_complete_pipeline(
+    results_df, plot_store = execute_complete_pipeline(
         model_dict=model_dict,
         dataset_bundle=dataset_bundle,
         gap_sizes=tuple(int(x) for x in task["gap_sizes"]),
@@ -427,31 +396,38 @@ def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, d
 def run_imputation_benchmark(
     *,
     repo_root: str | Path | None = None,
-    size_k: int = 5,
+    size_k: int = cfg_get_int("benchmark", "size_k", 5),
     model_names: Sequence[str | type[Any]] = DEFAULT_MODEL_NAMES,
     force_cpu: bool = True,
     quiet_logs: bool = True,
     local_files_only: bool = False,
     hf_token: str | None = None,
-    gap_sizes: Sequence[int] = (1, 2, 5, 10),
-    num_gaps: int = 3,
-    gap_strategy: str = "hybrid_tspulse",
-    metrics: Sequence[str] = ("mae", "rmse", "mase"),
-    random_seed: int = 42,
-    seasonality_m: int = 24,
-    freq: str = "h",
-    key_word: str = "NO2",
-    file_extension: str = "csv",
+    tspulse_model_id: str = cfg_get_str(
+        "benchmark", "tspulse_model_id", cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1")
+    ),
+    tspulse_revision: str = cfg_get_str(
+        "benchmark", "tspulse_revision", cfg_get_str("tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1")
+    ),
+    tspulse_model_path: str | None = cfg_get_str("benchmark", "tspulse_model_path", ""),
+    gap_sizes: Sequence[int] = DEFAULT_GAP_SIZES,
+    num_gaps: int = cfg_get_int("benchmark", "num_gaps", 3),
+    gap_strategy: str = cfg_get_str("benchmark", "gap_strategy", "hybrid_tspulse"),
+    metrics: Sequence[str] = DEFAULT_METRICS,
+    random_seed: int = cfg_get_int("benchmark", "random_seed", 42),
+    seasonality_m: int = cfg_get_int("benchmark", "seasonality_m", 24),
+    freq: str = cfg_get_str("data", "freq", "h"),
+    key_word: str = cfg_get_str("data", "key_word", "NO2"),
+    file_extension: str = cfg_get_str("data", "file_extension", "csv"),
     force_end: bool = False,
-    val_size: int = 48,
-    val_context_len: int = 72,
-    min_train_len_base: int = 72,
+    val_size: int = cfg_get_int("benchmark", "val_size", 48),
+    val_context_len: int = cfg_get_int("benchmark", "val_context_len", 72),
+    min_train_len_base: int = cfg_get_int("benchmark", "min_train_len_base", 72),
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
     dict[int, dict[str, Any]],
 ]:
-    configure_quiet_runtime(quiet=quiet_logs)
+    configure_warnings(quiet=quiet_logs)
     resolved_root = _resolve_repo_root(repo_root)
     darts_model_names, request_tspulse = _resolve_requested_models(model_names)
 
@@ -481,6 +457,9 @@ def run_imputation_benchmark(
     if request_tspulse:
         if TSFM_PUBLIC_AVAILABLE:
             model_dict["TSPulse"] = TSPulseHistoricalImputer(
+                model_id=tspulse_model_id,
+                revision=tspulse_revision,
+                model_path=tspulse_model_path or None,
                 freq=freq,
                 local_files_only=local_files_only,
                 hf_token=hf_token,
@@ -493,7 +472,7 @@ def run_imputation_benchmark(
             "No se pudo cargar ningun modelo para benchmark (Darts/TSPulse)."
         )
 
-    results_df, _, plot_store = execute_complete_pipeline(
+    results_df, plot_store = execute_complete_pipeline(
         model_dict=model_dict,
         dataset_bundle=dataset_bundle,
         gap_sizes=tuple(int(x) for x in gap_sizes),
@@ -511,32 +490,39 @@ def run_imputation_benchmark(
 def run_imputation_benchmark_parallel(
     *,
     repo_root: str | Path | None = None,
-    size_k: int = 5,
+    size_k: int = cfg_get_int("benchmark", "size_k", 5),
     model_names: Sequence[str | type[Any]] = DEFAULT_MODEL_NAMES,
     force_cpu: bool = True,
     quiet_logs: bool = True,
     local_files_only: bool = False,
     hf_token: str | None = None,
-    gap_sizes: Sequence[int] = (1, 2, 5, 10),
-    num_gaps: int = 3,
-    gap_strategy: str = "hybrid_tspulse",
-    metrics: Sequence[str] = ("mae", "rmse", "mase"),
-    random_seed: int = 42,
-    seasonality_m: int = 24,
-    freq: str = "h",
-    key_word: str = "NO2",
-    file_extension: str = "csv",
+    tspulse_model_id: str = cfg_get_str(
+        "benchmark", "tspulse_model_id", cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1")
+    ),
+    tspulse_revision: str = cfg_get_str(
+        "benchmark", "tspulse_revision", cfg_get_str("tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1")
+    ),
+    tspulse_model_path: str | None = cfg_get_str("benchmark", "tspulse_model_path", ""),
+    gap_sizes: Sequence[int] = DEFAULT_GAP_SIZES,
+    num_gaps: int = cfg_get_int("benchmark", "num_gaps", 3),
+    gap_strategy: str = cfg_get_str("benchmark", "gap_strategy", "hybrid_tspulse"),
+    metrics: Sequence[str] = DEFAULT_METRICS,
+    random_seed: int = cfg_get_int("benchmark", "random_seed", 42),
+    seasonality_m: int = cfg_get_int("benchmark", "seasonality_m", 24),
+    freq: str = cfg_get_str("data", "freq", "h"),
+    key_word: str = cfg_get_str("data", "key_word", "NO2"),
+    file_extension: str = cfg_get_str("data", "file_extension", "csv"),
     force_end: bool = False,
-    val_size: int = 48,
-    val_context_len: int = 72,
-    min_train_len_base: int = 72,
+    val_size: int = cfg_get_int("benchmark", "val_size", 48),
+    val_context_len: int = cfg_get_int("benchmark", "val_context_len", 72),
+    min_train_len_base: int = cfg_get_int("benchmark", "min_train_len_base", 72),
     max_workers: int | None = None,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
     dict[int, dict[str, Any]],
 ]:
-    configure_quiet_runtime(quiet=quiet_logs)
+    configure_warnings(quiet=quiet_logs)
     resolved_root = _resolve_repo_root(repo_root)
     darts_model_names, request_tspulse = _resolve_requested_models(model_names)
 
@@ -561,6 +547,9 @@ def run_imputation_benchmark_parallel(
         "force_cpu": bool(force_cpu),
         "local_files_only": bool(local_files_only),
         "hf_token": hf_token,
+        "tspulse_model_id": str(tspulse_model_id),
+        "tspulse_revision": str(tspulse_revision),
+        "tspulse_model_path": (tspulse_model_path or None),
         "gap_sizes": tuple(int(x) for x in gap_sizes),
         "num_gaps": int(num_gaps),
         "gap_strategy": str(gap_strategy),
@@ -650,24 +639,31 @@ def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFr
 def run_imputation_benchmark_parallel_montecarlo(
     *,
     repo_root: str | Path | None = None,
-    size_k: int = 5,
+    size_k: int = cfg_get_int("benchmark", "size_k", 5),
     model_names: Sequence[str | type[Any]] = DEFAULT_MODEL_NAMES,
     force_cpu: bool = True,
     quiet_logs: bool = True,
     local_files_only: bool = False,
     hf_token: str | None = None,
-    gap_sizes: Sequence[int] = (1, 2, 5, 10),
-    num_gaps: int = 3,
-    gap_strategy: str = "hybrid_tspulse",
-    metrics: Sequence[str] = ("mae", "rmse", "mase"),
-    seasonality_m: int = 24,
-    freq: str = "h",
-    key_word: str = "NO2",
-    file_extension: str = "csv",
+    tspulse_model_id: str = cfg_get_str(
+        "benchmark", "tspulse_model_id", cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1")
+    ),
+    tspulse_revision: str = cfg_get_str(
+        "benchmark", "tspulse_revision", cfg_get_str("tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1")
+    ),
+    tspulse_model_path: str | None = cfg_get_str("benchmark", "tspulse_model_path", ""),
+    gap_sizes: Sequence[int] = DEFAULT_GAP_SIZES,
+    num_gaps: int = cfg_get_int("benchmark", "num_gaps", 3),
+    gap_strategy: str = cfg_get_str("benchmark", "gap_strategy", "hybrid_tspulse"),
+    metrics: Sequence[str] = DEFAULT_METRICS,
+    seasonality_m: int = cfg_get_int("benchmark", "seasonality_m", 24),
+    freq: str = cfg_get_str("data", "freq", "h"),
+    key_word: str = cfg_get_str("data", "key_word", "NO2"),
+    file_extension: str = cfg_get_str("data", "file_extension", "csv"),
     force_end: bool = False,
-    val_size: int = 48,
-    val_context_len: int = 72,
-    min_train_len_base: int = 72,
+    val_size: int = cfg_get_int("benchmark", "val_size", 48),
+    val_context_len: int = cfg_get_int("benchmark", "val_context_len", 72),
+    min_train_len_base: int = cfg_get_int("benchmark", "min_train_len_base", 72),
     max_workers: int | None = None,
     seeds: Sequence[int] | None = None,
     n_runs: int = 20,
@@ -708,6 +704,9 @@ def run_imputation_benchmark_parallel_montecarlo(
                 quiet_logs=quiet_logs,
                 local_files_only=local_files_only,
                 hf_token=hf_token,
+                tspulse_model_id=tspulse_model_id,
+                tspulse_revision=tspulse_revision,
+                tspulse_model_path=tspulse_model_path,
                 gap_sizes=gap_sizes,
                 num_gaps=num_gaps,
                 gap_strategy=gap_strategy,

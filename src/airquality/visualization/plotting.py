@@ -7,11 +7,65 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from darts import TimeSeries
+from airquality.data.io import to_pd_series
 
 
-def _timeseries_to_pd_series(ts: TimeSeries) -> pd.Series:
-    """Convierte un `TimeSeries` de Darts a `pd.Series`."""
-    return ts.to_series()
+def _draw_series(
+    ax: Any,
+    x: pd.Index,
+    y: Any,
+    *,
+    label: str,
+    render_style: str,
+    color: str | None = None,
+    alpha: float = 1.0,
+    lw: float = 1.5,
+    linestyle: str = "-",
+) -> str | None:
+    if render_style == "points":
+        line = ax.plot(
+            x,
+            y,
+            label=label,
+            color=color,
+            alpha=alpha,
+            linestyle="None",
+            marker="o",
+            markersize=3.0,
+        )[0]
+    else:
+        line = ax.plot(
+            x,
+            y,
+            label=label,
+            color=color,
+            alpha=alpha,
+            lw=lw,
+            linestyle=linestyle,
+        )[0]
+    return str(line.get_color()) if hasattr(line, "get_color") else color
+
+
+def _plot_vertical_error_connectors(
+    ax: Any,
+    *,
+    gap_real: pd.Series,
+    pred: pd.Series,
+    color: str | None,
+) -> None:
+    common_idx = gap_real.index.intersection(pred.index)
+    for ts in common_idx:
+        y_true = float(gap_real.loc[ts])
+        y_pred = float(pred.loc[ts])
+        if np.isfinite(y_true) and np.isfinite(y_pred):
+            ax.plot(
+                [ts, ts],
+                [y_true, y_pred],
+                linestyle="--",
+                lw=0.9,
+                color=color or "gray",
+                alpha=0.45,
+            )
 
 
 def get_prediction_time_window(
@@ -80,41 +134,6 @@ def plot_predictions_by_gap(
     def _plot_on_axis(
         ax: Any, series_payload: dict[str, Any], gap: int, serie: str
     ) -> None:
-        def _draw(
-            x: pd.Index,
-            y: Any,
-            *,
-            label: str,
-            color: str | None = None,
-            alpha: float = 1.0,
-            lw: float = 1.5,
-            linestyle: str = "-",
-            style: str | None = None,
-        ) -> str | None:
-            mode = render_style if style is None else style
-            if mode == "points":
-                line = ax.plot(
-                    x,
-                    y,
-                    label=label,
-                    color=color,
-                    alpha=alpha,
-                    linestyle="None",
-                    marker="o",
-                    markersize=3.0,
-                )[0]
-            else:
-                line = ax.plot(
-                    x,
-                    y,
-                    label=label,
-                    color=color,
-                    alpha=alpha,
-                    lw=lw,
-                    linestyle=linestyle,
-                )[0]
-            return str(line.get_color()) if hasattr(line, "get_color") else color
-
         mase_map = _get_mase_map(serie, gap)
         preds_payload = series_payload.get("preds", {})
         actual = series_payload.get("actual", pd.Series(dtype=float))
@@ -124,14 +143,15 @@ def plot_predictions_by_gap(
             actual = actual.loc[start:end]
 
         if len(actual) > 0:
-            _draw(
+            _draw_series(
+                ax,
                 actual.index,
                 actual.values,
                 label="Real",
+                render_style="line" if render_style == "mixed" else render_style,
                 color="black",
                 alpha=0.45,
                 lw=1.3,
-                style="line" if render_style == "mixed" else render_style,
             )
 
         gap_real = pd.Series(dtype=float)
@@ -174,27 +194,21 @@ def plot_predictions_by_gap(
                 label = model_name
                 if error_display in {"legend", "both"} and model_name in mase_map:
                     label = f"{model_name} (MASE={mase_map[model_name]:.3f})"
-                pred_color = _draw(
+                pred_color = _draw_series(
+                    ax,
                     ps.index,
                     ps.values,
                     lw=1.2,
                     label=label,
-                    style="points",
+                    render_style="points",
                 )
                 if render_style == "mixed" and len(gap_real) > 0:
-                    common_idx = gap_real.index.intersection(ps.index)
-                    for ts in common_idx:
-                        y_true = float(gap_real.loc[ts])
-                        y_pred = float(ps.loc[ts])
-                        if np.isfinite(y_true) and np.isfinite(y_pred):
-                            ax.plot(
-                                [ts, ts],
-                                [y_true, y_pred],
-                                linestyle="--",
-                                lw=0.9,
-                                color=pred_color or "gray",
-                                alpha=0.45,
-                            )
+                    _plot_vertical_error_connectors(
+                        ax,
+                        gap_real=gap_real,
+                        pred=ps,
+                        color=pred_color,
+                    )
 
         naive_mase = series_payload.get("naive_mase", pd.Series(dtype=float)).dropna()
         if window is not None:
@@ -202,14 +216,15 @@ def plot_predictions_by_gap(
             naive_mase = naive_mase.loc[start:end]
 
         if show_naive_mase_plot and len(naive_mase) > 0:
-            _draw(
+            _draw_series(
+                ax,
                 naive_mase.index,
                 naive_mase.values,
                 label="Naive MASE y(t-m)",
+                render_style="line" if render_style == "mixed" else render_style,
                 lw=1.2,
                 linestyle="--",
                 color="orange",
-                style="line" if render_style == "mixed" else render_style,
             )
 
         if error_display in {"textbox", "both"} and mase_map:
@@ -319,7 +334,7 @@ def plot_predictions_by_method_grid(
         if isinstance(obj, pd.Series):
             return obj.sort_index()
         if isinstance(obj, TimeSeries):
-            return _timeseries_to_pd_series(obj).sort_index()
+            return to_pd_series(obj).sort_index()
         return pd.Series(dtype=float)
 
     def _plot_single_axis(
@@ -330,39 +345,6 @@ def plot_predictions_by_method_grid(
         method: str,
         gap: int | None,
     ) -> None:
-        def _draw(
-            x: pd.Index,
-            y: Any,
-            *,
-            color: str,
-            alpha: float,
-            lw: float,
-            label: str,
-            style: str | None = None,
-        ) -> str:
-            mode = render_style if style is None else style
-            if mode == "points":
-                line = ax.plot(
-                    x,
-                    y,
-                    color=color,
-                    alpha=alpha,
-                    linestyle="None",
-                    marker="o",
-                    markersize=3.0,
-                    label=label,
-                )[0]
-            else:
-                line = ax.plot(
-                    x,
-                    y,
-                    color=color,
-                    alpha=alpha,
-                    lw=lw,
-                    label=label,
-                )[0]
-            return str(line.get_color()) if hasattr(line, "get_color") else str(color)
-
         actual_clean = actual.dropna()
         pred_clean = pred.dropna()
         mae_value = float("nan")
@@ -383,14 +365,15 @@ def plot_predictions_by_method_grid(
             actual_plot = actual_clean
 
         if len(actual_plot) > 0:
-            _draw(
+            _draw_series(
+                ax,
                 actual_plot.index,
                 actual_plot.values,
+                render_style="line" if render_style == "mixed" else render_style,
                 color="black",
                 alpha=0.5,
                 lw=2.0,
                 label="Serie original",
-                style="line" if render_style == "mixed" else render_style,
             )
 
         if render_style == "mixed" and len(pred_clean) > 0:
@@ -408,30 +391,24 @@ def plot_predictions_by_method_grid(
 
         pred_color = "#0B3D91"
         if len(pred_clean) > 0:
-            pred_color = _draw(
+            pred_color = _draw_series(
+                ax,
                 pred_clean.index,
                 pred_clean.values,
+                render_style="points" if render_style == "mixed" else render_style,
                 color="#0B3D91",
                 alpha=1.0,
                 lw=2.4,
                 label="Prediccion",
-                style="points" if render_style == "mixed" else render_style,
             )
             if render_style == "mixed":
                 gap_real = actual_clean.reindex(pred_clean.index).dropna()
-                common_idx = gap_real.index.intersection(pred_clean.index)
-                for ts in common_idx:
-                    y_true = float(gap_real.loc[ts])
-                    y_pred = float(pred_clean.loc[ts])
-                    if np.isfinite(y_true) and np.isfinite(y_pred):
-                        ax.plot(
-                            [ts, ts],
-                            [y_true, y_pred],
-                            linestyle="--",
-                            lw=0.9,
-                            color=pred_color,
-                            alpha=0.45,
-                        )
+                _plot_vertical_error_connectors(
+                    ax,
+                    gap_real=gap_real,
+                    pred=pred_clean,
+                    color=pred_color,
+                )
         elif len(actual_plot) == 0:
             ax.text(
                 0.5,

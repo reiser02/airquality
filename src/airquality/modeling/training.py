@@ -1,7 +1,5 @@
-import logging
 import os
 import tempfile
-import warnings
 import gc
 import time
 import inspect
@@ -13,6 +11,7 @@ import numpy as np
 import pandas as pd
 from pytorch_lightning.callbacks import Callback
 from sklearn.preprocessing import StandardScaler
+from airquality.data.io import configure_warnings
 
 from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
@@ -22,19 +21,11 @@ from darts.models import (
 )
 from darts.utils.missing_values import extract_subseries
 
-from training_pipeline_config import (
+from airquality.modeling.training_config import (
     BASE_TRAINING_KWARGS,
     DatasetBundle,
     build_model_configs,
 )
-
-
-def configure_runtime_warnings() -> None:
-    """Reduce warnings/logs ruidosos de dependencias durante entrenamiento."""
-
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", ".*isinstance\\(treespec, LeafSpec\\).*")
-    logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 
 def build_scaled_train_val_series(
@@ -199,18 +190,18 @@ def build_train_val_test_series(
             "No hay columnas válidas para test tras construir train/val sin fuga de datos."
         )
 
-    return {
-        "series_train": series_train,
-        "series_val": series_val,
-        "series_test": series_test,
-        "dict_scalers": dict_scalers,
-        "valid_cols": valid_cols,
-        "all_series_unscaled": {
+    return DatasetBundle(
+        series_train=series_train,
+        series_val=series_val,
+        series_test=series_test,
+        dict_scalers=dict_scalers,
+        valid_cols=valid_cols,
+        all_series_unscaled={
             col: all_series_unscaled[col].copy()
             for col in valid_cols
             if col in all_series_unscaled
         },
-    }
+    )
 
 
 def _metric_to_float(metric_value: Any) -> float | None:
@@ -438,7 +429,7 @@ def fit_darts_model(
     if resume_mode is not None and model_cls is LinearRegressionModel:
         raise ValueError("`resume_mode` no aplica a LinearRegressionModel.")
 
-    configure_runtime_warnings()
+    configure_warnings(quiet=True)
     if model_cls is LinearRegressionModel:
         kwargs = deepcopy(model_kwargs)
     else:
@@ -538,7 +529,7 @@ def finetune_trained_models(
     tuple[dict[str, Any], dict[str, str]]
         (modelos_finetuned, modelos_omitidos_con_motivo)
     """
-    configure_runtime_warnings()
+    configure_warnings(quiet=True)
 
     skipped_models: dict[str, str] = {}
 
@@ -642,8 +633,8 @@ def finetune_models_from_data(
 
     return finetune_trained_models(
         trained_models=trained_models,
-        series_train=dataset_bundle["series_train"],
-        series_val=dataset_bundle["series_val"],
+        series_train=dataset_bundle.series_train,
+        series_val=dataset_bundle.series_val,
         n_epochs=n_epochs,
         enable_finetuning=enable_finetuning,
         model_specific_finetuning=model_specific_finetuning,
@@ -657,7 +648,7 @@ def train_global_methods(
     dataset_bundle: DatasetBundle,
     size_k: int,
     method_names: Sequence[str],
-    csv_output_path: str | None = "artifacts/training_curves_and_times.csv",
+    csv_output_path: str | None = "reports/metrics/training_curves_and_times.csv",
     resume_mode: str | None = None,
     model_output_dir: str | None = None,
 ) -> dict[str, Any]:
@@ -676,7 +667,7 @@ def train_global_methods(
     - `"best"`: carga mejor checkpoint.
 
     Guarda cada modelo entrenado en disco usando `model.save(...)`. Por defecto,
-    la salida se escribe en `src/artifacts/models/`.
+    la salida se escribe en `models/`.
     """
     if resume_mode not in (None, "best", "last"):
         raise ValueError("`resume_mode` debe ser None, 'best' o 'last'.")
@@ -686,13 +677,13 @@ def train_global_methods(
     model_configs = build_model_configs()
 
     if model_output_dir is None:
-        models_dir = Path(__file__).resolve().parent / "artifacts" / "models"
+        models_dir = Path(__file__).resolve().parents[3] / "models"
     else:
         models_dir = Path(model_output_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    series_train = dataset_bundle["series_train"]
-    series_val = dataset_bundle["series_val"]
+    series_train = dataset_bundle.series_train
+    series_val = dataset_bundle.series_val
 
     for name in method_names:
         if name not in model_configs:

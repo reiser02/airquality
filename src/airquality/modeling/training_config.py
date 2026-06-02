@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Any, NotRequired, Sequence, TypedDict
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
 import numpy as np
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -21,9 +21,11 @@ from darts.models import (
     TiDEModel,
     TransformerModel,
 )
+from airquality.config import cfg_get_float, cfg_get_int
 
 
-class DatasetBundle(TypedDict):
+@dataclass(slots=True)
+class DatasetBundle:
     """Estructura estándar del dataset escalado usado por training/eval."""
 
     series_train: list[TimeSeries]
@@ -31,7 +33,17 @@ class DatasetBundle(TypedDict):
     series_test: list[TimeSeries]
     dict_scalers: dict[str, Scaler]
     valid_cols: list[str]
-    all_series_unscaled: NotRequired[dict[str, Any]]
+    all_series_unscaled: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if len(self.valid_cols) != len(self.series_test):
+            raise ValueError("`valid_cols` y `series_test` deben tener la misma longitud")
+
+        if missing := [col for col in self.valid_cols if col not in self.dict_scalers]:
+            raise ValueError(
+                "Faltan scalers para columnas validas en `dict_scalers`: "
+                + ", ".join(missing)
+            )
 
 
 @dataclass(frozen=True)
@@ -44,15 +56,22 @@ class EvalConfig:
 
 
 BASE_TRAINING_KWARGS: dict[str, Any] = {
-    "batch_size": 256,
-    "n_epochs": 100,
+    "batch_size": cfg_get_int("training", "batch_size", 256),
+    "n_epochs": cfg_get_int("training", "n_epochs", 100),
     "optimizer_cls": AdamW,
-    "optimizer_kwargs": {"lr": 1e-3, "weight_decay": 1e-2},
+    "optimizer_kwargs": {
+        "lr": cfg_get_float("training", "learning_rate", 1e-3),
+        "weight_decay": cfg_get_float("training", "weight_decay", 1e-2),
+    },
     "lr_scheduler_cls": ReduceLROnPlateau,
-    "lr_scheduler_kwargs": {"mode": "min", "factor": 0.5, "patience": 2},
+    "lr_scheduler_kwargs": {
+        "mode": "min",
+        "factor": cfg_get_float("training", "lr_scheduler_factor", 0.5),
+        "patience": cfg_get_int("training", "lr_scheduler_patience", 2),
+    },
     "save_checkpoints": True,
     "force_reset": True,
-    "random_state": 42,
+    "random_state": cfg_get_int("training", "random_state", 42),
 }
 
 
@@ -69,8 +88,8 @@ def build_early_stopping_callback() -> EarlyStopping:
 
     return EarlyStopping(
         monitor="val_loss",
-        patience=5,
-        min_delta=1e-4,
+        patience=cfg_get_int("training", "early_stopping_patience", 5),
+        min_delta=cfg_get_float("training", "early_stopping_min_delta", 1e-4),
         mode="min",
         verbose=True,
     )
@@ -81,6 +100,10 @@ def build_lightning_trainer_kwargs(
     use_early_stopping: bool = True,
     precision: str | int | None = None,
     devices: int | str | list[int] | None = None,
+    enable_progress_bar: bool = True,
+    enable_checkpointing: bool = True,
+    enable_model_summary: bool = True,
+    logger: bool | Any = True,
 ) -> dict[str, Any]:
     """Genera kwargs de PyTorch Lightning para modelos Darts basados en Torch."""
 
@@ -93,7 +116,10 @@ def build_lightning_trainer_kwargs(
         "accelerator": accelerator,
         "devices": devices,
         "precision": precision,
-        "enable_progress_bar": True,
+        "enable_progress_bar": enable_progress_bar,
+        "enable_checkpointing": enable_checkpointing,
+        "enable_model_summary": enable_model_summary,
+        "logger": logger,
     }
     if use_early_stopping:
         kwargs["callbacks"] = [build_early_stopping_callback()]
@@ -138,12 +164,12 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "TiDE": (
             TiDEModel,
             {
-                "input_chunk_length": 72,
+                "input_chunk_length": cfg_get_int("models", "tide_input_chunk_length", 72),
                 "temporal_width_past": 1,
                 "num_encoder_layers": 3,
                 "num_decoder_layers": 3,
                 "decoder_output_dim": 64,
-                "hidden_size": 512,
+                "hidden_size": cfg_get_int("models", "tide_hidden_size", 512),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -152,10 +178,10 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "NHiTS": (
             NHiTSModel,
             {
-                "input_chunk_length": 72,
+                "input_chunk_length": cfg_get_int("models", "nhits_input_chunk_length", 72),
                 "num_stacks": 4,
                 "num_blocks": 3,
-                "layer_widths": 512,
+                "layer_widths": cfg_get_int("models", "nhits_layer_widths", 512),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -164,7 +190,7 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "NLinear": (
             NLinearModel,
             {
-                "input_chunk_length": 72,
+                "input_chunk_length": cfg_get_int("models", "nlinear_input_chunk_length", 72),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -173,7 +199,7 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "DLinear": (
             DLinearModel,
             {
-                "input_chunk_length": 72,
+                "input_chunk_length": cfg_get_int("models", "dlinear_input_chunk_length", 72),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -182,8 +208,8 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "TCN": (
             TCNModel,
             {
-                "input_chunk_length": 72,
-                "num_filters": 16,
+                "input_chunk_length": cfg_get_int("models", "tcn_input_chunk_length", 72),
+                "num_filters": cfg_get_int("models", "tcn_num_filters", 16),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -192,7 +218,7 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "Transformer": (
             TransformerModel,
             {
-                "input_chunk_length": 72,
+                "input_chunk_length": cfg_get_int("models", "transformer_input_chunk_length", 72),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
@@ -201,9 +227,9 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "TSMixer": (
             TSMixerModel,
             {
-                "input_chunk_length": 72,
-                "hidden_size": 128,
-                "ff_size": 128,
+                "input_chunk_length": cfg_get_int("models", "tsmixer_input_chunk_length", 72),
+                "hidden_size": cfg_get_int("models", "tsmixer_hidden_size", 128),
+                "ff_size": cfg_get_int("models", "tsmixer_ff_size", 128),
                 "num_blocks": 3,
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
@@ -213,10 +239,10 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "RNN": (
             RNNModel,
             {
-                "input_chunk_length": 48,
-                "training_length": 72,
+                "input_chunk_length": cfg_get_int("models", "rnn_input_chunk_length", 48),
+                "training_length": cfg_get_int("models", "rnn_training_length", 72),
                 "model": "GRU",
-                "hidden_dim": 64,
+                "hidden_dim": cfg_get_int("models", "rnn_hidden_dim", 64),
                 "n_rnn_layers": 3,
                 "dropout": 0.1,
                 "add_encoders": make_encoders_rnn(),
@@ -227,8 +253,8 @@ def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
         "LinearRegression": (
             LinearRegressionModel,
             {
-                "lags": 72,
-                "random_state": 42,
+                "lags": cfg_get_int("models", "linear_regression_lags", 72),
+                "random_state": cfg_get_int("training", "random_state", 42),
             },
         ),
     }
