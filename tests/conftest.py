@@ -1,3 +1,5 @@
+"""Shared pytest bootstrap that exposes `src/` imports to the test suite."""
+
 from __future__ import annotations
 
 import sys

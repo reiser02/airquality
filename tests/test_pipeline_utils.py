@@ -1,3 +1,5 @@
+"""Tests device, warning, and dataset normalization utility functions."""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -24,15 +26,10 @@ def test_load_and_normalize_series_happy_path(monkeypatch: pytest.MonkeyPatch) -
     idx = pd.to_datetime(["2024-01-01 01:00", "2024-01-01 00:00", "2024-01-01 01:00"])
     df = pd.DataFrame({"NO2": [2, 1, 3]}, index=idx)
 
-    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda **_: ["a.csv"])
+    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda: ["a.csv"])
     monkeypatch.setattr("airquality.data.io.load_to_df", lambda *_args, **_kwargs: df)
 
-    out = load_and_normalize_series(
-        base_path="x",
-        key_word="NO2",
-        file_extension="csv",
-        freq="h",
-    )
+    out = load_and_normalize_series(freq="h")
 
     assert len(out) == 1
     assert list(out[0].columns) == ["NO2"]
@@ -40,28 +37,17 @@ def test_load_and_normalize_series_happy_path(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_load_and_normalize_series_raises_when_no_files(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda **_: [])
+    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda: [])
 
     with pytest.raises(FileNotFoundError):
-        load_and_normalize_series(
-            base_path="x",
-            key_word="NO2",
-            file_extension="csv",
-            freq="h",
-        )
+        load_and_normalize_series(freq="h")
 
 
 def test_load_and_normalize_series_target_column_out_of_range(monkeypatch: pytest.MonkeyPatch) -> None:
     idx = pd.date_range("2024-01-01", periods=2, freq="h")
     df = pd.DataFrame({"A": [1, 2]}, index=idx)
-    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda **_: ["a.csv"])
+    monkeypatch.setattr("airquality.data.io.load_dataset_paths", lambda: ["a.csv"])
     monkeypatch.setattr("airquality.data.io.load_to_df", lambda *_args, **_kwargs: df)
 
     with pytest.raises(ValueError):
-        load_and_normalize_series(
-            base_path="x",
-            key_word="NO2",
-            file_extension="csv",
-            freq="h",
-            target_column_index=1,
-        )
+        load_and_normalize_series(freq="h", target_column_index=1)

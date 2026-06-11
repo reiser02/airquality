@@ -1,3 +1,5 @@
+"""Download pollutant measurements from the Cartagena data API."""
+
 import requests
 import pandas as pd
 import urllib3
@@ -10,6 +12,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def ejecutar_scraper() -> None:
+    """Fetch all configured station pollutants and save them as CSV files."""
     estaciones = {
         "urn:ngsi:AirQualityObserved:HOP94e6867be9fa": "Aquatec - Calle Jorge Juan",
         "urn:ngsi:AirQualityObserved:HOPac67b2cd1cd6": "AQN4 - Alameda San Anton",

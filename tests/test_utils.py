@@ -1,3 +1,5 @@
+"""Tests core data utilities for normalization, loading, and segment selection."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,13 +7,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from airquality.data.utils import (
+from airquality.data.loaders import (
     UnsupportedFileFormatError,
-    ensure_datetime_series,
-    get_longest_segment,
     load_dataset_paths,
     load_to_df,
 )
+from airquality.data.segments import get_longest_segment
+from airquality.data.series import ensure_datetime_series
 
 
 def test_ensure_datetime_series_normalizes_sorts_and_sets_freq() -> None:
@@ -33,14 +35,49 @@ def test_ensure_datetime_series_raises_with_bad_inputs() -> None:
         ensure_datetime_series(pd.Series([1, 2]), freq="h", name="a")
 
 
-def test_load_dataset_paths_filters_by_keyword_and_extension(tmp_path: Path) -> None:
+def test_load_dataset_paths_filters_by_keyword_and_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     (tmp_path / "estacion_NO2.csv").write_text("x", encoding="utf-8")
     (tmp_path / "estacion_CO.csv").write_text("x", encoding="utf-8")
 
-    paths = load_dataset_paths(str(tmp_path), key_word="NO2", file_extension="csv")
+    def fake_cfg_get_str(section: str, option: str, default: str) -> str:
+        overrides = {
+            ("data", "base_path_glob"): str(tmp_path),
+            ("data", "key_word"): "NO2",
+            ("data", "file_extension"): "csv",
+        }
+        return overrides.get((section, option), default)
+
+    monkeypatch.setattr("airquality.data.loaders.cfg_get_str", fake_cfg_get_str)
+
+    paths = load_dataset_paths()
 
     assert len(paths) == 1
     assert paths[0].endswith("estacion_NO2.csv")
+
+
+def test_load_dataset_paths_resolves_defaults_at_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_dir = tmp_path / "runtime"
+    target_dir.mkdir()
+    (target_dir / "estacion_O3.json").write_text("x", encoding="utf-8")
+
+    def fake_cfg_get_str(section: str, option: str, default: str) -> str:
+        overrides = {
+            ("data", "base_path_glob"): str(target_dir),
+            ("data", "key_word"): "O3",
+            ("data", "file_extension"): "json",
+        }
+        return overrides.get((section, option), default)
+
+    monkeypatch.setattr("airquality.data.loaders.cfg_get_str", fake_cfg_get_str)
+
+    paths = load_dataset_paths()
+
+    assert len(paths) == 1
+    assert paths[0].endswith("estacion_O3.json")
 
 
 def test_load_to_df_csv_renames_when_requested(tmp_path: Path) -> None:
@@ -60,24 +97,13 @@ def test_load_to_df_unsupported_extension_returns_none(tmp_path: Path) -> None:
     assert load_to_df(str(p)) is None
 
 
-def test_get_longest_segment_finds_best_block_without_force_end() -> None:
+def test_get_longest_segment_finds_best_block() -> None:
     idx = pd.date_range("2024-01-01", periods=6, freq="h")
     a = pd.DataFrame({"A": [1, 1, None, 1, 1, 1]}, index=idx)
     b = pd.DataFrame({"B": [1, 1, None, 1, 1, 1]}, index=idx)
 
-    out = get_longest_segment([a, b], force_end=False)
+    out = get_longest_segment([a, b])
 
     assert list(out.columns) == ["A", "B"]
     assert len(out) == 3
     assert out.index.min() == idx[3]
-
-
-def test_get_longest_segment_force_end_returns_last_connected_block() -> None:
-    idx = pd.date_range("2024-01-01", periods=5, freq="h")
-    a = pd.DataFrame({"A": [1, None, 2, 3, 4]}, index=idx)
-    b = pd.DataFrame({"B": [1, None, 2, 3, 4]}, index=idx)
-
-    out = get_longest_segment([a, b], force_end=True)
-
-    assert out.index.min() == idx[2]
-    assert out.index.max() == idx[4]

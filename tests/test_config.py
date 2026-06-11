@@ -1,3 +1,5 @@
+"""Tests config path discovery and repository config precedence."""
+
 from __future__ import annotations
 
 from pathlib import Path

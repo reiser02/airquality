@@ -1,16 +1,17 @@
+"""Runtime helpers for device selection, logging, and series loading."""
+
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Any, Sequence
 
 import pandas as pd
-from darts import TimeSeries
 
-from airquality.data.utils import load_dataset_paths, load_to_df
+from airquality.data.loaders import load_dataset_paths, load_to_df
+from airquality.data.series import ensure_datetime_series, to_pd_series
 
 
 def resolve_device(preferred: str) -> str:
+    """Resolve `cpu` or fall back from requested `cuda` when unavailable."""
     choice = str(preferred).strip().lower()
     if choice not in {"cpu", "cuda"}:
         raise ValueError("preferred debe ser 'cpu' o 'cuda'")
@@ -26,6 +27,7 @@ def resolve_device(preferred: str) -> str:
 
 
 def configure_warnings(quiet: bool = True) -> None:
+    """Reduce noisy logs from training and transformer dependencies."""
     if not quiet:
         return
 
@@ -43,51 +45,17 @@ def configure_warnings(quiet: bool = True) -> None:
         logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 
-def to_pd_series(
-    obj: Any,
-    *,
-    freq: str | None = None,
-    name: str | None = None,
-    sort_index: bool = True,
-) -> pd.Series:
-    if isinstance(obj, TimeSeries):
-        series = obj.to_series()
-    elif isinstance(obj, pd.Series):
-        series = obj.copy()
-    elif isinstance(obj, pd.DataFrame) and len(obj.columns) == 1:
-        series = obj.iloc[:, 0].copy()
-    else:
-        raise TypeError(f"No se puede convertir a pd.Series: {type(obj)}")
-
-    if name is not None:
-        series.name = name
-    if sort_index:
-        series = series.sort_index()
-    if freq is not None:
-        series = series[~series.index.duplicated(keep="last")]
-        series = series.asfreq(freq)
-    return series
-
-
 def load_and_normalize_series(
     *,
-    base_path: str,
-    key_word: str,
-    file_extension: str,
     freq: str,
     name_from_path: bool = True,
     target_column_index: int | None = None,
 ) -> list[pd.DataFrame]:
-    file_paths = sorted(
-        load_dataset_paths(
-            base_path=base_path,
-            key_word=key_word,
-            file_extension=file_extension,
-        )
-    )
+    """Load matching files and normalize each target column to one datetime series."""
+    file_paths = sorted(load_dataset_paths())
     if not file_paths:
         raise FileNotFoundError(
-            f"No se encontraron archivos en '{base_path}' con keyword='{key_word}' y extension='{file_extension}'."
+            "No se encontraron archivos para la configuracion actual."
         )
 
     out: list[pd.DataFrame] = []
@@ -112,16 +80,15 @@ def load_and_normalize_series(
                 )
             col_name = str(df.columns[int(target_column_index)])
             series = pd.to_numeric(df[col_name], errors="coerce")
-            series = series[~series.index.duplicated(keep="last")].sort_index().asfreq(freq)
-            out.append(series.to_frame(name=col_name).astype(float))
+            normalized = ensure_datetime_series(series, freq=freq, name=col_name)
+            out.append(normalized.to_frame(name=col_name))
             continue
 
         if len(df.columns) != 1:
             continue
 
         col_name = str(df.columns[0])
-        series = df.iloc[:, 0].astype(float).sort_index()
-        series = series[~series.index.duplicated(keep="last")].asfreq(freq)
-        out.append(series.to_frame(name=col_name))
+        normalized = ensure_datetime_series(df.iloc[:, 0], freq=freq, name=col_name)
+        out.append(normalized.to_frame(name=col_name))
 
     return out
