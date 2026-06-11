@@ -1,4 +1,8 @@
 /couta/
+.agents
+reports
+lightning_logs
+darts_logs
 
 # Python cache/build artifacts
 __pycache__/

@@ -16,4 +16,4 @@
 	- Introducción y organización de las siguientes subsecciones 
 	- Para cada sistema hecho, introducción, esquema, resultados y evaluación. 
 
-6- Conclusiones generales y future work.   
+6- Conclusiones generales y future work.
