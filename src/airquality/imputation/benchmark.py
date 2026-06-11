@@ -1,8 +1,10 @@
+"""Core gap generation, imputation, and scoring utilities for benchmarks."""
+
 from __future__ import annotations
 
 import os  # Read optional Hugging Face token from environment variables.
 import warnings  # Suppress optional runtime warnings in prediction helpers.
-from dataclasses import dataclass  # Structured diagnostics for skipped gaps.
+from dataclasses import dataclass, field  # Structured diagnostics for skipped gaps.
 from typing import Any, Mapping, Sequence  # Typing utilities for flexible public API.
 
 import numpy as np  # Numeric operations for masks, metrics, and random sampling.
@@ -12,9 +14,10 @@ from pandas.tseries.frequencies import (
 )  # Frequency-aware timestamp arithmetic.
 
 from darts import TimeSeries  # Darts time series container used across the module.
+from darts.metrics import mase as darts_mase
 from airquality.data.io import resolve_device, to_pd_series
-from airquality.modeling.training_config import DatasetBundle
-from airquality.data.utils import ensure_datetime_series
+from airquality.data.series import ensure_datetime_series
+from airquality.modeling.training_config import BenchmarkDatasetBundle
 
 
 try:
@@ -58,10 +61,57 @@ class GapContextFailure:
     reason: str
 
 
+@dataclass(slots=True)
+class PlotSeriesPayload:
+    """Internal benchmark plotting payload for one series."""
+
+    actual: pd.Series
+    preds: dict[str, pd.Series] = field(default_factory=dict)
+    naive_mase: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+
+
+@dataclass(slots=True)
+class PlotGapPayload:
+    """Internal benchmark plotting payload for one gap size."""
+
+    series: dict[str, PlotSeriesPayload]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _make_plot_series_payload(actual: pd.Series, naive_mase: pd.Series) -> PlotSeriesPayload:
+    """Create the plot payload container used for one benchmark series."""
+    return PlotSeriesPayload(
+        actual=actual,
+        preds={},
+        naive_mase=naive_mase,
+    )
+
+
+def _serialize_plot_series_payload(payload: PlotSeriesPayload) -> dict[str, Any]:
+    """Convert one plot-series payload dataclass into the plotting dict format."""
+    return {
+        "actual": payload.actual,
+        "preds": dict(payload.preds),
+        "naive_mase": payload.naive_mase,
+    }
+
+
+def _serialize_plot_gap_payload(payload: PlotGapPayload) -> dict[str, Any]:
+    """Convert one gap payload dataclass into the public plot-store format."""
+    serialized: dict[str, Any] = {
+        "series": {
+            series_name: _serialize_plot_series_payload(series_payload)
+            for series_name, series_payload in payload.series.items()
+        }
+    }
+    serialized.update(payload.metadata)
+    return serialized
+
+
 _ensure_datetime_series = ensure_datetime_series
 
 
-def _ts_to_series(ts: TimeSeries, *, freq: str, name: str) -> pd.Series:
+def _ts_to_series(ts: TimeSeries, freq: str, name: str) -> pd.Series:
     """Convert Darts `TimeSeries` into normalized `pd.Series`."""
     out = to_pd_series(ts, freq=freq, name=name)
     return _ensure_datetime_series(out, freq=freq, name=name)
@@ -166,7 +216,7 @@ def _normalize_series_collection(
 
 
 def _extract_test_series_from_dataset_bundle(
-    dataset_bundle: DatasetBundle, *, freq: str
+    dataset_bundle: BenchmarkDatasetBundle, *, freq: str
 ) -> tuple[dict[str, pd.Series], dict[str, pd.Series], dict[str, Any]]:
     """Build unscaled/scaled test series from project `dataset_bundle`."""
     valid_cols = list(dataset_bundle.valid_cols)
@@ -253,32 +303,119 @@ def _model_requires_unscaled_input(model: Any) -> bool:
     )
 
 
-def _build_all_series_map(
-    all_series: Sequence[pd.DataFrame | pd.Series] | Mapping[str, Any] | None,
-    *,
+def _prepare_pipeline_series_maps(
+    dataset_bundle: BenchmarkDatasetBundle,
+    predict_on_scaled_series: bool,
     freq: str,
-) -> dict[str, pd.Series]:
-    """Normalize optional full/reference series collection to `{name: series}`."""
-    if all_series is None:
-        return {}
-    return _normalize_series_collection(
-        all_series, freq=freq, default_prefix="all_series"
+) -> tuple[
+    dict[str, pd.Series],
+    dict[str, pd.Series],
+    dict[str, pd.Series],
+    dict[str, Any],
+]:
+    """Build benchmark series maps from one required dataset bundle."""
+    test_map_unscaled, test_map_scaled, bundle_scalers = _extract_test_series_from_dataset_bundle(
+        dataset_bundle, freq=freq
+    )
+
+    if not dataset_bundle.all_series_unscaled:
+        raise ValueError(
+            "`dataset_bundle.all_series_unscaled` es obligatorio para ejecutar el benchmark."
+        )
+
+    all_series_map = _normalize_series_collection(
+        dataset_bundle.all_series_unscaled,
+        freq=freq,
+        default_prefix="all_series",
+    )
+
+    return (
+        test_map_unscaled,
+        test_map_scaled,
+        all_series_map,
+        bundle_scalers,
     )
 
 
-def _derive_train_series_from_full(
-    *,
+def _derive_context_before_gap(
     series_name: str,
-    test_series: pd.Series,
-    all_series_by_name: Mapping[str, pd.Series],
-) -> pd.Series | None:
-    """Derive train history as all points before the first test timestamp."""
-    full = all_series_by_name.get(series_name)
-    if full is None or len(full) == 0 or len(test_series) == 0:
-        return None
-    test_start = pd.Timestamp(test_series.index.min())
-    out = full.loc[full.index < test_start].copy()
-    return out if len(out) > 0 else None
+    gap_start: pd.Timestamp,
+    all_series_map: Mapping[str, pd.Series],
+    scaler: Any | None,
+    freq: str,
+) -> tuple[pd.Series, pd.Series]:
+    """Derive unscaled and scaled context before the gap starting at gap_start.
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series]
+        (unscaled_context, scaled_context)
+    """
+    full = all_series_map[series_name]
+    unscaled_context = full.loc[full.index < gap_start].copy()
+    if scaler is not None and hasattr(scaler, "transform"):
+        try:
+            ts_scaled = scaler.transform(TimeSeries.from_series(unscaled_context, freq=freq))
+            scaled_context = _ts_to_series(ts_scaled, freq=freq, name=series_name).astype(np.float32)
+        except Exception:
+            scaled_context = unscaled_context.copy()
+    else:
+        scaled_context = unscaled_context.copy()
+    return unscaled_context, scaled_context
+
+
+def _compute_gap_mase(
+    actual_gap: pd.Series,
+    pred_gap: pd.Series,
+    insample: pd.Series,
+    seasonality_m: int,
+    freq: str,
+) -> float:
+    """Compute MASE for a single gap using Darts mase function."""
+    if len(actual_gap) == 0 or len(pred_gap) == 0 or len(insample) == 0:
+        return float("nan")
+    try:
+        aligned_idx = actual_gap.index.intersection(pred_gap.index)
+        if len(aligned_idx) == 0:
+            return float("nan")
+
+        actual_clean = actual_gap.reindex(aligned_idx).astype(float)
+        pred_clean = pred_gap.reindex(aligned_idx).astype(float)
+        valid = np.isfinite(actual_clean.to_numpy(dtype=float)) & np.isfinite(
+            pred_clean.to_numpy(dtype=float)
+        )
+        if not np.any(valid):
+            return float("nan")
+
+        actual_clean = actual_clean.iloc[valid]
+        pred_clean = pred_clean.iloc[valid]
+
+        insample_clean = insample.copy()
+        if insample_clean.isna().any():
+            insample_clean = (
+                insample_clean.interpolate(method="time", limit_direction="both")
+                .ffill()
+                .bfill()
+            )
+        if not np.isfinite(insample_clean.to_numpy(dtype=float)).any():
+            return float("nan")
+
+        actual_ts = TimeSeries.from_series(actual_clean, freq=freq)
+        pred_ts = TimeSeries.from_series(pred_clean, freq=freq)
+        insample_ts = TimeSeries.from_series(insample_clean, freq=freq)
+        val = darts_mase(
+            actual_series=actual_ts,
+            pred_series=pred_ts,
+            insample=insample_ts,
+            m=int(seasonality_m),
+            intersect=True,
+        )
+        if isinstance(val, (list, np.ndarray)):
+            val = np.nanmean(val)
+        val = float(val)
+        return val if np.isfinite(val) else float("nan")
+    except Exception:
+        return float("nan")
 
 
 def _build_gap_index(
@@ -398,6 +535,79 @@ def _generate_hybrid_tspulse_gaps(
     return sorted(block_windows + point_windows, key=lambda idx: pd.Timestamp(idx[0]))
 
 
+def _build_gap_windows_for_series(
+    *,
+    series_name: str,
+    ts_test: pd.Series,
+    gap_size: int,
+    num_gaps: int,
+    strategy: str,
+    rng: np.random.Generator,
+    freq: str,
+    hybrid_random_fraction: float,
+    gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None,
+) -> list[pd.DatetimeIndex]:
+    """Choose the synthetic gap windows to evaluate for one test series."""
+    if gap_spec_by_series is not None and series_name in gap_spec_by_series:
+        windows = [
+            _build_gap_index(start=s, length=l, freq=freq)
+            for s, l in gap_spec_by_series[series_name]
+            if int(l) > 0
+        ]
+    elif strategy == "hybrid_tspulse":
+        windows = _generate_hybrid_tspulse_gaps(
+            series=ts_test,
+            gap_size=gap_size,
+            num_gaps=int(num_gaps),
+            rng=rng,
+            freq=freq,
+            random_fraction=float(hybrid_random_fraction),
+        )
+    else:
+        windows = _generate_block_gaps(
+            series=ts_test,
+            gap_size=gap_size,
+            num_gaps=int(num_gaps),
+            rng=rng,
+            freq=freq,
+        )
+
+    test_index_set = set(ts_test.index.tolist())
+    return [
+        w
+        for w in windows
+        if set(pd.DatetimeIndex(w).tolist()).issubset(test_index_set)
+    ]
+
+
+def _plan_gaps_for_all_series(
+    *,
+    test_map_unscaled: Mapping[str, pd.Series],
+    gap_size: int,
+    num_gaps: int,
+    strategy: str,
+    rng: np.random.Generator,
+    freq: str,
+    hybrid_random_fraction: float,
+    gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None,
+) -> dict[str, list[pd.DatetimeIndex]]:
+    """Plan synthetic gaps for every test series in the benchmark run."""
+    return {
+        series_name: _build_gap_windows_for_series(
+            series_name=series_name,
+            ts_test=ts_test,
+            gap_size=gap_size,
+            num_gaps=num_gaps,
+            strategy=strategy,
+            rng=rng,
+            freq=freq,
+            hybrid_random_fraction=hybrid_random_fraction,
+            gap_spec_by_series=gap_spec_by_series,
+        )
+        for series_name, ts_test in test_map_unscaled.items()
+    }
+
+
 def _gap_windows_to_mask_index(
     gap_windows: Sequence[pd.DatetimeIndex],
 ) -> pd.DatetimeIndex:
@@ -465,26 +675,19 @@ def infer_darts_minimum_context(model: Any) -> int:
 
 
 def _build_clean_left_context(
-    *,
-    test_series: pd.Series,
-    train_series: pd.Series | None,
+    series: pd.Series,
     gap_start: pd.Timestamp,
     required_context: int,
     freq: str,
 ) -> pd.Series:
     """Build contiguous, NaN-free left context ending exactly before one gap.
 
-    If early test points are insufficient, this function prepends train history.
+    The series passed should contain the history before the gap.
     """
     offset = to_offset(freq)
     cutoff = pd.Timestamp(gap_start) - offset
 
-    parts: list[pd.Series] = []
-    if train_series is not None and len(train_series) > 0:
-        parts.append(train_series.copy())
-    parts.append(test_series.loc[test_series.index <= cutoff].copy())
-
-    history = pd.concat(parts).sort_index() if parts else pd.Series(dtype=float)
+    history = series.loc[series.index <= cutoff].copy()
     history = history[~history.index.duplicated(keep="last")].asfreq(freq)
     if len(history) == 0 or cutoff not in history.index:
         return pd.Series(dtype=float)
@@ -509,17 +712,17 @@ def _build_clean_left_context(
     return pd.Series(
         values[slice_start : int(cutoff_pos) + 1],
         index=index[slice_start : int(cutoff_pos) + 1],
-        name=test_series.name,
+        name=series.name,
     )
 
 
 def darts_left_context_imputation_for_gaps(
-    *,
     model_name: str,
     model: Any,
     series_name: str,
-    test_series: pd.Series,
-    train_series: pd.Series | None,
+    all_series_map: Mapping[str, pd.Series],
+    scaler: Any | None,
+    use_scaled_for_model: bool,
     gap_windows: Sequence[pd.DatetimeIndex],
     freq: str,
     config_workers: Mapping[str, Any] | None = None,
@@ -529,7 +732,7 @@ def darts_left_context_imputation_for_gaps(
     Important behavior:
     - No interpolation/forward-fill is applied inside the gap for model input.
     - Context contains only valid points before the gap.
-    - If test history is insufficient, train tail is prepended.
+    - If test history is insufficient, prior-history tail is prepended.
     - If still insufficient, the gap is skipped and left as NaN, with diagnostics.
     """
     required_context = infer_darts_minimum_context(model)
@@ -546,9 +749,17 @@ def darts_left_context_imputation_for_gaps(
             continue
 
         gap_start = pd.Timestamp(gap_idx.min())
+        unscaled_context, scaled_context = _derive_context_before_gap(
+            series_name=series_name,
+            gap_start=gap_start,
+            all_series_map=all_series_map,
+            scaler=scaler,
+            freq=freq,
+        )
+        context_series = scaled_context if use_scaled_for_model else unscaled_context
+
         context = _build_clean_left_context(
-            test_series=test_series,
-            train_series=train_series,
+            series=context_series,
             gap_start=gap_start,
             required_context=required_context,
             freq=freq,
@@ -565,7 +776,7 @@ def darts_left_context_imputation_for_gaps(
                     available_context=int(len(context)),
                     reason=(
                         "No se alcanza el contexto minimo del modelo incluso "
-                        "completando con train; se deja NaN en ese gap."
+                        "completando con historial; se deja NaN en ese gap."
                     ),
                 )
             )
@@ -617,37 +828,23 @@ def darts_left_context_imputation_for_gaps(
 
 
 def build_tspulse_context_frame(
-    *,
-    test_series: pd.Series,
-    train_series: pd.Series | None,
+    series_name: str,
+    all_series_map: Mapping[str, pd.Series],
+    mask_index: pd.DatetimeIndex,
+    test_index: pd.DatetimeIndex,
     context_length: int,
     freq: str,
     timestamp_column: str = "timestamp",
     target_column: str = "value",
 ) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
-    """Build TSPulse-ready context frame from train tail + test segment.
+    """Build TSPulse-ready context frame from all_series_map + mask."""
+    full = all_series_map[series_name].copy()
+    if len(mask_index) > 0:
+        full.loc[full.index.intersection(mask_index)] = np.nan
 
-    Behavior aligned with TSPulse context constraints (base context length 512):
-    - If test history is shorter than required context, prepend train tail.
-    - If still short, left-pad by extending timeline and filling from nearest values.
-    - Return `(frame, original_test_index)`.
-    """
-    test_clean = _ensure_datetime_series(test_series, freq=freq, name="test_series")
-    train_clean = (
-        _ensure_datetime_series(train_series, freq=freq, name="train_series")
-        if train_series is not None and len(train_series) > 0
-        else pd.Series(dtype=float)
-    )
-
-    if len(test_clean) == 0:
-        raise ValueError("`test_series` no puede estar vacia")
-
-    combined = pd.concat([train_clean, test_clean]).sort_index()
-    combined = combined[~combined.index.duplicated(keep="last")]
-
-    end_ts = pd.Timestamp(test_clean.index.max())
+    end_ts = pd.Timestamp(test_index.max())
     context_index = pd.date_range(end=end_ts, periods=int(context_length), freq=freq)
-    context_values = combined.reindex(context_index)
+    context_values = full.reindex(context_index)
     context_values = (
         context_values.interpolate(method="time", limit_direction="both")
         .ffill()
@@ -656,7 +853,7 @@ def build_tspulse_context_frame(
 
     if context_values.isna().any():
         raise ValueError(
-            "No fue posible construir un contexto valido para TSPulse tras completar con train y padding"
+            "No fue posible construir un contexto valido para TSPulse tras completar con historial y padding"
         )
 
     frame = pd.DataFrame(
@@ -665,7 +862,7 @@ def build_tspulse_context_frame(
             target_column: context_values.to_numpy(dtype=float),
         }
     )
-    return frame, pd.DatetimeIndex(test_clean.index)
+    return frame, pd.DatetimeIndex(test_index)
 
 
 class TSPulseHistoricalImputer:
@@ -730,8 +927,10 @@ class TSPulseHistoricalImputer:
     def _impute_full_series(
         self,
         *,
-        series: pd.Series,
-        train_series: pd.Series | None,
+        series_name: str,
+        all_series_map: Mapping[str, pd.Series],
+        mask_index: pd.DatetimeIndex,
+        test_index: pd.DatetimeIndex,
         freq: str,
     ) -> pd.Series:
         """Run official TSPulse zero-shot imputation on one masked test series."""
@@ -740,9 +939,11 @@ class TSPulseHistoricalImputer:
                 "tsfm_public no esta instalado; no se puede ejecutar TSPulse"
             ) from TSFM_PUBLIC_IMPORT_ERROR
 
-        prepared, test_index = build_tspulse_context_frame(
-            test_series=series,
-            train_series=train_series,
+        prepared, test_index_out = build_tspulse_context_frame(
+            series_name=series_name,
+            all_series_map=all_series_map,
+            mask_index=mask_index,
+            test_index=test_index,
             context_length=self.context_length,
             freq=freq,
             timestamp_column="timestamp",
@@ -773,23 +974,26 @@ class TSPulseHistoricalImputer:
         idx = pd.DatetimeIndex(out["timestamp"])
         value_col = "value_imputed" if "value_imputed" in out.columns else "value"
         imputed = pd.Series(
-            out[value_col].to_numpy(dtype=float), index=idx, name=series.name
+            out[value_col].to_numpy(dtype=float), index=idx, name=series_name
         )
-        return imputed.reindex(test_index)
+        return imputed.reindex(test_index_out)
 
     def historical_imputation_forecasts(
         self,
         *,
-        masked_test_series: pd.Series,
-        train_series: pd.Series | None,
+        series_name: str,
+        all_series_map: Mapping[str, pd.Series],
         mask_index: pd.DatetimeIndex,
+        test_index: pd.DatetimeIndex,
         freq: str,
         **_: Any,
     ) -> pd.Series:
         """Impute all missing points and return predictions over mask timestamps."""
         imputed = self._impute_full_series(
-            series=masked_test_series,
-            train_series=train_series,
+            series_name=series_name,
+            all_series_map=all_series_map,
+            mask_index=mask_index,
+            test_index=test_index,
             freq=freq,
         )
         return imputed.reindex(mask_index)
@@ -818,17 +1022,16 @@ def _compute_metrics_on_mask(
     *,
     y_true: pd.Series,
     y_pred: pd.Series,
-    mase_denominator: float,
     metrics: Sequence[str],
 ) -> dict[str, float]:
-    """Compute selected metrics (MAE, RMSE, MASE) only on mask timestamps."""
+    """Compute selected metrics (MAE, RMSE) only on mask timestamps."""
     idx = y_true.index.intersection(y_pred.index)
     true_vals = y_true.reindex(idx).to_numpy(dtype=float)
     pred_vals = y_pred.reindex(idx).to_numpy(dtype=float)
 
     valid = np.isfinite(true_vals) & np.isfinite(pred_vals)
     if not np.any(valid):
-        return {m.upper(): float("nan") for m in metrics}
+        return {m.upper(): float("nan") for m in metrics if m.lower() in ("mae", "rmse")}
 
     err = true_vals[valid] - pred_vals[valid]
     out: dict[str, float] = {}
@@ -839,35 +1042,259 @@ def _compute_metrics_on_mask(
             out["MAE"] = float(np.mean(np.abs(err)))
         elif m == "rmse":
             out["RMSE"] = float(np.sqrt(np.mean(np.square(err))))
-        elif m == "mase":
-            mae_value = float(np.mean(np.abs(err)))
-            out["MASE"] = (
-                float(mae_value / mase_denominator)
-                if np.isfinite(mase_denominator) and mase_denominator > 0
-                else float("nan")
-            )
-        else:
-            raise ValueError(f"Metrica no soportada: {metric_name}")
-
     return out
 
 
-def execute_complete_pipeline(
-    *,
+def _build_plot_store_series_payloads(
+    test_map_unscaled: Mapping[str, pd.Series],
+    gaps_per_series: Mapping[str, Sequence[pd.DatetimeIndex]],
+    all_series_map: Mapping[str, pd.Series],
+    seasonality_m: int,
+) -> tuple[dict[str, PlotSeriesPayload], dict[str, pd.DatetimeIndex]]:
+    """Prepare plotting payloads and mask indexes before model inference."""
+    plot_series_payload: dict[str, PlotSeriesPayload] = {}
+    mask_index_by_series: dict[str, pd.DatetimeIndex] = {}
+
+    for series_name, ts_test in test_map_unscaled.items():
+        _, mask_index = _mask_test_series(ts_test, gaps_per_series[series_name])
+        mask_index_by_series[series_name] = mask_index
+        reference_full = all_series_map[series_name]
+
+        naive_mase = (
+            reference_full.shift(int(seasonality_m)).reindex(mask_index)
+            if len(reference_full) > 0
+            else pd.Series(dtype=float)
+        )
+
+        plot_series_payload[series_name] = _make_plot_series_payload(
+            actual=ts_test,
+            naive_mase=naive_mase,
+        )
+
+    return plot_series_payload, mask_index_by_series
+
+
+def _predict_mask_for_model_series(
+    model_name: str,
+    model: Any,
+    series_name: str,
+    test_index: pd.DatetimeIndex,
+    all_series_map: Mapping[str, pd.Series],
+    gap_windows: Sequence[pd.DatetimeIndex],
+    gap_size: int,
+    bundle_scalers: Mapping[str, Any],
+    use_scaled_for_model: bool,
+    freq: str,
+    config_workers: Mapping[str, Any],
+) -> tuple[pd.Series, list[GapContextFailure]]:
+    """Run one model on one series and return predictions over masked timestamps."""
+    mask_index = _gap_windows_to_mask_index(gap_windows)
+    pred_mask_model = pd.Series(index=mask_index, dtype=float, name=series_name)
+    failures: list[GapContextFailure] = []
+
+    if len(mask_index) > 0:
+        if hasattr(model, "historical_imputation_forecasts"):
+            pred_mask_model = model.historical_imputation_forecasts(
+                series_name=series_name,
+                all_series_map=all_series_map,
+                mask_index=mask_index,
+                test_index=test_index,
+                gap_size=gap_size,
+                freq=freq,
+                config_workers=config_workers,
+            )
+            pred_mask_model = pred_mask_model.reindex(mask_index).astype(float)
+        elif hasattr(model, "predict"):
+            pred_mask_model, failures = darts_left_context_imputation_for_gaps(
+                model_name=model_name,
+                model=model,
+                series_name=series_name,
+                all_series_map=all_series_map,
+                scaler=bundle_scalers.get(series_name),
+                use_scaled_for_model=use_scaled_for_model,
+                gap_windows=gap_windows,
+                freq=freq,
+                config_workers=config_workers,
+            )
+        else:
+            raise TypeError(
+                f"Modelo '{model_name}' no expone una interfaz de imputacion soportada "
+                "(historical_imputation_forecasts o predict)."
+            )
+
+    pred_mask = (
+        _inverse_scale_prediction_series(
+            pred_mask_model,
+            scaler=(bundle_scalers.get(series_name) if use_scaled_for_model else None),
+            freq=freq,
+            name=series_name,
+        )
+        .reindex(mask_index)
+        .astype(float)
+    )
+    return pred_mask, failures
+
+
+def _build_metric_row(
+    model_name: str,
+    series_name: str,
+    gap_size: int,
+    pred_mask: pd.Series,
+    ts_test_unscaled: pd.Series,
+    all_series_map: Mapping[str, pd.Series],
+    gap_windows: Sequence[pd.DatetimeIndex],
+    metric_list: Sequence[str],
+    seasonality_m: int,
+    freq: str,
+) -> dict[str, Any]:
+    """Build one benchmark result row for a model, series, and gap size."""
+    # Compute MAE/RMSE on the pooled mask timestamps
+    mae_rmse_metrics = [m for m in metric_list if m in ("mae", "rmse")]
+    row: dict[str, Any] = {
+        "Modelo": str(model_name),
+        "Serie": str(series_name),
+        "Gap_Size": int(gap_size),
+    }
+
+    if mae_rmse_metrics:
+        # Get pooled true values and predictions on mask index
+        mask_index = _gap_windows_to_mask_index(gap_windows)
+        y_true = ts_test_unscaled.reindex(mask_index)
+        y_pred = pred_mask.reindex(mask_index)
+        mae_rmse_values = _compute_metrics_on_mask(
+            y_true=y_true,
+            y_pred=y_pred,
+            metrics=mae_rmse_metrics,
+        )
+        row.update(mae_rmse_values)
+
+    if "mase" in metric_list:
+        gap_mases: list[float] = []
+        gap_lengths: list[int] = []
+
+        full_series = all_series_map[series_name]
+
+        for gap_idx in gap_windows:
+            if len(gap_idx) == 0:
+                continue
+
+            gap_start = pd.Timestamp(gap_idx.min())
+
+            actual_gap = ts_test_unscaled.reindex(gap_idx)
+            pred_gap = pred_mask.reindex(gap_idx)
+
+            insample = full_series.loc[full_series.index < gap_start].copy()
+
+            gap_mase = _compute_gap_mase(
+                actual_gap=actual_gap,
+                pred_gap=pred_gap,
+                insample=insample,
+                seasonality_m=seasonality_m,
+                freq=freq,
+            )
+
+            if np.isfinite(gap_mase):
+                gap_mases.append(gap_mase)
+                gap_lengths.append(len(gap_idx))
+
+        if len(gap_mases) > 0:
+            total_len = sum(gap_lengths)
+            weighted_sum = sum(m * l for m, l in zip(gap_mases, gap_lengths))
+            final_mase = weighted_sum / total_len
+        else:
+            final_mase = float("nan")
+
+        row["MASE"] = final_mase
+
+    return row
+
+
+def _execute_gap_size_pipeline(
+    gap_size: int,
     model_dict: Mapping[str, Any],
-    test_series: Mapping[str, Any]
-    | Sequence[Any]
-    | pd.DataFrame
-    | pd.Series
-    | TimeSeries
-    | None = None,
-    train_series: Mapping[str, Any]
-    | Sequence[Any]
-    | pd.DataFrame
-    | pd.Series
-    | TimeSeries
-    | None = None,
-    dataset_bundle: DatasetBundle | None = None,
+    test_map_unscaled: Mapping[str, pd.Series],
+    test_map_scaled: Mapping[str, pd.Series],
+    all_series_map: Mapping[str, pd.Series],
+    bundle_scalers: Mapping[str, Any],
+    predict_on_scaled_series: bool,
+    strategy: str,
+    num_gaps: int,
+    rng: np.random.Generator,
+    freq: str,
+    hybrid_random_fraction: float,
+    gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None,
+    seasonality_m: int,
+    metric_list: Sequence[str],
+    config_workers: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, PlotSeriesPayload], list[GapContextFailure]]:
+    """Execute gap generation, inference, and scoring for one gap size."""
+    gaps_per_series = _plan_gaps_for_all_series(
+        test_map_unscaled=test_map_unscaled,
+        gap_size=gap_size,
+        num_gaps=int(num_gaps),
+        strategy=strategy,
+        rng=rng,
+        freq=freq,
+        hybrid_random_fraction=float(hybrid_random_fraction),
+        gap_spec_by_series=gap_spec_by_series,
+    )
+
+    plot_series_payload, mask_index_by_series = _build_plot_store_series_payloads(
+        test_map_unscaled=test_map_unscaled,
+        gaps_per_series=gaps_per_series,
+        all_series_map=all_series_map,
+        seasonality_m=seasonality_m,
+    )
+
+    failures: list[GapContextFailure] = []
+    rows: list[dict[str, Any]] = []
+    for model_name, model in model_dict.items():
+        use_scaled_for_model = bool(
+            predict_on_scaled_series
+            and bundle_scalers
+            and not _model_requires_unscaled_input(model)
+        )
+
+        for series_name, ts_test_unscaled in test_map_unscaled.items():
+            gap_windows = gaps_per_series[series_name]
+
+            pred_mask, series_failures = _predict_mask_for_model_series(
+                model_name=model_name,
+                model=model,
+                series_name=series_name,
+                test_index=ts_test_unscaled.index,
+                all_series_map=all_series_map,
+                gap_windows=gap_windows,
+                gap_size=gap_size,
+                bundle_scalers=bundle_scalers,
+                use_scaled_for_model=use_scaled_for_model,
+                freq=freq,
+                config_workers=config_workers,
+            )
+            failures.extend(series_failures)
+
+            plot_series_payload[series_name].preds[model_name] = pred_mask
+            rows.append(
+                _build_metric_row(
+                    model_name=model_name,
+                    series_name=series_name,
+                    gap_size=gap_size,
+                    pred_mask=pred_mask,
+                    ts_test_unscaled=ts_test_unscaled,
+                    all_series_map=all_series_map,
+                    gap_windows=gap_windows,
+                    metric_list=metric_list,
+                    seasonality_m=seasonality_m,
+                    freq=freq,
+                )
+            )
+
+    return rows, plot_series_payload, failures
+
+
+def execute_complete_pipeline(
+    model_dict: Mapping[str, Any],
+    dataset_bundle: BenchmarkDatasetBundle,
     predict_on_scaled_series: bool = True,
     gap_sizes: Sequence[int] = (1, 2, 5, 10),
     num_gaps: int = 3,
@@ -885,14 +1312,14 @@ def execute_complete_pipeline(
     """Execute imputation benchmark across TSPulse and Darts models.
 
     Main responsibilities:
-    - Receive one or many test series and already-loaded models.
+    - Receive one dataset bundle and already-loaded models.
     - Generate (or receive) artificial gaps compatible with TSPulse notebook ideas.
     - Impute with TSPulse and Darts.
     - Evaluate MAE, RMSE, and MASE strictly on missing points.
-    - If test input comes from `dataset_bundle`, prediction is executed on scaled
-      values by default and predictions are inverse-transformed before scoring.
-    - If `dataset_bundle` includes `all_series_unscaled`, use it as fallback
-      history for train-context/MASE when `train_series` is not provided.
+    - Prediction is executed on scaled values by default and predictions are
+      inverse-transformed before scoring.
+    - `dataset_bundle.all_series_unscaled` is required and used as the source of
+      pre-test history for context/MASE.
     - Return predictions, metrics, and plotting payload.
 
     Returns
@@ -913,51 +1340,12 @@ def execute_complete_pipeline(
     if config_workers is None:
         config_workers = DEFAULT_CONFIG_WORKERS
 
-    bundle_scalers: dict[str, Any] = {}
-    if test_series is not None:
-        test_map_unscaled = _normalize_series_collection(
-            test_series, freq=freq, default_prefix="test"
-        )
-        test_map_scaled = {name: s.copy() for name, s in test_map_unscaled.items()}
-    elif dataset_bundle is not None:
-        test_map_unscaled, test_map_scaled, bundle_scalers = (
-            _extract_test_series_from_dataset_bundle(dataset_bundle, freq=freq)
-        )
-    else:
-        raise ValueError("Debes pasar `test_series` o `dataset_bundle`")
-
-    train_map = (
-        _normalize_series_collection(train_series, freq=freq, default_prefix="train")
-        if train_series is not None
-        else {}
-    )
-
-    bundle_all_series_map: dict[str, pd.Series] = {}
-    if dataset_bundle is not None:
-        bundle_all_series = dataset_bundle.all_series_unscaled
-        if bundle_all_series is not None:
-            bundle_all_series_map = _build_all_series_map(bundle_all_series, freq=freq)
-
-    all_series_map = dict(bundle_all_series_map)
-
-    # If train was not provided explicitly, derive from full/reference series.
-    for series_name, ts_test in test_map_unscaled.items():
-        if series_name not in train_map:
-            derived = _derive_train_series_from_full(
-                series_name=series_name,
-                test_series=ts_test,
-                all_series_by_name=all_series_map,
-            )
-            if derived is not None:
-                train_map[series_name] = _ensure_datetime_series(
-                    derived, freq=freq, name=series_name
-                )
-
-    train_map_scaled = (
-        _scale_series_map(train_map, dict_scalers=bundle_scalers, freq=freq)
-        if predict_on_scaled_series and bundle_scalers
-        else {name: s.copy() for name, s in train_map.items()}
-    )
+    (
+        test_map_unscaled,
+        test_map_scaled,
+        all_series_map,
+        bundle_scalers,
+    ) = _prepare_pipeline_series_maps(dataset_bundle, predict_on_scaled_series, freq)
 
     strategy = str(gap_strategy).strip().lower()
     if strategy not in {"block", "hybrid_tspulse"}:
@@ -972,213 +1360,29 @@ def execute_complete_pipeline(
         if gap_size <= 0:
             raise ValueError("Todos los `gap_sizes` deben ser > 0")
 
-        gaps_per_series: dict[str, list[pd.DatetimeIndex]] = {}
-        for series_name, ts_test in test_map_unscaled.items():
-            if gap_spec_by_series is not None and series_name in gap_spec_by_series:
-                windows = [
-                    _build_gap_index(start=s, length=l, freq=freq)
-                    for s, l in gap_spec_by_series[series_name]
-                    if int(l) > 0
-                ]
-            elif strategy == "hybrid_tspulse":
-                windows = _generate_hybrid_tspulse_gaps(
-                    series=ts_test,
-                    gap_size=gap_size,
-                    num_gaps=int(num_gaps),
-                    rng=rng,
-                    freq=freq,
-                    random_fraction=float(hybrid_random_fraction),
-                )
-            else:
-                windows = _generate_block_gaps(
-                    series=ts_test,
-                    gap_size=gap_size,
-                    num_gaps=int(num_gaps),
-                    rng=rng,
-                    freq=freq,
-                )
-
-            # Keep only windows fully contained in current test index.
-            test_index_set = set(ts_test.index.tolist())
-            windows = [
-                w
-                for w in windows
-                if set(pd.DatetimeIndex(w).tolist()).issubset(test_index_set)
-            ]
-            gaps_per_series[series_name] = windows
-
-        plot_store[gap_size] = {"series": {}}
-        failures_by_gap[gap_size] = []
-        mask_index_by_series: dict[str, pd.DatetimeIndex] = {}
-
-        # Initialize plotting payload by series.
-        for series_name, ts_test in test_map_unscaled.items():
-            _, mask_index = _mask_test_series(ts_test, gaps_per_series[series_name])
-            mask_index_by_series[series_name] = mask_index
-            reference_full = all_series_map.get(series_name)
-            if reference_full is None:
-                reference_full = pd.concat(
-                    [train_map.get(series_name, pd.Series(dtype=float)), ts_test]
-                ).sort_index()
-                reference_full = reference_full[
-                    ~reference_full.index.duplicated(keep="last")
-                ]
-
-            naive_mase = (
-                reference_full.shift(int(seasonality_m)).reindex(mask_index)
-                if len(reference_full) > 0
-                else pd.Series(dtype=float)
-            )
-
-            plot_store[gap_size]["series"][series_name] = {
-                "actual": ts_test,
-                "preds": {},
-                "naive_mase": naive_mase,
-            }
-
-        eval_payload_by_series: dict[str, dict[str, Any]] = {}
-        for series_name, ts_test_unscaled in test_map_unscaled.items():
-            mask_index = mask_index_by_series[series_name]
-            ts_train_unscaled = train_map.get(series_name)
-
-            y_true = ts_test_unscaled.reindex(mask_index)
-            if len(mask_index) > 0:
-                first_gap_start = pd.Timestamp(mask_index.min())
-                insample_parts: list[pd.Series] = []
-                if ts_train_unscaled is not None and len(ts_train_unscaled) > 0:
-                    insample_parts.append(ts_train_unscaled)
-
-                pre_gap_test = ts_test_unscaled.loc[
-                    ts_test_unscaled.index < first_gap_start
-                ]
-                if len(pre_gap_test) > 0:
-                    insample_parts.append(pre_gap_test)
-
-                if insample_parts:
-                    insample = pd.concat(insample_parts).sort_index()
-                    insample = insample[~insample.index.duplicated(keep="last")]
-                else:
-                    insample = pd.Series(dtype=float)
-
-                if len(insample) == 0:
-                    ref = all_series_map.get(series_name)
-                    if ref is not None:
-                        insample = ref.loc[ref.index < first_gap_start]
-            else:
-                insample = (
-                    ts_train_unscaled.copy()
-                    if ts_train_unscaled is not None
-                    else pd.Series(dtype=float)
-                )
-
-            mase_denom = _compute_mase_denominator(
-                insample,
-                seasonality_m=seasonality_m,
-                freq=freq,
-            )
-            eval_payload_by_series[series_name] = {
-                "y_true": y_true,
-                "mase_denom": mase_denom,
-            }
-
-        for model_name, model in model_dict.items():
-            use_scaled_for_model = bool(
-                predict_on_scaled_series
-                and bundle_scalers
-                and not _model_requires_unscaled_input(model)
-            )
-
-            for series_name, ts_test_unscaled in test_map_unscaled.items():
-                gap_windows = gaps_per_series[series_name]
-                ts_train_unscaled = train_map.get(series_name)
-
-                ts_test_model = (
-                    test_map_scaled[series_name]
-                    if use_scaled_for_model
-                    else ts_test_unscaled
-                )
-                ts_train_model = (
-                    train_map_scaled.get(series_name)
-                    if use_scaled_for_model
-                    else ts_train_unscaled
-                )
-
-                ts_masked_model, mask_index = _mask_test_series(
-                    ts_test_model, gap_windows
-                )
-                pred_mask_model = pd.Series(
-                    index=mask_index, dtype=float, name=series_name
-                )
-
-                if len(mask_index) > 0:
-                    if hasattr(model, "historical_imputation_forecasts"):
-                        pred_mask_model = model.historical_imputation_forecasts(
-                            series_name=series_name,
-                            test_series=ts_test_model,
-                            masked_test_series=ts_masked_model,
-                            train_series=ts_train_model,
-                            mask_index=mask_index,
-                            gap_size=gap_size,
-                            freq=freq,
-                            config_workers=config_workers,
-                        )
-                        pred_mask_model = pred_mask_model.reindex(mask_index).astype(
-                            float
-                        )
-                    elif hasattr(model, "predict"):
-                        pred_mask_model, failures = (
-                            darts_left_context_imputation_for_gaps(
-                                model_name=model_name,
-                                model=model,
-                                series_name=series_name,
-                                test_series=ts_test_model,
-                                train_series=ts_train_model,
-                                gap_windows=gap_windows,
-                                freq=freq,
-                                config_workers=config_workers,
-                            )
-                        )
-                        failures_by_gap[gap_size].extend(failures)
-                    else:
-                        raise TypeError(
-                            f"Modelo '{model_name}' no expone una interfaz de imputacion soportada "
-                            "(historical_imputation_forecasts o predict)."
-                        )
-
-                pred_mask = (
-                    _inverse_scale_prediction_series(
-                        pred_mask_model,
-                        scaler=(
-                            bundle_scalers.get(series_name)
-                            if use_scaled_for_model
-                            else None
-                        ),
-                        freq=freq,
-                        name=series_name,
-                    )
-                    .reindex(mask_index)
-                    .astype(float)
-                )
-
-                plot_store[gap_size]["series"][series_name]["preds"][model_name] = (
-                    pred_mask
-                )
-
-                eval_payload = eval_payload_by_series[series_name]
-                metric_values = _compute_metrics_on_mask(
-                    y_true=eval_payload["y_true"],
-                    y_pred=pred_mask,
-                    mase_denominator=float(eval_payload["mase_denom"]),
-                    metrics=metric_list,
-                )
-
-                row: dict[str, Any] = {
-                    "Modelo": str(model_name),
-                    "Serie": str(series_name),
-                    "Gap_Size": int(gap_size),
-                }
-                row.update(metric_values)
-                rows.append(row)
+        gap_rows, plot_series_payload, gap_failures = _execute_gap_size_pipeline(
+            gap_size=gap_size,
+            model_dict=model_dict,
+            test_map_unscaled=test_map_unscaled,
+            test_map_scaled=test_map_scaled,
+            all_series_map=all_series_map,
+            bundle_scalers=bundle_scalers,
+            predict_on_scaled_series=predict_on_scaled_series,
+            strategy=strategy,
+            num_gaps=int(num_gaps),
+            rng=rng,
+            freq=freq,
+            hybrid_random_fraction=float(hybrid_random_fraction),
+            gap_spec_by_series=gap_spec_by_series,
+            seasonality_m=seasonality_m,
+            metric_list=metric_list,
+            config_workers=config_workers,
+        )
+        rows.extend(gap_rows)
+        plot_store[gap_size] = _serialize_plot_gap_payload(
+            PlotGapPayload(series=plot_series_payload)
+        )
+        failures_by_gap[gap_size] = gap_failures
 
         if failures_by_gap[gap_size]:
             unique_reasons = sorted({f.reason for f in failures_by_gap[gap_size]})

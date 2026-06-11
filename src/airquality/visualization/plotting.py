@@ -1,3 +1,5 @@
+"""Plotting helpers for benchmark predictions, gaps, and model comparisons."""
+
 from __future__ import annotations
 
 import math
@@ -22,6 +24,7 @@ def _draw_series(
     lw: float = 1.5,
     linestyle: str = "-",
 ) -> str | None:
+    """Draw one line or point series and return the rendered color."""
     if render_style == "points":
         line = ax.plot(
             x,
@@ -53,6 +56,7 @@ def _plot_vertical_error_connectors(
     pred: pd.Series,
     color: str | None,
 ) -> None:
+    """Draw vertical connectors between real and predicted gap values."""
     common_idx = gap_real.index.intersection(pred.index)
     for ts in common_idx:
         y_true = float(gap_real.loc[ts])
