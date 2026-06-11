@@ -1,3 +1,5 @@
+"""Training helpers for building datasets, fitting models, and exporting metrics."""
+
 import os
 import tempfile
 import gc
@@ -22,8 +24,9 @@ from darts.models import (
 from darts.utils.missing_values import extract_subseries
 
 from airquality.modeling.training_config import (
-    BASE_TRAINING_KWARGS,
-    DatasetBundle,
+    BenchmarkDatasetBundle,
+    TrainingDatasetBundle,
+    build_base_training_kwargs,
     build_model_configs,
 )
 
@@ -119,31 +122,71 @@ def build_scaled_train_val_series(
     return train_series_list, val_series_list, dict_scalers
 
 
-def build_train_val_test_series(
+def build_training_dataset_bundle(
+    series_dfs: Sequence[pd.DataFrame],
+    longest_segment: pd.DataFrame | None = None,
+    val_size: int = 10,
+    min_train_len: int = 82,
+    val_context_len: int = 72,
+) -> TrainingDatasetBundle:
+    """
+    Construye series de train/val escaladas.
+
+    Para evitar fuga de datos, elimina (pone NaN) el bloque temporal de
+    `longest_segment` (si se provee) dentro de cada serie.
+    """
+    series_train_input: list[pd.DataFrame] = []
+    seen_names: set[str] = set()
+
+    for series_df in series_dfs:
+        if len(series_df.columns) != 1:
+            raise ValueError(
+                "Cada elemento de `series_dfs` debe tener exactamente una columna."
+            )
+
+        col = str(series_df.columns[0])
+        if col in seen_names:
+            raise ValueError(f"Nombre de serie duplicado en `series_dfs`: {col}")
+        seen_names.add(col)
+
+        series_full = series_df.iloc[:, 0].astype(np.float32).copy()
+        series_full.name = col
+
+        series_copy = series_full.copy()
+        if longest_segment is not None and col in longest_segment.columns:
+            test_rows = series_copy.index.intersection(longest_segment.index)
+            series_copy.loc[test_rows] = np.nan
+
+        series_train_input.append(series_copy.to_frame())
+
+    series_train, series_val, _ = build_scaled_train_val_series(
+        series_train_input,
+        val_size=val_size,
+        min_train_len=min_train_len,
+        val_context_len=val_context_len,
+    )
+
+    return TrainingDatasetBundle(
+        series_train=series_train,
+        series_val=series_val,
+    )
+
+
+def build_benchmark_dataset_bundle(
     series_dfs: Sequence[pd.DataFrame],
     longest_segment: pd.DataFrame,
     val_size: int,
     min_train_len: int,
     val_context_len: int = 72,
-) -> DatasetBundle:
+    test_only_series: Sequence[pd.Series] | None = None,
+    test_only_train_fraction: float = 0.6,
+) -> BenchmarkDatasetBundle:
     """
-    Construye train/val/test escalados en un solo paso.
-
-    Para evitar fuga de datos, elimina (pone NaN) el bloque temporal de
-    `longest_segment` dentro de cada serie que esté presente en ese segmento
-    antes de construir train/val. Luego aplica los mismos scalers al segmento
-    de test para evitar repetir el flujo en distintos sitios.
-
-    `val_size` define la cola (en puntos) reservada para validacion en cada
-    bloque continuo.
-
-    `val_context_len` define cuántos puntos previos a esa cola se conservan en
-    cada serie de validacion como contexto de entrada.
-
-    Además devuelve `all_series_unscaled` (solo para columnas válidas), útil
-    para pipelines de imputación que necesitan recuperar historial de train a
-    partir del propio `dataset_bundle` sin tener que pasar `all_series` aparte.
+    Construye las entradas de benchmark/evaluacion.
     """
+    if not (0.0 < float(test_only_train_fraction) < 1.0):
+        raise ValueError("`test_only_train_fraction` debe estar en (0, 1)")
+
     series_train_input: list[pd.DataFrame] = []
     seen_names: set[str] = set()
     all_series_unscaled: dict[str, pd.Series] = {}
@@ -170,7 +213,7 @@ def build_train_val_test_series(
 
         series_train_input.append(series_copy.to_frame())
 
-    series_train, series_val, dict_scalers = build_scaled_train_val_series(
+    _, _, dict_scalers = build_scaled_train_val_series(
         series_train_input,
         val_size=val_size,
         min_train_len=min_train_len,
@@ -185,14 +228,45 @@ def build_train_val_test_series(
         for col in valid_cols
     ]
 
+    for series_raw in test_only_series or ():
+        col = str(series_raw.name) if series_raw.name is not None else ""
+        if not col:
+            raise ValueError("Cada serie en `test_only_series` debe tener nombre.")
+        if col in seen_names:
+            raise ValueError(
+                f"La serie test-only '{col}' ya existe en `series_dfs`; usa nombres unicos."
+            )
+        seen_names.add(col)
+
+        series_full = series_raw.astype(np.float32).copy()
+        series_full.name = col
+        all_series_unscaled[col] = series_full.copy()
+
+        split_idx = int(len(series_full) * float(test_only_train_fraction))
+        split_idx = max(1, min(split_idx, len(series_full) - 1))
+        train_prefix = series_full.iloc[:split_idx].copy()
+        test_suffix = series_full.iloc[split_idx:].copy()
+
+        if len(train_prefix) == 0 or len(test_suffix) == 0:
+            raise ValueError(
+                f"La serie test-only '{col}' no deja train/test validos con fraction={test_only_train_fraction}."
+            )
+
+        sc = Scaler(global_fit=True, scaler=StandardScaler()).fit(
+            [TimeSeries.from_series(train_prefix, freq="h")]
+        )
+        dict_scalers[col] = sc
+        valid_cols.append(col)
+        series_test.append(
+            sc.transform(TimeSeries.from_series(test_suffix, freq="h")).astype(np.float32)
+        )
+
     if not valid_cols:
         raise ValueError(
             "No hay columnas válidas para test tras construir train/val sin fuga de datos."
         )
 
-    return DatasetBundle(
-        series_train=series_train,
-        series_val=series_val,
+    return BenchmarkDatasetBundle(
         series_test=series_test,
         dict_scalers=dict_scalers,
         valid_cols=valid_cols,
@@ -205,6 +279,7 @@ def build_train_val_test_series(
 
 
 def _metric_to_float(metric_value: Any) -> float | None:
+    """Convert one callback metric value to a plain float when possible."""
     if metric_value is None:
         return None
 
@@ -229,6 +304,7 @@ def _read_metric_from_callback_metrics(
     callback_metrics: Any,
     candidate_names: Sequence[str],
 ) -> float | None:
+    """Read the first available metric value from callback metrics."""
     if callback_metrics is None:
         return None
 
@@ -282,6 +358,7 @@ def _attach_loss_history_callback(
     model_cls: type,
     model_kwargs: dict[str, Any],
 ) -> tuple[dict[str, Any], LossHistoryCallback | None]:
+    """Attach a loss-tracking callback when the model uses Lightning training."""
     kwargs = deepcopy(model_kwargs)
 
     if model_cls is LinearRegressionModel:
@@ -305,6 +382,7 @@ def _build_curve_rows(
     training_time_seconds: float,
     loss_callback: LossHistoryCallback | None,
 ) -> list[dict[str, Any]]:
+    """Convert one model's tracked losses into CSV-ready metric rows."""
     base_row = {
         "model_name": model_name,
         "training_time_seconds": float(training_time_seconds),
@@ -433,7 +511,7 @@ def fit_darts_model(
     if model_cls is LinearRegressionModel:
         kwargs = deepcopy(model_kwargs)
     else:
-        kwargs = deepcopy(BASE_TRAINING_KWARGS)
+        kwargs = deepcopy(build_base_training_kwargs())
         kwargs.update(model_kwargs)
         kwargs = _filter_model_init_kwargs(model_cls, kwargs)
 
@@ -623,9 +701,9 @@ def finetune_models_from_data(
     `val_context_len` usa la misma semantica de ventana de contexto para val
     que `build_train_val_test_series()`.
     """
-    dataset_bundle = build_train_val_test_series(
+    dataset_bundle = build_training_dataset_bundle(
         series_dfs,
-        longest_segment,
+        longest_segment=longest_segment,
         val_size=val_size,
         min_train_len=min_train_len,
         val_context_len=val_context_len,
@@ -644,8 +722,85 @@ def finetune_models_from_data(
     )
 
 
+def _resolve_models_dir(model_output_dir: str | None) -> Path:
+    """Resolve and create the directory used for saved model artifacts."""
+    if model_output_dir is None:
+        models_dir = Path(__file__).resolve().parents[3] / "models"
+    else:
+        models_dir = Path(model_output_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return models_dir
+
+
+def _train_single_global_method(
+    *,
+    name: str,
+    model_configs: dict[str, tuple[type, dict[str, Any]]],
+    series_train: list[TimeSeries],
+    series_val: list[TimeSeries],
+    size_k: int,
+    resume_mode: str | None,
+    models_dir: Path,
+) -> tuple[str, Any, list[dict[str, Any]]]:
+    """Train one configured forecasting model and save its artifact."""
+    if name not in model_configs:
+        raise ValueError(
+            f"Método no soportado: '{name}'. Disponibles: {sorted(model_configs)}"
+        )
+
+    print(f"Entrenando {name}")
+    model_cls, model_kwargs = model_configs[name]
+    model_kwargs_with_name = deepcopy(model_kwargs)
+    if model_cls is not LinearRegressionModel and not model_kwargs_with_name.get(
+        "model_name"
+    ):
+        model_kwargs_with_name["model_name"] = f"{name}_k{size_k}"
+    tracked_kwargs, loss_callback = _attach_loss_history_callback(
+        model_cls,
+        model_kwargs_with_name,
+    )
+    start_time = time.perf_counter()
+    model = fit_darts_model(
+        model_cls,
+        series_train,
+        series_val,
+        size_k,
+        tracked_kwargs,
+        resume_mode=resume_mode,
+    )
+    elapsed = time.perf_counter() - start_time
+    curve_rows = _build_curve_rows(name, elapsed, loss_callback)
+
+    model_save_path = models_dir / f"{name}_k{size_k}.pt"
+    model.save(str(model_save_path))
+    print(f"Modelo guardado en: {model_save_path.resolve()}")
+    return name, model, curve_rows
+
+
+def _export_training_curve_rows(
+    *, curve_rows: list[dict[str, Any]], csv_output_path: str
+) -> None:
+    """Write aggregated training-curve rows to the configured CSV file."""
+    curve_df = pd.DataFrame(
+        curve_rows,
+        columns=[
+            "model_name",
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "training_time_seconds",
+        ],
+    ).sort_values(["model_name", "epoch"], ignore_index=True)
+
+    output_path = Path(csv_output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    curve_df = _merge_curve_rows_with_existing_csv(curve_df, output_path)
+    curve_df.to_csv(output_path, index=False)
+    print(f"CSV exportado en: {output_path.resolve()}")
+
+
 def train_global_methods(
-    dataset_bundle: DatasetBundle,
+    dataset_bundle: TrainingDatasetBundle,
     size_k: int,
     method_names: Sequence[str],
     csv_output_path: str | None = "reports/metrics/training_curves_and_times.csv",
@@ -675,67 +830,28 @@ def train_global_methods(
     trained_models: dict[str, Any] = {}
     curve_rows: list[dict[str, Any]] = []
     model_configs = build_model_configs()
-
-    if model_output_dir is None:
-        models_dir = Path(__file__).resolve().parents[3] / "models"
-    else:
-        models_dir = Path(model_output_dir)
-    models_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = _resolve_models_dir(model_output_dir)
 
     series_train = dataset_bundle.series_train
     series_val = dataset_bundle.series_val
 
     for name in method_names:
-        if name not in model_configs:
-            raise ValueError(
-                f"Método no soportado: '{name}'. Disponibles: {sorted(model_configs)}"
-            )
-
-        print(f"Entrenando {name}")
-        model_cls, model_kwargs = model_configs[name]
-        model_kwargs_with_name = deepcopy(model_kwargs)
-        if model_cls is not LinearRegressionModel and not model_kwargs_with_name.get(
-            "model_name"
-        ):
-            model_kwargs_with_name["model_name"] = f"{name}_k{size_k}"
-        tracked_kwargs, loss_callback = _attach_loss_history_callback(
-            model_cls,
-            model_kwargs_with_name,
-        )
-        start_time = time.perf_counter()
-        model = fit_darts_model(
-            model_cls,
-            series_train,
-            series_val,
-            size_k,
-            tracked_kwargs,
+        trained_name, model, model_curve_rows = _train_single_global_method(
+            name=name,
+            model_configs=model_configs,
+            series_train=series_train,
+            series_val=series_val,
+            size_k=size_k,
             resume_mode=resume_mode,
+            models_dir=models_dir,
         )
-        elapsed = time.perf_counter() - start_time
-        curve_rows.extend(_build_curve_rows(name, elapsed, loss_callback))
-
-        model_save_path = models_dir / f"{name}_k{size_k}.pt"
-        model.save(str(model_save_path))
-        print(f"Modelo guardado en: {model_save_path.resolve()}")
-
-        trained_models[name] = model
+        curve_rows.extend(model_curve_rows)
+        trained_models[trained_name] = model
 
     if csv_output_path is not None:
-        curve_df = pd.DataFrame(
-            curve_rows,
-            columns=[
-                "model_name",
-                "epoch",
-                "train_loss",
-                "val_loss",
-                "training_time_seconds",
-            ],
-        ).sort_values(["model_name", "epoch"], ignore_index=True)
-
-        output_path = Path(csv_output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        curve_df = _merge_curve_rows_with_existing_csv(curve_df, output_path)
-        curve_df.to_csv(output_path, index=False)
-        print(f"CSV exportado en: {output_path.resolve()}")
+        _export_training_curve_rows(
+            curve_rows=curve_rows,
+            csv_output_path=csv_output_path,
+        )
 
     return trained_models

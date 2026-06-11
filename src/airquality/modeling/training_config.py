@@ -1,3 +1,6 @@
+"""Shared dataset containers and default training configuration builders."""
+
+from configparser import ConfigParser
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -25,11 +28,17 @@ from airquality.config import cfg_get_float, cfg_get_int
 
 
 @dataclass(slots=True)
-class DatasetBundle:
-    """Estructura estándar del dataset escalado usado por training/eval."""
+class TrainingDatasetBundle:
+    """Estructura estándar del dataset escalado usado por training."""
 
     series_train: list[TimeSeries]
     series_val: list[TimeSeries]
+
+
+@dataclass(slots=True)
+class BenchmarkDatasetBundle:
+    """Estructura estándar del dataset escalado usado por eval/benchmark."""
+
     series_test: list[TimeSeries]
     dict_scalers: dict[str, Scaler]
     valid_cols: list[str]
@@ -55,24 +64,29 @@ class EvalConfig:
     forecast_sizes: Sequence[int] = (1, 2, 5, 10)
 
 
-BASE_TRAINING_KWARGS: dict[str, Any] = {
-    "batch_size": cfg_get_int("training", "batch_size", 256),
-    "n_epochs": cfg_get_int("training", "n_epochs", 100),
-    "optimizer_cls": AdamW,
-    "optimizer_kwargs": {
-        "lr": cfg_get_float("training", "learning_rate", 1e-3),
-        "weight_decay": cfg_get_float("training", "weight_decay", 1e-2),
-    },
-    "lr_scheduler_cls": ReduceLROnPlateau,
-    "lr_scheduler_kwargs": {
-        "mode": "min",
-        "factor": cfg_get_float("training", "lr_scheduler_factor", 0.5),
-        "patience": cfg_get_int("training", "lr_scheduler_patience", 2),
-    },
-    "save_checkpoints": True,
-    "force_reset": True,
-    "random_state": cfg_get_int("training", "random_state", 42),
-}
+def build_base_training_kwargs(cfg: ConfigParser | None = None) -> dict[str, Any]:
+    """Build the common optimizer and trainer kwargs used across Darts models."""
+    return {
+        "batch_size": cfg_get_int("training", "batch_size", 256, cfg=cfg),
+        "n_epochs": cfg_get_int("training", "n_epochs", 100, cfg=cfg),
+        "optimizer_cls": AdamW,
+        "optimizer_kwargs": {
+            "lr": cfg_get_float("training", "learning_rate", 1e-3, cfg=cfg),
+            "weight_decay": cfg_get_float("training", "weight_decay", 1e-2, cfg=cfg),
+        },
+        "lr_scheduler_cls": ReduceLROnPlateau,
+        "lr_scheduler_kwargs": {
+            "mode": "min",
+            "factor": cfg_get_float("training", "lr_scheduler_factor", 0.5, cfg=cfg),
+            "patience": cfg_get_int("training", "lr_scheduler_patience", 2, cfg=cfg),
+        },
+        "save_checkpoints": True,
+        "force_reset": True,
+        "random_state": cfg_get_int("training", "random_state", 42, cfg=cfg),
+    }
+
+
+BASE_TRAINING_KWARGS: dict[str, Any] = build_base_training_kwargs()
 
 
 class Float32StandardScaler(StandardScaler):
@@ -83,13 +97,13 @@ class Float32StandardScaler(StandardScaler):
         return transformed.astype(np.float32, copy=False)
 
 
-def build_early_stopping_callback() -> EarlyStopping:
+def build_early_stopping_callback(cfg: ConfigParser | None = None) -> EarlyStopping:
     """Construye EarlyStopping para minimizar `val_loss` durante entrenamiento."""
 
     return EarlyStopping(
         monitor="val_loss",
-        patience=cfg_get_int("training", "early_stopping_patience", 5),
-        min_delta=cfg_get_float("training", "early_stopping_min_delta", 1e-4),
+        patience=cfg_get_int("training", "early_stopping_patience", 5, cfg=cfg),
+        min_delta=cfg_get_float("training", "early_stopping_min_delta", 1e-4, cfg=cfg),
         mode="min",
         verbose=True,
     )
@@ -104,6 +118,7 @@ def build_lightning_trainer_kwargs(
     enable_checkpointing: bool = True,
     enable_model_summary: bool = True,
     logger: bool | Any = True,
+    cfg: ConfigParser | None = None,
 ) -> dict[str, Any]:
     """Genera kwargs de PyTorch Lightning para modelos Darts basados en Torch."""
 
@@ -122,7 +137,7 @@ def build_lightning_trainer_kwargs(
         "logger": logger,
     }
     if use_early_stopping:
-        kwargs["callbacks"] = [build_early_stopping_callback()]
+        kwargs["callbacks"] = [build_early_stopping_callback(cfg=cfg)]
     return kwargs
 
 
@@ -157,104 +172,104 @@ def make_encoders_rnn() -> dict[str, Any]:
     }
 
 
-def build_model_configs() -> dict[str, tuple[type, dict[str, Any]]]:
+def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type, dict[str, Any]]]:
     """Devuelve el catálogo de modelos y sus hiperparámetros por defecto."""
 
     return {
         "TiDE": (
             TiDEModel,
             {
-                "input_chunk_length": cfg_get_int("models", "tide_input_chunk_length", 72),
+                "input_chunk_length": cfg_get_int("models", "tide_input_chunk_length", 72, cfg=cfg),
                 "temporal_width_past": 1,
                 "num_encoder_layers": 3,
                 "num_decoder_layers": 3,
                 "decoder_output_dim": 64,
-                "hidden_size": cfg_get_int("models", "tide_hidden_size", 512),
+                "hidden_size": cfg_get_int("models", "tide_hidden_size", 512, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "NHiTS": (
             NHiTSModel,
             {
-                "input_chunk_length": cfg_get_int("models", "nhits_input_chunk_length", 72),
+                "input_chunk_length": cfg_get_int("models", "nhits_input_chunk_length", 72, cfg=cfg),
                 "num_stacks": 4,
                 "num_blocks": 3,
-                "layer_widths": cfg_get_int("models", "nhits_layer_widths", 512),
+                "layer_widths": cfg_get_int("models", "nhits_layer_widths", 512, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "NLinear": (
             NLinearModel,
             {
-                "input_chunk_length": cfg_get_int("models", "nlinear_input_chunk_length", 72),
+                "input_chunk_length": cfg_get_int("models", "nlinear_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "DLinear": (
             DLinearModel,
             {
-                "input_chunk_length": cfg_get_int("models", "dlinear_input_chunk_length", 72),
+                "input_chunk_length": cfg_get_int("models", "dlinear_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "TCN": (
             TCNModel,
             {
-                "input_chunk_length": cfg_get_int("models", "tcn_input_chunk_length", 72),
-                "num_filters": cfg_get_int("models", "tcn_num_filters", 16),
+                "input_chunk_length": cfg_get_int("models", "tcn_input_chunk_length", 72, cfg=cfg),
+                "num_filters": cfg_get_int("models", "tcn_num_filters", 16, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "Transformer": (
             TransformerModel,
             {
-                "input_chunk_length": cfg_get_int("models", "transformer_input_chunk_length", 72),
+                "input_chunk_length": cfg_get_int("models", "transformer_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "TSMixer": (
             TSMixerModel,
             {
-                "input_chunk_length": cfg_get_int("models", "tsmixer_input_chunk_length", 72),
-                "hidden_size": cfg_get_int("models", "tsmixer_hidden_size", 128),
-                "ff_size": cfg_get_int("models", "tsmixer_ff_size", 128),
+                "input_chunk_length": cfg_get_int("models", "tsmixer_input_chunk_length", 72, cfg=cfg),
+                "hidden_size": cfg_get_int("models", "tsmixer_hidden_size", 128, cfg=cfg),
+                "ff_size": cfg_get_int("models", "tsmixer_ff_size", 128, cfg=cfg),
                 "num_blocks": 3,
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "RNN": (
             RNNModel,
             {
-                "input_chunk_length": cfg_get_int("models", "rnn_input_chunk_length", 48),
-                "training_length": cfg_get_int("models", "rnn_training_length", 72),
+                "input_chunk_length": cfg_get_int("models", "rnn_input_chunk_length", 48, cfg=cfg),
+                "training_length": cfg_get_int("models", "rnn_training_length", 72, cfg=cfg),
                 "model": "GRU",
-                "hidden_dim": cfg_get_int("models", "rnn_hidden_dim", 64),
+                "hidden_dim": cfg_get_int("models", "rnn_hidden_dim", 64, cfg=cfg),
                 "n_rnn_layers": 3,
                 "dropout": 0.1,
                 "add_encoders": make_encoders_rnn(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
             },
         ),
         "LinearRegression": (
             LinearRegressionModel,
             {
-                "lags": cfg_get_int("models", "linear_regression_lags", 72),
-                "random_state": cfg_get_int("training", "random_state", 42),
+                "lags": cfg_get_int("models", "linear_regression_lags", 72, cfg=cfg),
+                "random_state": cfg_get_int("training", "random_state", 42, cfg=cfg),
             },
         ),
     }

@@ -1,3 +1,5 @@
+"""Tests training configuration defaults, scaler behavior, and model catalog contents."""
+
 from __future__ import annotations
 
 import numpy as np

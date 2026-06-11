@@ -1,3 +1,5 @@
+"""CLI helpers for fine-tuning TSPulse on the project's air-quality series."""
+
 from __future__ import annotations
 
 import argparse
@@ -13,9 +15,9 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from airquality.data.io import resolve_device, to_pd_series
+from airquality.data.loaders import load_dataset_paths, load_to_df
+from airquality.data.segments import get_longest_segment
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
-
-from airquality.data.utils import get_longest_segment, load_dataset_paths, load_to_df
 
 try:
     from transformers import Trainer, TrainingArguments, set_seed
@@ -84,12 +86,14 @@ else:
 
 
 def sanitize_name(text: str) -> str:
+    """Normalize free-form text into a filesystem-friendly identifier."""
     text = re.sub(r"\s+", " ", text.strip())
     text = re.sub(r"[^\w\-\. ]+", "_", text)
     return text.replace(" ", "_")
 
 
 def build_series_name(csv_path: Path, value_col: str) -> str:
+    """Build a stable series identifier from file location and value column."""
     parent = sanitize_name(csv_path.parent.name)
     stem = sanitize_name(csv_path.stem)
     val = sanitize_name(value_col)
@@ -98,29 +102,14 @@ def build_series_name(csv_path: Path, value_col: str) -> str:
     return f"{parent}__{stem}__{val}"
 
 
-def discover_csv_files(
-    data_root: Path,
-    *,
-    key_word: str,
-    file_extension: str,
-) -> list[Path]:
-    # Directly use project utility, aligned with:
-    # load_dataset_paths("../Datos-post-COUTA/*/", key_word="NO2", file_extension="csv")
-    base_path = str((data_root / "*/").resolve())
-    by_keyword = sorted(
-        Path(p).resolve()
-        for p in load_dataset_paths(
-            base_path=base_path,
-            key_word=key_word,
-            file_extension=file_extension,
-        )
-    )
+def discover_csv_files() -> list[Path]:
+    """Discover the input files that match the configured dataset filters."""
+    by_keyword = sorted(Path(p).resolve() for p in load_dataset_paths())
     files = [p for p in by_keyword if p.is_file()]
 
     if not files:
         raise FileNotFoundError(
-            "No se encontraron CSV. Revisa ruta y filtros de load_dataset_paths.\n"
-            f"base_path='{base_path}', key_word='{key_word}', file_extension='{file_extension}'"
+            "No se encontraron CSV. Revisa la configuracion de load_dataset_paths."
         )
     return files
 
@@ -133,6 +122,7 @@ def load_series_list(
     min_non_nan_ratio: float,
     min_points: int,
 ) -> list[pd.DataFrame]:
+    """Load, validate, and filter the raw series used for TSPulse fine-tuning."""
     out: list[pd.DataFrame] = []
     seen_names: set[str] = set()
 
@@ -347,7 +337,8 @@ def build_training_args(
         return TrainingArguments(**common)
 
 
-def run(args: argparse.Namespace) -> None:
+def _ensure_runtime_dependencies() -> None:
+    """Fail fast when transformers or Granite TSFM dependencies are missing."""
     if not TRANSFORMERS_AVAILABLE:
         raise RuntimeError(
             "transformers is not available. Install dependencies first, e.g. "
@@ -357,13 +348,13 @@ def run(args: argparse.Namespace) -> None:
     if not TSFM_AVAILABLE:
         raise RuntimeError(
             "tsfm_public is not available. Install Granite TSFM first, e.g. "
-            "`pip install \"granite-tsfm[notebooks]\"`.\n"
+            '`pip install "granite-tsfm[notebooks]"`.\n'
             f"Original import error: {TSFM_IMPORT_ERROR}"
         )
 
-    set_seed(args.seed)
-    np.random.seed(args.seed)
 
+def _validate_run_args(args: argparse.Namespace) -> None:
+    """Validate the fine-tuning arguments that are not enforced by argparse."""
     if not (0.0 < float(args.mask_ratio) <= 1.0):
         raise ValueError("mask_ratio must be in (0, 1].")
     if not (0.0 < float(args.plateau_factor) < 1.0):
@@ -377,14 +368,22 @@ def run(args: argparse.Namespace) -> None:
     if float(args.early_stopping_threshold) < 0.0:
         raise ValueError("early_stopping_threshold must be >= 0.")
 
+
+def _resolve_run_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Resolve and create the input and output paths for one run."""
     data_root = Path(args.data_root).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    return data_root, output_dir
 
+
+def _load_training_series_and_split(
+    args: argparse.Namespace,
+    data_root: Path,
+) -> tuple[list[pd.DataFrame], pd.DataFrame, pd.DataFrame, int, pd.DataFrame, pd.DataFrame]:
+    """Load raw series, hold out the evaluation block, and build train/valid tables."""
+    del data_root
     csv_files = discover_csv_files(
-        data_root,
-        key_word=args.key_word,
-        file_extension=args.file_extension,
     )
 
     series_dfs = load_series_list(
@@ -397,7 +396,6 @@ def run(args: argparse.Namespace) -> None:
 
     longest_segment = get_longest_segment(
         series_dfs,
-        force_end=args.force_end,
         verbose=args.verbose_segment,
     )
     if longest_segment.empty:
@@ -425,10 +423,12 @@ def run(args: argparse.Namespace) -> None:
         context_length=args.context_length,
     )
     print(f"[info] Train rows: {len(train_df)} | Valid rows: {len(valid_df)}")
+    return series_dfs, longest_segment, train_remainder_df, heldout_points, train_df, valid_df
 
-    # Real NaNs are preserved in the dataset. TSPulse will use the observed mask
-    # directly only when mask_type='user'; other mask types apply synthetic masking.
-    tsp = TimeSeriesPreprocessor(
+
+def _build_preprocessor(args: argparse.Namespace) -> TimeSeriesPreprocessor:
+    """Build the TSFM preprocessor used for TSPulse training datasets."""
+    return TimeSeriesPreprocessor(
         id_columns=[args.id_column],
         timestamp_column=args.timestamp_column,
         target_columns=[args.tspulse_target_column],
@@ -440,22 +440,23 @@ def run(args: argparse.Namespace) -> None:
         scaler_type="standard",
     )
 
-    train_dataset, valid_dataset = build_train_valid_datasets(
-        tsp=tsp,
-        train_df=train_df,
-        valid_df=valid_df,
-    )
 
-    device = torch.device(resolve_device(args.device))
-    print(f"[info] Device: {device}")
-
+def _load_and_configure_model(
+    args: argparse.Namespace,
+    *,
+    tsp: TimeSeriesPreprocessor,
+    device: torch.device,
+) -> object:
+    """Load the pretrained TSPulse checkpoint and apply runtime overrides."""
     model = TSPulseForReconstruction.from_pretrained(
         args.model_id,
         revision=args.revision,
     ).to(device)
     model = model.float()
 
-    ckpt_num_channels = int(getattr(model.config, "num_input_channels", tsp.num_input_channels))
+    ckpt_num_channels = int(
+        getattr(model.config, "num_input_channels", tsp.num_input_channels)
+    )
     if ckpt_num_channels != int(tsp.num_input_channels):
         raise ValueError(
             "num_input_channels del checkpoint no coincide con el dataset preparado. "
@@ -487,36 +488,46 @@ def run(args: argparse.Namespace) -> None:
 
     for p in model.parameters():
         p.requires_grad = True
+    return model
 
+
+def _resolve_learning_rate(
+    args: argparse.Namespace,
+    *,
+    model: object,
+    train_dataset: ForecastDFDataset,
+    device: torch.device,
+) -> tuple[float, object]:
+    """Return the configured learning rate or a value suggested by the LR finder."""
     lr = args.learning_rate
-    if args.auto_lr:
-        if optimal_lr_finder is None:
-            print("[warn] optimal_lr_finder not available, using fixed learning_rate")
-        else:
-            try:
-                lr, model = optimal_lr_finder(
-                    model,
-                    train_dataset,
-                    batch_size=args.batch_size,
-                    device=str(device),
-                )
-                print(f"[info] Suggested LR from finder: {lr:.8f}")
-            except Exception as exc:
-                print(f"[warn] LR finder failed ({exc}); using fixed learning_rate={lr}")
+    if not args.auto_lr:
+        return lr, model
 
-    temp_dir = tempfile.mkdtemp(prefix="tspulse_ft_")
-    train_args = build_training_args(
-        output_dir=temp_dir,
-        learning_rate=lr,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        eval_batch_size=args.eval_batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        report_to=args.report_to,
-    )
+    if optimal_lr_finder is None:
+        print("[warn] optimal_lr_finder not available, using fixed learning_rate")
+        return lr, model
 
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    try:
+        lr, model = optimal_lr_finder(
+            model,
+            train_dataset,
+            batch_size=args.batch_size,
+            device=str(device),
+        )
+        print(f"[info] Suggested LR from finder: {lr:.8f}")
+    except Exception as exc:
+        print(f"[warn] LR finder failed ({exc}); using fixed learning_rate={lr}")
+    return lr, model
+
+
+def _build_optimizer_scheduler(
+    args: argparse.Namespace,
+    *,
+    model: object,
+    learning_rate: float,
+) -> tuple[AdamW, ReduceLROnPlateau]:
+    """Build the optimizer and plateau scheduler used during fine-tuning."""
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(
         optimizer,
         mode=args.plateau_mode,
@@ -536,7 +547,11 @@ def run(args: argparse.Namespace) -> None:
         f"threshold_mode={args.plateau_threshold_mode}, cooldown={args.plateau_cooldown}, "
         f"min_lr={args.plateau_min_lr})"
     )
+    return optimizer, scheduler
 
+
+def _build_trainer_callbacks(args: argparse.Namespace) -> list[object]:
+    """Build the optional trainer callbacks enabled for this fine-tuning run."""
     callbacks: list[object] = []
     if args.early_stopping_patience > 0 and EarlyStoppingCallback is not None:
         callbacks.append(
@@ -547,15 +562,11 @@ def run(args: argparse.Namespace) -> None:
         )
     if EpochBoundaryCallback is not None:
         callbacks.append(EpochBoundaryCallback())
+    return callbacks
 
-    trainer = Trainer(
-        model=model,
-        args=train_args,
-        train_dataset=train_dataset,
-        eval_dataset=valid_dataset,
-        optimizers=(optimizer, scheduler),
-        callbacks=callbacks if callbacks else None,
-    )
+
+def _report_trainer_runtime(args: argparse.Namespace) -> None:
+    """Print the effective callback and runtime behavior before training starts."""
     if args.early_stopping_patience > 0:
         if EarlyStoppingCallback is None:
             print("[warn] EarlyStoppingCallback no disponible; entrenamiento sin early stopping.")
@@ -567,7 +578,9 @@ def run(args: argparse.Namespace) -> None:
     if EpochBoundaryCallback is None:
         print("[warn] TrainerCallback no disponible; no se mostrará separador por época.")
 
-    trainer.train()
+
+def _report_best_validation(trainer: object) -> None:
+    """Print the best validation checkpoint recorded by the trainer."""
     best_eval_loss = None
     best_eval_epoch = None
     for row in trainer.state.log_history:
@@ -584,197 +597,164 @@ def run(args: argparse.Namespace) -> None:
         f"epoch={best_eval_epoch}"
     )
 
+
+def _save_finetuned_artifacts(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    trainer: object,
+    tsp: TimeSeriesPreprocessor,
+) -> None:
+    """Persist the fine-tuned model and preprocessor to the output directory."""
     run_name = f"airquality_tspulse_ft_{args.mask_type}_{args.mask_ratio}"
     save_dir = output_dir / run_name
     save_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(save_dir))
     tsp.save_pretrained(str(save_dir / "preprocessor"))
-
     print(f"[done] Fine-tuned model saved to: {save_dir}")
 
 
+def run(args: argparse.Namespace) -> None:
+    """Execute the full TSPulse fine-tuning workflow from parsed CLI args."""
+    _ensure_runtime_dependencies()
+
+    set_seed(args.seed)
+    np.random.seed(args.seed)
+    _validate_run_args(args)
+
+    data_root, output_dir = _resolve_run_paths(args)
+    _, _, _, _, train_df, valid_df = _load_training_series_and_split(
+        args,
+        data_root,
+    )
+
+    # Real NaNs are preserved in the dataset. TSPulse will use the observed mask
+    # directly only when mask_type='user'; other mask types apply synthetic masking.
+    tsp = _build_preprocessor(args)
+
+    train_dataset, valid_dataset = build_train_valid_datasets(
+        tsp=tsp,
+        train_df=train_df,
+        valid_df=valid_df,
+    )
+
+    device = torch.device(resolve_device(args.device))
+    print(f"[info] Device: {device}")
+
+    model = _load_and_configure_model(args, tsp=tsp, device=device)
+    lr, model = _resolve_learning_rate(
+        args,
+        model=model,
+        train_dataset=train_dataset,
+        device=device,
+    )
+
+    temp_dir = tempfile.mkdtemp(prefix="tspulse_ft_")
+    train_args = build_training_args(
+        output_dir=temp_dir,
+        learning_rate=lr,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        report_to=args.report_to,
+    )
+
+    optimizer, scheduler = _build_optimizer_scheduler(
+        args,
+        model=model,
+        learning_rate=lr,
+    )
+    callbacks = _build_trainer_callbacks(args)
+
+    trainer = Trainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
+        optimizers=(optimizer, scheduler),
+        callbacks=callbacks if callbacks else None,
+    )
+    _report_trainer_runtime(args)
+
+    trainer.train()
+    _report_best_validation(trainer)
+    _save_finetuned_artifacts(args=args, output_dir=output_dir, trainer=trainer, tsp=tsp)
+
+
+def _build_parser_defaults() -> dict[str, object]:
+    """Read CLI default values from the project configuration files."""
+    return {
+        "data_root": cfg_get_str("data", "data_root", "Datos-post-COUTA"),
+        "key_word": cfg_get_str("data", "key_word", "NO2"),
+        "file_extension": cfg_get_str("data", "file_extension", "csv"),
+        "timestamp_column": cfg_get_str("data", "timestamp_column", "fecha"),
+        "target_column_index": cfg_get_int("data", "target_column_index", 0),
+        "freq": cfg_get_str("data", "freq", "h"),
+        "min_non_nan_ratio": cfg_get_float("data", "min_non_nan_ratio", 0.15),
+        "min_series_points": cfg_get_int("data", "min_series_points", 600),
+        "id_column": cfg_get_str("tspulse", "id_column", "series_id"),
+        "tspulse_target_column": cfg_get_str("tspulse", "tspulse_target_column", "value"),
+        "model_id": cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"),
+        "revision": cfg_get_str("tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"),
+        "context_length": cfg_get_int("tspulse", "context_length", 512),
+        "mask_type": cfg_get_str("tspulse", "mask_type", "var_hybrid"),
+        "mask_ratio": cfg_get_float("tspulse", "mask_ratio", 0.7),
+        "epochs": cfg_get_int("tspulse", "epochs", 40),
+        "batch_size": cfg_get_int("tspulse", "batch_size", 16),
+        "eval_batch_size": cfg_get_int("tspulse", "eval_batch_size", 16),
+        "valid_fraction": cfg_get_float("tspulse", "valid_fraction", 0.2),
+        "learning_rate": cfg_get_float("tspulse", "learning_rate", 1e-4),
+        "weight_decay": cfg_get_float("tspulse", "weight_decay", 1e-2),
+        "plateau_mode": cfg_get_str("tspulse", "plateau_mode", "min"),
+        "plateau_factor": cfg_get_float("tspulse", "plateau_factor", 0.5),
+        "plateau_patience": cfg_get_int("tspulse", "plateau_patience", 3),
+        "plateau_threshold": cfg_get_float("tspulse", "plateau_threshold", 1e-4),
+        "plateau_threshold_mode": cfg_get_str("tspulse", "plateau_threshold_mode", "rel"),
+        "plateau_cooldown": cfg_get_int("tspulse", "plateau_cooldown", 0),
+        "plateau_min_lr": cfg_get_float("tspulse", "plateau_min_lr", 1e-6),
+        "plateau_eps": cfg_get_float("tspulse", "plateau_eps", 1e-8),
+        "early_stopping_patience": cfg_get_int("tspulse", "early_stopping_patience", 5),
+        "early_stopping_threshold": cfg_get_float("tspulse", "early_stopping_threshold", 0.0),
+        "num_workers": cfg_get_int("tspulse", "num_workers", 1),
+        "seed": cfg_get_int("tspulse", "seed", 42),
+        "device": cfg_get_str("tspulse", "device", "cpu"),
+        "report_to": cfg_get_str("tspulse", "report_to", "none"),
+        "output_dir": cfg_get_str("tspulse", "output_dir", "models/tspulse_finetune"),
+    }
+
+
+class ConfigOnlyArgumentParser(argparse.ArgumentParser):
+    """Argument parser that re-applies cfg-backed values after CLI parsing."""
+
+    def __init__(self, config_defaults: dict[str, object], **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._config_defaults = dict(config_defaults)
+
+    def parse_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args=args, namespace=namespace)
+        for key, value in self._config_defaults.items():
+            setattr(parsed, key, value)
+        return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    """Build the command-line parser for the TSPulse fine-tuning entry point."""
+    defaults = _build_parser_defaults()
+    parser = ConfigOnlyArgumentParser(
+        config_defaults=defaults,
         description=(
             "Fine-tune TSPulse for imputation using list-of-series loading, "
             "with held-out test block from get_longest_segment."
         )
     )
 
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        default=cfg_get_str("data", "data_root", "Datos-post-COUTA"),
-    )
-    parser.add_argument(
-        "--key-word",
-        type=str,
-        default=cfg_get_str("data", "key_word", "NO2"),
-        help="Keyword used by load_dataset_paths.",
-    )
-    parser.add_argument(
-        "--file-extension",
-        type=str,
-        default=cfg_get_str("data", "file_extension", "csv"),
-        help="File extension used by load_dataset_paths fallback.",
-    )
-    parser.add_argument(
-        "--timestamp-column",
-        type=str,
-        default=cfg_get_str("data", "timestamp_column", "fecha"),
-    )
-    parser.add_argument(
-        "--target-column-index",
-        type=int,
-        default=cfg_get_int("data", "target_column_index", 0),
-        help="Índice de la columna de valores dentro de cada CSV (0 = primera columna de valores).",
-    )
-    parser.add_argument("--freq", type=str, default=cfg_get_str("data", "freq", "h"))
-    parser.add_argument(
-        "--min-non-nan-ratio",
-        type=float,
-        default=cfg_get_float("data", "min_non_nan_ratio", 0.15),
-    )
-    parser.add_argument(
-        "--min-series-points",
-        type=int,
-        default=cfg_get_int("data", "min_series_points", 600),
-    )
-
-    parser.add_argument("--force-end", action="store_true", help="Use trailing complete block in get_longest_segment")
     parser.add_argument("--verbose-segment", action="store_true")
-
-    parser.add_argument(
-        "--id-column",
-        type=str,
-        default=cfg_get_str("tspulse", "id_column", "series_id"),
-    )
-    parser.add_argument(
-        "--tspulse-target-column",
-        type=str,
-        default=cfg_get_str("tspulse", "tspulse_target_column", "value"),
-    )
-
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default=cfg_get_str(
-            "tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"
-        ),
-    )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default=cfg_get_str(
-            "tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"
-        ),
-        help="Imputation-optimized TSPulse branch",
-    )
-
-    parser.add_argument(
-        "--context-length",
-        type=int,
-        default=cfg_get_int("tspulse", "context_length", 512),
-    )
-    parser.add_argument(
-        "--mask-type",
-        type=str,
-        choices=["var_hybrid", "hybrid", "block", "random", "user"],
-        default=cfg_get_str("tspulse", "mask_type", "var_hybrid"),
-    )
-    parser.add_argument(
-        "--mask-ratio",
-        type=float,
-        default=cfg_get_float("tspulse", "mask_ratio", 0.7),
-    )
-
-    parser.add_argument(
-        "--epochs", type=int, default=cfg_get_int("tspulse", "epochs", 40)
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=cfg_get_int("tspulse", "batch_size", 16)
-    )
-    parser.add_argument(
-        "--eval-batch-size",
-        type=int,
-        default=cfg_get_int("tspulse", "eval_batch_size", 16),
-    )
-    parser.add_argument(
-        "--valid-fraction",
-        type=float,
-        default=cfg_get_float("tspulse", "valid_fraction", 0.2),
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=cfg_get_float("tspulse", "learning_rate", 1e-4),
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=cfg_get_float("tspulse", "weight_decay", 1e-2),
-    )
-    parser.add_argument(
-        "--plateau-mode",
-        type=str,
-        choices=["min", "max"],
-        default=cfg_get_str("tspulse", "plateau_mode", "min"),
-        help="Metric direction for ReduceLROnPlateau (use 'min' for eval_loss).",
-    )
-    parser.add_argument(
-        "--plateau-factor",
-        type=float,
-        default=cfg_get_float("tspulse", "plateau_factor", 0.5),
-        help="new_lr = lr * plateau_factor when metric plateaus.",
-    )
-    parser.add_argument(
-        "--plateau-patience",
-        type=int,
-        default=cfg_get_int("tspulse", "plateau_patience", 3),
-        help="Number of eval epochs without improvement before lowering LR.",
-    )
-    parser.add_argument(
-        "--plateau-threshold",
-        type=float,
-        default=cfg_get_float("tspulse", "plateau_threshold", 1e-4),
-        help="Minimum significant improvement for plateau detection.",
-    )
-    parser.add_argument(
-        "--plateau-threshold-mode",
-        type=str,
-        choices=["rel", "abs"],
-        default=cfg_get_str("tspulse", "plateau_threshold_mode", "rel"),
-    )
-    parser.add_argument(
-        "--plateau-cooldown",
-        type=int,
-        default=cfg_get_int("tspulse", "plateau_cooldown", 0),
-        help="Cooldown eval epochs after an LR drop.",
-    )
-    parser.add_argument(
-        "--plateau-min-lr",
-        type=float,
-        default=cfg_get_float("tspulse", "plateau_min_lr", 1e-6),
-        help="Lower bound for learning rate.",
-    )
-    parser.add_argument(
-        "--plateau-eps",
-        type=float,
-        default=cfg_get_float("tspulse", "plateau_eps", 1e-8),
-        help="Minimal LR change to apply.",
-    )
-    parser.add_argument(
-        "--early-stopping-patience",
-        type=int,
-        default=cfg_get_int("tspulse", "early_stopping_patience", 5),
-        help="Stop after N eval epochs without significant eval_loss improvement. Set 0 to disable.",
-    )
-    parser.add_argument(
-        "--early-stopping-threshold",
-        type=float,
-        default=cfg_get_float("tspulse", "early_stopping_threshold", 0.0),
-        help="Minimum eval_loss improvement to reset early stopping patience.",
-    )
     parser.add_argument(
         "--dropout",
         type=float,
@@ -788,31 +768,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="If set, overrides checkpoint head_dropout after loading.",
     )
     parser.add_argument("--auto-lr", action="store_true")
-
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=cfg_get_int("tspulse", "num_workers", 1),
-    )
-    parser.add_argument("--seed", type=int, default=cfg_get_int("tspulse", "seed", 42))
-    parser.add_argument(
-        "--device",
-        type=str,
-        choices=["cpu", "cuda"],
-        default=cfg_get_str("tspulse", "device", "cpu"),
-    )
-    parser.add_argument(
-        "--report-to",
-        type=str,
-        default=cfg_get_str("tspulse", "report_to", "none"),
-        help="none | tensorboard | wandb | ...",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=cfg_get_str("tspulse", "output_dir", "src/artifacts/tspulse_finetune"),
-    )
 
     return parser
 
