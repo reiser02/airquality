@@ -6,6 +6,7 @@ import pandas as pd
 from darts import TimeSeries
 
 from airquality.imputation.benchmark import execute_complete_pipeline
+from airquality.imputation.imputers import DartsGlobalGapImputer
 from airquality.modeling.training import build_benchmark_dataset_bundle
 
 
@@ -86,7 +87,7 @@ def test_execute_complete_pipeline_uses_bundle_history_for_test_only_series() ->
     )
 
     results_df, plot_store = execute_complete_pipeline(
-        model_dict={"LastValue": LastValueModel()},
+        model_dict={"LastValue": DartsGlobalGapImputer(LastValueModel(), model_name="LastValue")},
         dataset_bundle=bundle,
         gap_sizes=(1,),
         num_gaps=1,
@@ -116,7 +117,7 @@ def test_execute_complete_pipeline_fails_without_all_series_history() -> None:
 
     try:
         execute_complete_pipeline(
-            {"LastValue": LastValueModel()},
+            {"LastValue": DartsGlobalGapImputer(LastValueModel(), model_name="LastValue")},
             bundle,
             gap_sizes=(1,),
             num_gaps=1,
