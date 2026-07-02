@@ -9,14 +9,17 @@ import pytest
 from darts import TimeSeries
 
 from airquality.imputation.benchmark import (
-    _build_clean_left_context,
     _compute_gap_mase,
     _compute_mase_denominator,
     _compute_metrics_on_mask,
+    _gap_windows_to_mask_index,
     _normalize_series_collection,
-    build_tspulse_context_frame,
-    darts_left_context_imputation_for_gaps,
     execute_complete_pipeline,
+)
+from airquality.imputation.imputers import (
+    DartsGlobalGapImputer,
+    _build_clean_left_context,
+    build_tspulse_context_frame,
 )
 from airquality.modeling.training import build_benchmark_dataset_bundle
 
@@ -99,14 +102,12 @@ def test_darts_left_context_imputation_retries_predict_signature_and_fills_gap()
     test = _series([1.0, 2.0, 3.0, 4.0], name="S")
     gap = pd.date_range("2024-01-01 02:00:00", periods=2, freq="h")
 
-    pred, failures = darts_left_context_imputation_for_gaps(
-        model_name="Retry",
-        model=model,
+    pred, failures = DartsGlobalGapImputer(model, model_name="Retry").impute_gaps(
         series_name="S",
         all_series_map={"S": test},
-        scaler=None,
-        use_scaled_for_model=False,
         gap_windows=[gap],
+        test_index=test.index,
+        scaler=None,
         freq="h",
         config_workers={"num_workers": 0},
     )
@@ -125,14 +126,12 @@ def test_darts_left_context_imputation_reports_skipped_gap_when_context_is_insuf
             raise AssertionError("predict should not be called")
 
     gap = pd.date_range("2024-01-01 01:00:00", periods=1, freq="h")
-    pred, failures = darts_left_context_imputation_for_gaps(
-        model_name="LongCtx",
-        model=NeedsLongContext(),
+    pred, failures = DartsGlobalGapImputer(NeedsLongContext(), model_name="LongCtx").impute_gaps(
         series_name="S",
         all_series_map={"S": _series([1.0, 2.0], name="S")},
-        scaler=None,
-        use_scaled_for_model=False,
         gap_windows=[gap],
+        test_index=pd.DatetimeIndex([]),
+        scaler=None,
         freq="h",
     )
 
@@ -205,20 +204,23 @@ def test_compute_metrics_on_mask_rejects_unknown_metric() -> None:
 
 
 def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
-    class StubHistoricalImputer:
-        def historical_imputation_forecasts(
+    class StubImputer:
+        model_name = "Stub"
+
+        def impute_gaps(
             self,
             *,
             series_name,
             all_series_map,
-            mask_index,
+            gap_windows,
             test_index,
-            gap_size,
+            scaler,
             freq,
-            config_workers,
+            config_workers=None,
         ):
-            del series_name, all_series_map, test_index, gap_size, freq, config_workers
-            return pd.Series([30.0, 40.0], index=mask_index, dtype=float)
+            del series_name, all_series_map, test_index, scaler, freq, config_workers
+            mask_index = _gap_windows_to_mask_index(gap_windows)
+            return pd.Series([30.0, 40.0], index=mask_index, dtype=float), []
 
     full = _series([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], name="S")
     frame = full.to_frame(name="S")
@@ -234,9 +236,8 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     gap_start = pd.Timestamp("2024-01-01 04:00:00")
 
     results_df, plot_store = execute_complete_pipeline(
-        model_dict={"Stub": StubHistoricalImputer()},
+        model_dict={"Stub": StubImputer()},
         dataset_bundle=bundle,
-        predict_on_scaled_series=False,
         gap_sizes=(2,),
         num_gaps=1,
         gap_spec_by_series={"S": [(gap_start, 2)]},
@@ -266,19 +267,22 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
 
 
 def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
-    class MockMultiGapModel:
-        def historical_imputation_forecasts(
+    class MockMultiGapImputer:
+        model_name = "Mock"
+
+        def impute_gaps(
             self,
             *,
             series_name,
             all_series_map,
-            mask_index,
+            gap_windows,
             test_index,
-            gap_size,
+            scaler,
             freq,
-            config_workers,
+            config_workers=None,
         ):
-            del series_name, all_series_map, test_index, gap_size, freq, config_workers
+            del series_name, all_series_map, test_index, scaler, freq, config_workers
+            mask_index = _gap_windows_to_mask_index(gap_windows)
             preds = pd.Series(dtype=float, index=mask_index)
             pred_vals = {
                 pd.Timestamp("2024-01-01 03:00:00"): 30.0,
@@ -290,7 +294,7 @@ def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
             for ts, val in pred_vals.items():
                 if ts in preds.index:
                     preds.loc[ts] = val
-            return preds
+            return preds, []
 
     full = _series([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0], name="S")
     frame = full.to_frame(name="S")
@@ -309,9 +313,8 @@ def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
     ]
 
     results_df, _ = execute_complete_pipeline(
-        model_dict={"Mock": MockMultiGapModel()},
+        model_dict={"Mock": MockMultiGapImputer()},
         dataset_bundle=bundle,
-        predict_on_scaled_series=False,
         gap_sizes=(5,),
         num_gaps=2,
         gap_spec_by_series={"S": gap_spec},

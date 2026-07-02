@@ -7,9 +7,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from airquality.imputation.imputers import DartsGlobalGapImputer
 from airquality.imputation.run_benchmark import (
     BenchmarkRunConfig,
-    Float32InputModelAdapter,
     TSPulseModelConfig,
     TSPULSE_FINETUNED_MODEL_NAME,
     TSPULSE_ORIGINAL_MODEL_NAME,
@@ -27,24 +27,41 @@ from airquality.imputation.run_benchmark import (
 )
 
 
-class DummyModel:
-    def __init__(self) -> None:
-        self.last_series = None
+def test_darts_global_imputer_casts_context_to_float32() -> None:
+    from darts import TimeSeries
 
-    def predict(self, *args, **kwargs):
-        self.last_series = kwargs.get("series")
-        return "ok"
+    class RecordingModel:
+        input_chunk_length = 1
 
+        def __init__(self) -> None:
+            self.series_dtype = None
 
-def test_float32_input_model_adapter_casts_series_argument() -> None:
-    model = DummyModel()
-    adapter = Float32InputModelAdapter(model)
-    s = pd.Series([1.0, 2.0], dtype="float64")
+        def predict(self, *, n, series, **kwargs):
+            del kwargs
+            self.series_dtype = series.dtype
+            index = pd.date_range(series.end_time() + series.freq, periods=n, freq=series.freq_str)
+            return TimeSeries.from_series(pd.Series([0.0] * n, index=index), freq=series.freq_str)
 
-    result = adapter.predict(series=s)
+    model = RecordingModel()
+    full = pd.Series(
+        [1.0, 2.0, 3.0],
+        index=pd.date_range("2024-01-01", periods=3, freq="h"),
+        name="S",
+        dtype="float64",
+    )
+    gap = pd.date_range("2024-01-01 02:00:00", periods=1, freq="h")
 
-    assert result == "ok"
-    assert str(model.last_series.dtype) == "float32"
+    DartsGlobalGapImputer(model, model_name="R").impute_gaps(
+        series_name="S",
+        all_series_map={"S": full},
+        gap_windows=[gap],
+        test_index=full.index,
+        scaler=None,
+        freq="h",
+        config_workers={"num_workers": 0},
+    )
+
+    assert str(model.series_dtype) == "float32"
 
 
 def test_resolve_repo_root_uses_explicit_path(tmp_path: Path) -> None:
@@ -74,24 +91,36 @@ def test_summarize_results_by_model_groups_and_sorts() -> None:
 
 
 def test_resolve_requested_models_deduplicates_darts_and_detects_tspulse() -> None:
-    darts, tspulse_model_names = _resolve_requested_models(
+    darts, prophet, tspulse_model_names = _resolve_requested_models(
         ["TiDE", "TiDE", " TCN ", TSPULSE_ORIGINAL_MODEL_NAME]
     )
 
     assert darts == ["TiDE", "TCN"]
+    assert prophet == []
     assert tspulse_model_names == [TSPULSE_ORIGINAL_MODEL_NAME]
 
 
 def test_resolve_requested_models_accepts_explicit_tspulse_variants() -> None:
-    darts, tspulse_model_names = _resolve_requested_models(
+    darts, prophet, tspulse_model_names = _resolve_requested_models(
         ["TSPulse_FineTuned", "TSPulse", "TSPulse"]
     )
 
     assert darts == []
+    assert prophet == []
     assert tspulse_model_names == [
         TSPULSE_FINETUNED_MODEL_NAME,
         TSPULSE_ORIGINAL_MODEL_NAME,
     ]
+
+
+def test_resolve_requested_models_detects_prophet_family() -> None:
+    darts, prophet, tspulse_model_names = _resolve_requested_models(
+        ["NLinear", "Prophet", "Prophet"]
+    )
+
+    assert darts == ["NLinear"]
+    assert prophet == ["Prophet"]
+    assert tspulse_model_names == []
 
 
 def test_merge_plot_stores_combines_predictions_and_preserves_metadata() -> None:
@@ -174,7 +203,7 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
     )
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark._resolve_requested_models",
-        lambda model_names: (list(model_names), []),
+        lambda model_names: (list(model_names), [], []),
     )
 
     def fake_cfg_get_int(section: str, option: str, default: int) -> int:
@@ -419,7 +448,7 @@ def test_load_darts_models_from_artifacts_loads_cpu_model_and_skips_missing(
     assert trainer_kwargs["map_location"] == "cpu"
     assert trainer_kwargs["pl_trainer_kwargs"]["accelerator"] == "cpu"
     wrapped = loaded["Fake"]
-    assert isinstance(wrapped, Float32InputModelAdapter)
+    assert isinstance(wrapped, DartsGlobalGapImputer)
     assert wrapped._model.model.float_called is True
     assert wrapped._model.trainer_params["enable_progress_bar"] is False
     assert wrapped._model.model_params["pl_trainer_kwargs"]["logger"] is False
