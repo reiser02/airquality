@@ -1,4 +1,4 @@
-"""Unit + smoke tests for the label-free air-quality anomaly-detection benchmark."""
+"""Unit + smoke tests for the two-mode air-quality anomaly-detection benchmark."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import numpy as np
 import pytest
 
 from airquality.anomaly import benchmark as benchmark_module
+from airquality.anomaly.anomalies import ANOMALY_TYPES, apply_anomaly_segment, inject_synthetic_anomalies
 from airquality.anomaly.benchmark import (
-    METRIC_KEYS,
+    INJECTION_VARIANT,
+    SYNTHETIC_METRIC_KEYS,
+    UNLABELED_METRIC_KEYS,
     AnomalyBenchmarkConfig,
     AnomalyCase,
     _filter_model_kwargs,
@@ -19,9 +22,10 @@ from airquality.anomaly.benchmark import (
     run_benchmark,
     split_by_detection_rate,
 )
-from airquality.anomaly.ensemble import consensus
+from airquality.anomaly.ensemble import consensus, rank_top_k
 from airquality.anomaly.metrics import (
     MAD_SCALE,
+    compute_metrics,
     detect_mask,
     detection_rate,
     mad_threshold,
@@ -42,6 +46,79 @@ def _spiky_series(length: int = 800, spike_positions: tuple[int, ...] = (120, 40
     for position in spike_positions:
         values[position] += 25.0
     return values
+
+
+# --- synthetic anomaly injection (no STL base) ------------------------------
+
+
+@pytest.mark.parametrize("variant", [*ANOMALY_TYPES, INJECTION_VARIANT])
+def test_inject_produces_labels(variant: str):
+    values = _base_series()
+    injected, labels = inject_synthetic_anomalies(values, variant, seed=7)
+    assert injected.shape == values.shape == labels.shape
+    assert labels.sum() >= 1
+    assert set(np.unique(labels)).issubset({0, 1})
+
+
+def test_injection_variant_is_raw_combined():
+    assert INJECTION_VARIANT == "combined"
+
+
+def test_inject_preserves_series_outside_labels():
+    # No STL base: outside the injected segments the REAL series is untouched.
+    values = _base_series(400)
+    injected, labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=3)
+    untouched = labels == 0
+    assert np.array_equal(injected[untouched], values[untouched])
+    assert not np.array_equal(injected, values)
+
+
+def test_inject_rejects_stl_variant():
+    with pytest.raises(ValueError):
+        inject_synthetic_anomalies(_base_series(200), "STL-combined", seed=1)
+
+
+def test_inject_short_series_returns_zero_labels():
+    values = np.arange(5, dtype=np.float32)
+    injected, labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=1)
+    assert labels.sum() == 0
+    assert injected.shape == values.shape
+
+
+def test_apply_anomaly_segment_unknown_type_raises():
+    arr = np.zeros(10, dtype=np.float32)
+    with pytest.raises(ValueError):
+        apply_anomaly_segment(arr, arr, 0, 4, "bogus", np.random.default_rng(0), 1.0)
+
+
+def test_inject_is_deterministic_for_seed():
+    values = _base_series(400)
+    a_values, a_labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=5)
+    b_values, b_labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=5)
+    assert np.array_equal(a_values, b_values)
+    assert np.array_equal(a_labels, b_labels)
+
+
+# --- supervised metrics (synthetic mode) ------------------------------------
+
+
+def test_compute_metrics_perfect_score():
+    labels = np.array([0, 0, 1, 1, 0, 0, 1, 0])
+    scores = labels.astype(np.float64)
+    metrics = compute_metrics(labels, scores, window_size=2)
+    assert metrics["auroc"] == pytest.approx(1.0)
+    assert metrics["vus_pr"] > 0.5
+
+
+def test_compute_metrics_no_anomalies_returns_zero_dict():
+    metrics = compute_metrics(np.zeros(8, dtype=np.int64), np.linspace(0, 1, 8), window_size=2)
+    assert set(metrics) == set(SYNTHETIC_METRIC_KEYS)
+    assert all(value == 0.0 for value in metrics.values())
+
+
+def test_compute_metrics_empty_returns_zero_dict():
+    metrics = compute_metrics(np.array([], dtype=np.int64), np.array([]), window_size=2)
+    assert all(value == 0.0 for value in metrics.values())
 
 
 # --- score binarization (median + k*MAD) -----------------------------------
@@ -102,6 +179,19 @@ def test_normalize_scores_scales_to_unit_range():
 
 
 # --- ensemble ------------------------------------------------------------
+
+
+def test_rank_top_k_picks_highest():
+    metrics = {"a": 0.1, "b": 0.9, "c": 0.5, "d": 0.7}
+    assert rank_top_k(metrics, k=3) == ["b", "d", "c"]
+
+
+def test_rank_top_k_breaks_ties_by_name():
+    assert rank_top_k({"b": 0.5, "a": 0.5, "c": 0.1}, k=2) == ["a", "b"]
+
+
+def test_rank_top_k_k_larger_than_input_returns_all():
+    assert rank_top_k({"a": 0.1, "b": 0.2}, k=5) == ["b", "a"]
 
 
 @pytest.mark.parametrize("method", ["AVG", "MAX", "AOM"])
@@ -206,12 +296,12 @@ def test_filter_model_kwargs_drops_unaccepted():
 def test_summarize_aggregates_and_drops_scores():
     series_results = [
         {
-            "metrics": {key: 1.0 for key in METRIC_KEYS},
+            "metrics": {key: 1.0 for key in UNLABELED_METRIC_KEYS},
             "timing": {"fit_seconds": 1.0, "inference_seconds": 2.0},
             "scores": np.zeros(3),
         },
         {
-            "metrics": {key: 0.0 for key in METRIC_KEYS},
+            "metrics": {key: 0.0 for key in UNLABELED_METRIC_KEYS},
             "timing": {"fit_seconds": 3.0, "inference_seconds": 4.0},
             "scores": np.zeros(3),
         },
@@ -222,6 +312,17 @@ def test_summarize_aggregates_and_drops_scores():
     assert out["macro_metrics"]["detection_rate"] == 0.5
     assert out["timing"]["mean_fit_seconds"] == 2.0
     assert all("scores" not in entry for entry in out["series_results"])
+
+
+def test_summarize_derives_metric_keys_from_entries():
+    series_results = [
+        {
+            "metrics": {key: 0.5 for key in SYNTHETIC_METRIC_KEYS},
+            "timing": {"fit_seconds": 1.0, "inference_seconds": 1.0},
+        }
+    ]
+    out = _summarize(series_results)
+    assert set(out["macro_metrics"]) == set(SYNTHETIC_METRIC_KEYS)
 
 
 def _hourly_5m_frame(n_hours: int, start: str = "2024-01-01"):
@@ -243,8 +344,21 @@ def test_build_cases_skips_short_series(monkeypatch):
     cases = benchmark_module.build_cases(config)
 
     assert {case.name for case in cases} == {"Good"}  # Tiny is skipped (too few points)
-    # Cases carry the REAL series untouched (no synthetic injection).
-    assert all(np.isfinite(case.values).all() for case in cases)
+    # Unlabeled cases carry the REAL series untouched (no injection, no labels).
+    assert all(case.labels is None and case.values_select is None for case in cases)
+
+
+def test_build_cases_synthetic_injects_two_independent_seeds(monkeypatch):
+    stations = [("Good", _hourly_5m_frame(30))]
+    monkeypatch.setattr(benchmark_module, "load_raw_5m", lambda pollutant, base_dir: stations)
+
+    config = AnomalyBenchmarkConfig(mode="synthetic", min_series_points=6)
+    cases = benchmark_module.build_cases(config)
+
+    (case,) = cases
+    assert case.labels.sum() >= 1 and case.labels_select.sum() >= 1
+    # Selection and evaluation injections are independent (different seeds).
+    assert not np.array_equal(case.values, case.values_select)
 
 
 def _real_cases() -> list[AnomalyCase]:
@@ -324,6 +438,91 @@ def test_recompute_ensemble_matches_saved_run(tmp_path, monkeypatch):
     out = recompute_ensemble(tmp_path, method="AVG", threshold_k=3.5)
 
     assert "Ensemble(method=AVG,k=3.5)" in out
+    for name in ("ModifiedZScore", "IQR", "IsolationForest"):
+        assert name in out
+    assert all(np.isfinite(value) for value in out.values())
+
+
+# --- synthetic mode end-to-end ---------------------------------------------
+
+
+def _synthetic_cases() -> list[AnomalyCase]:
+    cases = []
+    for station in ("StationA", "StationB"):
+        values = _base_series(700)
+        sel_v, sel_l = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=3)
+        eval_v, eval_l = inject_synthetic_anomalies(values, INJECTION_VARIANT, seed=101)
+        cases.append(
+            AnomalyCase(
+                name=station,
+                values=eval_v,
+                labels=eval_l,
+                values_select=sel_v,
+                labels_select=sel_l,
+            )
+        )
+    return cases
+
+
+def test_run_benchmark_synthetic_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _synthetic_cases())
+    config = AnomalyBenchmarkConfig(
+        mode="synthetic",
+        models=["ModifiedZScore", "IQR", "IsolationForest"],
+        device="cpu",
+        output_dir=str(tmp_path),
+    )
+    summary = run_benchmark(config)
+
+    assert summary["mode"] == "synthetic"
+    assert summary["model_names"][-1] == "Ensemble"
+    for name in summary["model_names"]:
+        assert "vus_pr" in summary["models"][name]["macro_metrics"]
+
+    results_path = tmp_path / "results.json"
+    assert results_path.exists()
+    payload = json.loads(results_path.read_text())
+    assert "Ensemble" in payload["models"]
+    assert payload["variants"] == [INJECTION_VARIANT]
+    # Detectors carry a selection-injection VUS-PR distinct from the reported (eval) one.
+    assert "vus_pr_select" in payload["models"]["IQR"]["series_results"][0]
+    # Labels are persisted so the ensemble can be recomputed without retraining.
+    scores_npz = np.load(tmp_path / "scores.npz")
+    assert "__labels__case0" in scores_npz
+
+
+def test_run_benchmark_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        run_benchmark(AnomalyBenchmarkConfig(mode="bogus"))
+
+
+def test_save_benchmark_plots_synthetic_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _synthetic_cases())
+    config = AnomalyBenchmarkConfig(
+        mode="synthetic", models=["ModifiedZScore", "IQR"], device="cpu", output_dir=str(tmp_path)
+    )
+    run_benchmark(config)
+
+    plot_paths = save_benchmark_plots(tmp_path / "results.json")
+
+    assert plot_paths["metrics_plot"].name == "vus_pr_distribution.png"
+    for key in ("metrics_plot", "scatter_plot", "training_plot"):
+        assert plot_paths[key].exists()
+
+
+def test_recompute_ensemble_synthetic_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _synthetic_cases())
+    config = AnomalyBenchmarkConfig(
+        mode="synthetic",
+        models=["ModifiedZScore", "IQR", "IsolationForest"],
+        device="cpu",
+        output_dir=str(tmp_path),
+    )
+    run_benchmark(config)
+
+    out = recompute_ensemble(tmp_path, method="AVG", top_k=3)
+
+    assert "Ensemble(method=AVG,top_k=3)" in out
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())

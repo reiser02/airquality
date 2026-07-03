@@ -1,8 +1,11 @@
-"""Score-consensus for the anomaly pipeline.
+"""Ensemble selection and score-consensus for the anomaly pipeline.
 
-There is no label-based metric to rank detectors with, so the ensemble fuses
-the per-timestep scores of every detector that survives the detection-rate
-filter (see :func:`airquality.anomaly.benchmark.split_by_detection_rate`).
+In ``unlabeled`` mode there is no label-based metric to rank detectors with,
+so the ensemble fuses the per-timestep scores of every detector that survives
+the detection-rate filter (see
+:func:`airquality.anomaly.benchmark.split_by_detection_rate`). In ``synthetic``
+mode detectors are ranked by their selection-injection VUS-PR and the top-k
+(default 3) are fused with their VUS-PR as ``AVG`` weights.
 
 Consensus methods (standard outlier-ensemble score combiners — Aggarwal & Sathe;
 PyOD; LSCP):
@@ -24,6 +27,13 @@ from .metrics import normalize_scores
 
 ENSEMBLE_METHODS = ("AVG", "MAX", "AOM")
 DEFAULT_ENSEMBLE_METHOD = "AVG"
+DEFAULT_TOP_K = 3
+
+
+def rank_top_k(metric_by_model: dict[str, float], k: int = DEFAULT_TOP_K) -> list[str]:
+    """Return the ``k`` model names with the highest metric (ties broken by name)."""
+    ordered = sorted(metric_by_model.items(), key=lambda item: (-item[1], item[0]))
+    return [name for name, _ in ordered[:k]]
 
 
 def consensus(

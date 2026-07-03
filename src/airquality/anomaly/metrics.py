@@ -1,19 +1,28 @@
-"""Label-free scoring utilities for the anomaly benchmark.
+"""Scoring metrics for both anomaly-benchmark modes.
 
-There is no ground truth for real air-quality series (the detectors will run
-in real time), so no supervised metric (AUROC/VUS-PR/...) can be computed.
-Instead, detector scores are binarized with a robust threshold on their own
-distribution (median + k * scaled MAD, the Iglewicz-Hoaglin modified z-score
-rule for k=3.5) and detectors are judged by their **detection rate**: the
-fraction of points they flag. Detectors flagging more than a small budget
-(default 7%) are discarded — sensor errors (spikes, calibration drift,
-cutouts) are rare, so a high rate means the detector is flagging normal
-variation, not faults.
+**Label-free** (``unlabeled`` mode, also used by the production cleaning):
+there is no ground truth for real air-quality series, so detector scores are
+binarized with a robust threshold on their own distribution (median + k *
+scaled MAD, the Iglewicz-Hoaglin modified z-score rule for k=3.5) and
+detectors are judged by their **detection rate**: the fraction of points they
+flag. Detectors flagging more than a small budget (default 7%) are discarded —
+sensor errors (spikes, calibration drift, cutouts) are rare, so a high rate
+means the detector is flagging normal variation, not faults.
+
+**Supervised** (``synthetic`` mode): :func:`compute_metrics` scores detectors
+against injected-anomaly labels with the genias metric set — AUROC, AUPR,
+VUS-PR/VUS-ROC (window-tolerant volumes, via the vendored ``vus_volume``) and
+affiliation F1 (event-based, via the vendored ``affiliation`` package).
 """
 
 from __future__ import annotations
 
 import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from ._vendor.affiliation.generics import convert_vector_to_events
+from ._vendor.affiliation.metrics import pr_from_events
+from ._vendor.vus_volume import vus_roc_pr
 
 #: 1.4826 * MAD estimates the standard deviation under normality, so
 #: ``median + 3.5 * 1.4826 * MAD`` matches the Iglewicz-Hoaglin modified
@@ -66,3 +75,49 @@ def detection_rate(mask: np.ndarray) -> float:
     if mask.size == 0:
         return 0.0
     return float(mask.mean())
+
+
+def compute_metrics(labels: np.ndarray, scores: np.ndarray, window_size: int) -> dict[str, float]:
+    """Compute the supervised metric set for one scored series (synthetic mode).
+
+    ``window_size`` is the sliding-window tolerance used by VUS; scores are
+    min-max normalized first. Returns all-zero metrics when there are no
+    positive labels (metrics would be undefined).
+    """
+    if len(labels) == 0 or np.sum(labels) == 0:
+        return {
+            "auroc": 0.0,
+            "aupr": 0.0,
+            "vus_pr": 0.0,
+            "vus_roc": 0.0,
+            "affiliation_f1": 0.0,
+        }
+
+    labels = labels.astype(np.int64)
+    score = normalize_scores(scores.astype(np.float64))
+    sliding_window = max(1, int(window_size))
+
+    auroc = float(roc_auc_score(labels, score))
+    aupr = float(average_precision_score(labels, score))
+    vus_roc, vus_pr = vus_roc_pr(labels, score, sliding_window)
+
+    # Affiliation precision/recall over events thresholded at 0.5 (matches
+    # vus.metrics.get_metrics).
+    discrete_score = np.array(score > 0.5, dtype=np.float32)
+    events_pred = convert_vector_to_events(discrete_score)
+    events_gt = convert_vector_to_events(labels)
+    affiliation = pr_from_events(events_pred, events_gt, (0, len(discrete_score)))
+    affiliation_precision = float(affiliation["Affiliation_Precision"])
+    affiliation_recall = float(affiliation["Affiliation_Recall"])
+
+    affiliation_f1 = 0.0
+    if affiliation_precision + affiliation_recall > 0.0:
+        affiliation_f1 = (2.0 * affiliation_precision * affiliation_recall) / (affiliation_precision + affiliation_recall)
+
+    return {
+        "auroc": auroc,
+        "aupr": aupr,
+        "vus_pr": float(vus_pr),
+        "vus_roc": float(vus_roc),
+        "affiliation_f1": float(affiliation_f1),
+    }
