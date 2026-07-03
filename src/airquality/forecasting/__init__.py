@@ -8,7 +8,6 @@ their multi-step forecasting error over a shared observed holdout.
 from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
 from airquality.forecasting.cleaning import (
     CleaningResult,
-    best_threshold_f1,
     detect_anomaly_mask,
     remove_anomalies,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "run_comparison_from_config",
     "detect_anomaly_mask",
     "remove_anomalies",
-    "best_threshold_f1",
     "CleaningResult",
     "build_imputer",
     "impute_series",

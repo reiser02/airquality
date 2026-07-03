@@ -24,7 +24,7 @@ from typing import Any
 
 import pandas as pd
 
-from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
+from airquality.config import cfg_get_csv_list, cfg_get_float, cfg_get_int, cfg_get_str
 from airquality.data.io import load_and_normalize_series
 from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
 from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
@@ -83,7 +83,8 @@ def run_comparison_from_config() -> dict[str, Any]:
     min_series_points = cfg_get_int("forecasting", "min_series_points", 600)
     seed = cfg_get_int("forecasting", "seed", 13)
     device = cfg_get_str("forecasting", "device", "cpu")
-    detector_variant = cfg_get_str("forecasting", "detector_variant", "STL-combined")
+    threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
+    max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
     detectors = list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
     imputation_model = cfg_get_str("forecasting", "imputation_model", "interp")
     forecast_models = list(
@@ -117,18 +118,20 @@ def run_comparison_from_config() -> dict[str, Any]:
         cleaning = detect_anomaly_mask(
             train_raw,
             detectors=detectors,
-            variant=detector_variant,
             seed=seed,
             device=device,
             freq=freq,
+            threshold_k=threshold_k,
+            max_detection_rate=max_detection_rate,
         )
         train_clean = remove_anomalies(train_raw, cleaning)
         train_pre = impute_series(
             train_clean, imputer, freq=freq, use_scaler=imputation_model not in ("interp", "LinearInterp")
         )
         print(
-            f"[info] {name}: detector={cleaning.detector or 'none'} "
-            f"f1={cleaning.f1:.3f} anomalias={cleaning.n_flagged}"
+            f"[info] {name}: detectores={','.join(cleaning.detectors) or 'none'} "
+            f"descartados={','.join(cleaning.discarded) or 'none'} "
+            f"tasa={cleaning.detection_rate:.2%} anomalias={cleaning.n_flagged}"
         )
 
         for model_name in forecast_models:
@@ -145,7 +148,7 @@ def run_comparison_from_config() -> dict[str, Any]:
             common = {
                 "series": name,
                 "model": model_name,
-                "detector": cleaning.detector,
+                "detectors": ",".join(cleaning.detectors),
                 "n_anomalies": cleaning.n_flagged,
                 "imputation_model": imputation_model,
             }

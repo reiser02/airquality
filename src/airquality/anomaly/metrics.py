@@ -1,18 +1,29 @@
-"""Scoring metrics for the anomaly benchmark (genias metric set).
+"""Label-free scoring utilities for the anomaly benchmark.
 
-Computes the five metrics reported per detector and case: AUROC, AUPR,
-VUS-PR/VUS-ROC (window-tolerant volumes, via the vendored ``vus_volume``) and
-affiliation F1 (event-based, via the vendored ``affiliation`` package).
+There is no ground truth for real air-quality series (the detectors will run
+in real time), so no supervised metric (AUROC/VUS-PR/...) can be computed.
+Instead, detector scores are binarized with a robust threshold on their own
+distribution (median + k * scaled MAD, the Iglewicz-Hoaglin modified z-score
+rule for k=3.5) and detectors are judged by their **detection rate**: the
+fraction of points they flag. Detectors flagging more than a small budget
+(default 7%) are discarded — sensor errors (spikes, calibration drift,
+cutouts) are rare, so a high rate means the detector is flagging normal
+variation, not faults.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from sklearn.metrics import average_precision_score, roc_auc_score
 
-from ._vendor.affiliation.generics import convert_vector_to_events
-from ._vendor.affiliation.metrics import pr_from_events
-from ._vendor.vus_volume import vus_roc_pr
+#: 1.4826 * MAD estimates the standard deviation under normality, so
+#: ``median + 3.5 * 1.4826 * MAD`` matches the Iglewicz-Hoaglin modified
+#: z-score cutoff of 3.5.
+MAD_SCALE = 1.4826
+DEFAULT_THRESHOLD_K = 3.5
+
+#: Maximum tolerated fraction of flagged points. Sensor faults are rare;
+#: a detector above this budget is flagging normal variation.
+DEFAULT_MAX_DETECTION_RATE = 0.07
 
 
 def normalize_scores(scores: np.ndarray) -> np.ndarray:
@@ -24,47 +35,34 @@ def normalize_scores(scores: np.ndarray) -> np.ndarray:
     return (scores - minimum) / (maximum - minimum)
 
 
-def compute_metrics(labels: np.ndarray, scores: np.ndarray, window_size: int) -> dict[str, float]:
-    """Compute the benchmark metric set for one scored series.
+def mad_threshold(scores: np.ndarray, k: float = DEFAULT_THRESHOLD_K) -> float:
+    """Robust score threshold: ``median + k * 1.4826 * MAD`` over finite scores.
 
-    ``window_size`` is the sliding-window tolerance used by VUS; scores are
-    min-max normalized first. Returns all-zero metrics when there are no
-    positive labels (metrics would be undefined).
+    Degenerates gracefully: with MAD = 0 (more than half the scores identical,
+    e.g. Hampel scoring 0 on every non-outlier) the threshold is the median, so
+    only scores strictly above the majority value are flagged; an all-constant
+    score array then flags nothing. Returns ``inf`` when no score is finite.
     """
-    if len(labels) == 0 or np.sum(labels) == 0:
-        return {
-            "auroc": 0.0,
-            "aupr": 0.0,
-            "vus_pr": 0.0,
-            "vus_roc": 0.0,
-            "affiliation_f1": 0.0,
-        }
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = scores[np.isfinite(scores)]
+    if finite.size == 0:
+        return float("inf")
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    return median + float(k) * MAD_SCALE * mad
 
-    labels = labels.astype(np.int64)
-    score = normalize_scores(scores.astype(np.float64))
-    sliding_window = max(1, int(window_size))
 
-    auroc = float(roc_auc_score(labels, score))
-    aupr = float(average_precision_score(labels, score))
-    vus_roc, vus_pr = vus_roc_pr(labels, score, sliding_window)
+def detect_mask(scores: np.ndarray, k: float = DEFAULT_THRESHOLD_K) -> np.ndarray:
+    """Binarize ``scores`` with the MAD threshold (strict ``>``; NaN never flagged)."""
+    scores = np.asarray(scores, dtype=np.float64)
+    threshold = mad_threshold(scores, k)
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(scores) & (scores > threshold)
 
-    # Affiliation precision/recall over events thresholded at 0.5 (matches
-    # vus.metrics.get_metrics).
-    discrete_score = np.array(score > 0.5, dtype=np.float32)
-    events_pred = convert_vector_to_events(discrete_score)
-    events_gt = convert_vector_to_events(labels)
-    affiliation = pr_from_events(events_pred, events_gt, (0, len(discrete_score)))
-    affiliation_precision = float(affiliation["Affiliation_Precision"])
-    affiliation_recall = float(affiliation["Affiliation_Recall"])
 
-    affiliation_f1 = 0.0
-    if affiliation_precision + affiliation_recall > 0.0:
-        affiliation_f1 = (2.0 * affiliation_precision * affiliation_recall) / (affiliation_precision + affiliation_recall)
-
-    return {
-        "auroc": auroc,
-        "aupr": aupr,
-        "vus_pr": float(vus_pr),
-        "vus_roc": float(vus_roc),
-        "affiliation_f1": float(affiliation_f1),
-    }
+def detection_rate(mask: np.ndarray) -> float:
+    """Fraction of flagged points in a boolean ``mask`` (0.0 when empty)."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return 0.0
+    return float(mask.mean())

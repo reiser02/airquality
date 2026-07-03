@@ -1,28 +1,26 @@
 """Detect and remove anomalies from a *real* (unlabeled) air-quality series.
 
-The benchmark pipeline (:mod:`.pipeline`) injects synthetic anomalies to *score*
-detectors with VUS-PR. Here we reuse the same building blocks for a different
-goal: cleaning one real series for which there is **no** ground truth.
+This is the production-facing counterpart of the label-free anomaly benchmark
+(:mod:`airquality.anomaly.benchmark`) and applies the exact same method — there
+is no ground truth in real time, so no detector can be selected or calibrated
+against labels (synthetic injection was deliberately dropped: its anomalies
+were not representative of the sensor faults we target).
 
-Strategy (per series, agreed with the user):
+Strategy (per series):
 
 1. Split the series into **contiguous observed segments** (no ``dropna()``
    gluing: stitching non-contiguous stretches would create artificial phase
-   jumps in the daily cycle for STL and windowed detectors).
-2. Inject synthetic anomalies into the longest contiguous segment
-   (:func:`.anomalies.inject_synthetic_anomalies`) to obtain reference labels.
-3. Fit every registered detector on the injected segment and, for each, pick the
-   score threshold that **maximizes F1** against the injected labels.
-4. **Select the detector** with the best F1 (one detector per series). The
-   injected anomalies are the selection mechanism -- no VUS-PR is computed.
-5. Transfer the calibrated threshold in **relative (quantile) terms**: the
-   absolute score scale changes between the injected and the original series
-   for many detectors, so the optimal threshold is mapped to its quantile in
-   the injected-score distribution and that quantile is applied to the scores
-   of each original segment.
-6. Re-score the winning detector on every contiguous segment of the *original*
-   (non-injected) series and flag with the transferred quantile threshold;
-   segments shorter than :data:`MIN_SEGMENT_POINTS` get no detection.
+   jumps in the daily cycle for windowed detectors).
+2. Fit/score every requested detector on each segment and binarize its scores
+   with the robust MAD threshold (:func:`airquality.anomaly.metrics.detect_mask`,
+   median + k * scaled MAD).
+3. **Discard** detectors whose detection rate over the observed points exceeds
+   ``max_detection_rate`` (default 7%): the target anomalies are sensor faults
+   (spikes, calibration drift, cutouts), which are rare — a higher rate means
+   the detector flags normal variation.
+4. Build the final mask from the **consensus** of the surviving detectors
+   (:func:`airquality.anomaly.ensemble.consensus` over their normalized
+   scores), re-thresholded with the same MAD rule per segment.
 
 Flagged timestamps are then set to NaN by :func:`remove_anomalies` so the
 imputation step can fill them.
@@ -36,14 +34,17 @@ import logging
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import f1_score
 
-from airquality.anomaly.anomalies import inject_synthetic_anomalies
+from airquality.anomaly.ensemble import DEFAULT_ENSEMBLE_METHOD, consensus
+from airquality.anomaly.metrics import (
+    DEFAULT_MAX_DETECTION_RATE,
+    DEFAULT_THRESHOLD_K,
+    detect_mask,
+)
 from airquality.anomaly.registry import resolve_model_class, resolve_model_names
 from airquality.data.segments import contiguous_observed_segments
 from airquality.data.series import ensure_datetime_series
 
-DEFAULT_VARIANT = "STL-combined"
 DEFAULT_SEED = 13
 
 #: Minimum contiguous observed points a segment needs to enter detection (the
@@ -53,14 +54,15 @@ MIN_SEGMENT_POINTS = 8
 
 @dataclass
 class CleaningResult:
-    """Outcome of anomaly detection on one series."""
+    """Outcome of label-free anomaly detection on one series."""
 
-    detector: str
-    threshold: float  # absolute F1-optimal threshold on the injected scores
-    threshold_quantile: float  # rank of `threshold` in the injected-score distribution
-    f1: float
+    detectors: list[str]  # survivors of the detection-rate filter (used in the consensus)
+    discarded: list[str]  # detectors over the detection-rate budget
+    rates: dict[str, float]  # per-detector detection rate on this series
+    threshold_k: float
     mask: pd.Series  # boolean, indexed like the input series (True = anomaly)
-    n_flagged: int
+    n_flagged: int = 0
+    detection_rate: float = 0.0  # rate of the final consensus mask
 
 
 def _filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str, object]:
@@ -72,42 +74,6 @@ def _filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str
     return {key: value for key, value in kwargs.items() if key in valid}
 
 
-def best_threshold_f1(
-    labels: np.ndarray,
-    scores: np.ndarray,
-    *,
-    max_candidates: int = 100,
-    min_quantile: float = 0.5,
-) -> tuple[float, float]:
-    """Return the ``(threshold, f1)`` over ``scores`` that best matches ``labels``.
-
-    Candidate thresholds are a capped grid of score quantiles; a point is flagged
-    when ``score >= threshold``. Used to calibrate a detector without real labels
-    by reusing the synthetic-injection labels. The search starts at
-    ``min_quantile`` (default the median) because anomalies are the high-score
-    minority -- this prevents a degenerate threshold that flags the majority of
-    the series when a weak detector barely separates the classes.
-    """
-    scores = np.asarray(scores, dtype=float)
-    labels = np.asarray(labels, dtype=int)
-    finite = scores[np.isfinite(scores)]
-    if finite.size == 0 or labels.sum() == 0:
-        return float("inf"), 0.0
-
-    quantiles = np.linspace(min_quantile, 1.0, max_candidates)
-    candidates = np.unique(np.quantile(finite, quantiles))
-
-    best_threshold = float(candidates[-1])
-    best_f1 = -1.0
-    for threshold in candidates:
-        predicted = (scores >= threshold).astype(int)
-        score = f1_score(labels, predicted, zero_division=0)
-        if score > best_f1:
-            best_f1 = float(score)
-            best_threshold = float(threshold)
-    return best_threshold, best_f1
-
-
 def _fit_score(model_cls: type, values: np.ndarray, *, seed: int, device: str) -> np.ndarray:
     """Instantiate, fit and score one detector on ``values``."""
     kwargs = _filter_model_kwargs(model_cls, {"device": device})
@@ -116,16 +82,64 @@ def _fit_score(model_cls: type, values: np.ndarray, *, seed: int, device: str) -
     return np.asarray(model.score(values), dtype=float)
 
 
+def _score_segments(
+    model_names: list[str],
+    segments: list[pd.Series],
+    *,
+    seed: int,
+    device: str,
+) -> dict[str, list[np.ndarray | None]]:
+    """Score every detector on every segment (``None`` where a detector fails).
+
+    Detectors that fail on every segment are dropped entirely; a per-segment
+    failure (e.g. a windowed model on a segment shorter than its window) only
+    removes that detector from that segment's consensus.
+    """
+    scores_by_model: dict[str, list[np.ndarray | None]] = {}
+    for name in model_names:
+        model_cls = resolve_model_class(name)
+        segment_scores: list[np.ndarray | None] = []
+        for segment in segments:
+            try:
+                segment_scores.append(
+                    _fit_score(model_cls, segment.to_numpy(dtype=np.float32), seed=seed, device=device)
+                )
+            except Exception as exc:  # pragma: no cover - detector-specific failures
+                logging.warning(
+                    "Detector %s fallo en un segmento de %d puntos: %s", name, len(segment), exc
+                )
+                segment_scores.append(None)
+        if all(scores is None for scores in segment_scores):
+            logging.warning("Detector %s fallo en todos los segmentos; se omite.", name)
+            continue
+        scores_by_model[name] = segment_scores
+    return scores_by_model
+
+
+def _detector_rate(segment_scores: list[np.ndarray | None], threshold_k: float) -> float:
+    """Detection rate of one detector over every segment it scored."""
+    flagged = 0
+    total = 0
+    for scores in segment_scores:
+        if scores is None:
+            continue
+        mask = detect_mask(scores, threshold_k)
+        flagged += int(mask.sum())
+        total += int(mask.size)
+    return flagged / total if total else 0.0
+
+
 def detect_anomaly_mask(
     series: pd.Series,
     *,
     detectors: list[str] | None = None,
-    variant: str = DEFAULT_VARIANT,
     seed: int = DEFAULT_SEED,
     device: str = "cpu",
     freq: str = "h",
+    threshold_k: float = DEFAULT_THRESHOLD_K,
+    max_detection_rate: float = DEFAULT_MAX_DETECTION_RATE,
 ) -> CleaningResult:
-    """Select the best detector via synthetic injection and flag real anomalies."""
+    """Flag anomalies with the consensus of the detectors that pass the rate filter."""
     s = ensure_datetime_series(series, freq=freq, name=str(series.name or "series"))
     empty_mask = pd.Series(False, index=s.index, name=s.name)
 
@@ -134,74 +148,47 @@ def detect_anomaly_mask(
     segments = contiguous_observed_segments(s, min_len=MIN_SEGMENT_POINTS)
     if not segments:
         return CleaningResult(
-            detector="", threshold=float("inf"), threshold_quantile=1.0,
-            f1=0.0, mask=empty_mask, n_flagged=0,
+            detectors=[], discarded=[], rates={}, threshold_k=threshold_k, mask=empty_mask
         )
 
-    # --- Selection: calibrate every detector on the longest contiguous segment.
-    selection_values = max(segments, key=len).to_numpy(dtype=np.float32)
-    injected, labels = inject_synthetic_anomalies(selection_values, variant, seed)
     model_names = resolve_model_names(detectors if detectors else ["all"])
+    scores_by_model = _score_segments(model_names, segments, seed=seed, device=device)
 
-    best_name = ""
-    best_threshold = float("inf")
-    best_f1 = -1.0
-    best_scores: np.ndarray | None = None
-    for name in model_names:
-        try:
-            model_cls = resolve_model_class(name)
-            scores = _fit_score(model_cls, injected, seed=seed, device=device)
-            threshold, f1 = best_threshold_f1(labels, scores)
-        except Exception as exc:  # pragma: no cover - detector-specific failures
-            logging.warning("Detector %s fallo durante la seleccion: %s", name, exc)
-            continue
-        if f1 > best_f1:
-            best_f1, best_name, best_threshold = f1, name, threshold
-            best_scores = scores
+    # --- Detection-rate filter: sensor faults are rare, so a detector flagging
+    # more than the budget is marking normal variation, not anomalies.
+    rates = {
+        name: _detector_rate(segment_scores, threshold_k)
+        for name, segment_scores in scores_by_model.items()
+    }
+    survivors = sorted(name for name, rate in rates.items() if rate <= max_detection_rate)
+    discarded = sorted(name for name, rate in rates.items() if rate > max_detection_rate)
 
-    if not best_name:
-        return CleaningResult(
-            detector="", threshold=float("inf"), threshold_quantile=1.0,
-            f1=0.0, mask=empty_mask, n_flagged=0,
-        )
-
-    # --- Quantile transfer: the absolute score scale is not comparable between
-    # the injected and the original series (z-scores, reconstruction errors...),
-    # so the calibrated threshold travels as the rank it occupies among the
-    # injected scores and is re-materialized on each original-score distribution.
-    finite_selection = (
-        best_scores[np.isfinite(best_scores)] if best_scores is not None else np.array([])
-    )
-    can_transfer = np.isfinite(best_threshold) and finite_selection.size > 0
-    threshold_quantile = (
-        float(np.mean(finite_selection < best_threshold)) if can_transfer else 1.0
-    )
-
-    # --- Application: re-score the winner on every ORIGINAL contiguous segment
-    # and flag with the transferred quantile threshold.
+    # --- Final mask: per segment, fuse the survivors' normalized scores and
+    # re-threshold the consensus with the same MAD rule.
     mask = empty_mask.copy()
     n_flagged = 0
-    if can_transfer:
-        best_cls = resolve_model_class(best_name)
-        for segment in segments:
-            segment_scores = _fit_score(
-                best_cls, segment.to_numpy(dtype=np.float32), seed=seed, device=device
-            )
-            finite = segment_scores[np.isfinite(segment_scores)]
-            if finite.size == 0:
-                continue
-            segment_threshold = float(np.quantile(finite, threshold_quantile))
-            flagged = segment_scores >= segment_threshold
-            mask.loc[segment.index] = flagged
-            n_flagged += int(flagged.sum())
+    for segment_index, segment in enumerate(segments):
+        score_arrays = [
+            scores_by_model[name][segment_index]
+            for name in survivors
+            if scores_by_model[name][segment_index] is not None
+        ]
+        if not score_arrays:
+            continue
+        fused = consensus(score_arrays, DEFAULT_ENSEMBLE_METHOD, seed)
+        flagged = detect_mask(fused, threshold_k)
+        mask.loc[segment.index] = flagged
+        n_flagged += int(flagged.sum())
 
+    total_observed = sum(len(segment) for segment in segments)
     return CleaningResult(
-        detector=best_name,
-        threshold=best_threshold,
-        threshold_quantile=threshold_quantile,
-        f1=best_f1,
+        detectors=survivors,
+        discarded=discarded,
+        rates=rates,
+        threshold_k=threshold_k,
         mask=mask,
         n_flagged=n_flagged,
+        detection_rate=n_flagged / total_observed if total_observed else 0.0,
     )
 
 
@@ -215,7 +202,6 @@ def remove_anomalies(series: pd.Series, result: CleaningResult) -> pd.Series:
 
 __all__ = [
     "CleaningResult",
-    "best_threshold_f1",
     "detect_anomaly_mask",
     "remove_anomalies",
 ]

@@ -8,11 +8,7 @@ import pytest
 
 import airquality.forecasting.pipeline as cp
 from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
-from airquality.forecasting.cleaning import (
-    best_threshold_f1,
-    detect_anomaly_mask,
-    remove_anomalies,
-)
+from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
 from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
 from airquality.imputation.registry import resolve_imputer_family
 
@@ -32,23 +28,6 @@ def _seasonal_series(n: int = 900, name: str = "ST", seed: int = 0) -> pd.Series
 
 
 # --------------------------------------------------------------------------- #
-# Threshold calibration
-# --------------------------------------------------------------------------- #
-def test_best_threshold_f1_perfect_separation():
-    labels = np.array([0, 0, 1, 1, 0, 0, 1, 0])
-    scores = np.array([0.1, 0.2, 0.9, 0.8, 0.05, 0.1, 0.95, 0.2])
-    threshold, f1 = best_threshold_f1(labels, scores)
-    assert f1 == pytest.approx(1.0)
-    assert (scores >= threshold).astype(int).tolist() == labels.tolist()
-
-
-def test_best_threshold_f1_no_positive_labels():
-    threshold, f1 = best_threshold_f1(np.zeros(5, dtype=int), np.arange(5.0))
-    assert f1 == 0.0
-    assert threshold == float("inf")
-
-
-# --------------------------------------------------------------------------- #
 # Anomaly detection / removal
 # --------------------------------------------------------------------------- #
 def test_detect_anomaly_mask_flags_spikes():
@@ -59,10 +38,12 @@ def test_detect_anomaly_mask_flags_spikes():
 
     result = detect_anomaly_mask(series, detectors=BASELINE_DETECTORS, device="cpu")
 
-    assert result.detector in BASELINE_DETECTORS
+    assert result.detectors and set(result.detectors) <= set(BASELINE_DETECTORS)
     assert bool(result.mask.iloc[300]) and bool(result.mask.iloc[500])
     # Gaps are never flagged (they are not observed points).
     assert not result.mask.iloc[100:105].any()
+    # The consensus itself must respect the rarity budget on this clean series.
+    assert result.detection_rate <= 0.07
 
     cleaned = remove_anomalies(series, result)
     assert np.isnan(cleaned.iloc[300]) and np.isnan(cleaned.iloc[500])
@@ -72,7 +53,22 @@ def test_detect_anomaly_mask_flags_spikes():
 def test_detect_anomaly_mask_short_series_is_noop():
     idx = pd.date_range("2024-01-01", periods=5, freq="h")
     result = detect_anomaly_mask(pd.Series([1.0, 2, 3, 4, 5], index=idx, name="s"))
-    assert result.detector == ""
+    assert result.detectors == []
+    assert result.n_flagged == 0
+
+
+def test_detect_anomaly_mask_discards_detectors_over_budget():
+    # With a budget of 0, any detector that flags a point is discarded and the
+    # final mask is empty (no survivors flag anything).
+    series = _seasonal_series(seed=1)
+    series.iloc[300] = 140.0
+
+    result = detect_anomaly_mask(
+        series, detectors=BASELINE_DETECTORS, device="cpu", max_detection_rate=0.0
+    )
+
+    assert set(result.discarded) >= {"ModifiedZScore"}
+    assert all(result.rates[name] == 0.0 for name in result.detectors)
     assert result.n_flagged == 0
 
 
@@ -91,18 +87,14 @@ def test_contiguous_observed_segments_splits_on_gaps():
     assert contiguous_observed_segments(series, min_len=1)[-1].index[0] == series.index[58]
 
 
-def test_detect_anomaly_mask_transfers_threshold_as_quantile():
-    # The threshold must travel as a score *rank*, not as an absolute value:
-    # detectors score the injected series on a different scale than the
-    # original one.
+def test_detect_anomaly_mask_reports_per_detector_rates():
     series = _seasonal_series(seed=3)
     series.iloc[400] = 150.0
 
     result = detect_anomaly_mask(series, detectors=BASELINE_DETECTORS, device="cpu")
 
-    assert 0.0 <= result.threshold_quantile <= 1.0
-    # A high quantile (anomalies are the minority) that still catches the spike.
-    assert result.threshold_quantile >= 0.5
+    assert set(result.rates) == set(BASELINE_DETECTORS)
+    assert all(0.0 <= rate <= 1.0 for rate in result.rates.values())
     assert bool(result.mask.iloc[400])
 
 

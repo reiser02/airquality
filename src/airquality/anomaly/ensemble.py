@@ -1,7 +1,8 @@
-"""Ensemble selection and score-consensus for the anomaly pipeline.
+"""Score-consensus for the anomaly pipeline.
 
-Per evaluation case we rank detectors by their (label-based) VUS-PR, keep the
-top-k (default 3), and fuse their per-timestep scores into one consensus score.
+There is no label-based metric to rank detectors with, so the ensemble fuses
+the per-timestep scores of every detector that survives the detection-rate
+filter (see :func:`airquality.anomaly.benchmark.split_by_detection_rate`).
 
 Consensus methods (standard outlier-ensemble score combiners — Aggarwal & Sathe;
 PyOD; LSCP):
@@ -11,7 +12,7 @@ PyOD; LSCP):
 - ``MAX``  — per-timestep maximum of normalized scores. Reduces bias, favours
   recall (flags a point if any detector is confident).
 - ``AOM``  — average-of-maximum: split detectors into random buckets, take the
-  max per bucket, average the buckets. Balances bias/variance (with only 3
+  max per bucket, average the buckets. Balances bias/variance (with few
   detectors it degenerates towards ``MAX``).
 """
 
@@ -23,13 +24,6 @@ from .metrics import normalize_scores
 
 ENSEMBLE_METHODS = ("AVG", "MAX", "AOM")
 DEFAULT_ENSEMBLE_METHOD = "AVG"
-DEFAULT_TOP_K = 3
-
-
-def rank_top_k(metric_by_model: dict[str, float], k: int = DEFAULT_TOP_K) -> list[str]:
-    """Return the ``k`` model names with the highest metric (ties broken by name)."""
-    ordered = sorted(metric_by_model.items(), key=lambda item: (-item[1], item[0]))
-    return [name for name, _ in ordered[:k]]
 
 
 def consensus(
@@ -40,8 +34,9 @@ def consensus(
 ) -> np.ndarray:
     """Fuse per-timestep score arrays into one consensus score in ``[0, 1]``-ish range.
 
-    ``weights`` (e.g. per-model VUS-PR) are used by ``AVG`` to compute a
-    weighted mean instead of a simple mean.  Ignored by ``MAX`` and ``AOM``.
+    Optional ``weights`` (e.g. a future per-model reliability score) are used by
+    ``AVG`` to compute a weighted mean instead of a simple mean. Ignored by
+    ``MAX`` and ``AOM``.
     """
     if not score_arrays:
         raise ValueError("consensus requires at least one score array")

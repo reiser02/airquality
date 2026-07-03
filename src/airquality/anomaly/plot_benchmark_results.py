@@ -15,10 +15,11 @@ import argparse
 import json
 from pathlib import Path
 
+from .metrics import DEFAULT_MAX_DETECTION_RATE
 from .presentation import (
+    save_detection_rate_distribution_plot,
+    save_detection_rate_vs_inference_plot,
     save_training_time_plot,
-    save_vus_pr_distribution_plot,
-    save_vus_pr_vs_inference_plot,
 )
 
 
@@ -35,13 +36,14 @@ def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     model_summaries = summary["models"]
+    max_detection_rate = float(summary.get("config", {}).get("max_detection_rate", DEFAULT_MAX_DETECTION_RATE))
     plot_paths = {
-        "metrics_plot": plot_dir / summary.get("metrics_plot", "vus_pr_distribution.png"),
-        "scatter_plot": plot_dir / summary.get("scatter_plot", "vus_pr_vs_inference.png"),
+        "metrics_plot": plot_dir / summary.get("metrics_plot", "detection_rate_distribution.png"),
+        "scatter_plot": plot_dir / summary.get("scatter_plot", "detection_rate_vs_inference.png"),
         "training_plot": plot_dir / summary.get("training_plot", "training_time.png"),
     }
-    save_vus_pr_distribution_plot(plot_paths["metrics_plot"], model_summaries)
-    save_vus_pr_vs_inference_plot(plot_paths["scatter_plot"], model_summaries)
+    save_detection_rate_distribution_plot(plot_paths["metrics_plot"], model_summaries, max_detection_rate)
+    save_detection_rate_vs_inference_plot(plot_paths["scatter_plot"], model_summaries, max_detection_rate)
     save_training_time_plot(plot_paths["training_plot"], model_summaries)
     return plot_paths
 
