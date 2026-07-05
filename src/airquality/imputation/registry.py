@@ -2,8 +2,9 @@
 
 Mirrors the role of ``anomaly/registry.py``: it validates requested imputation
 model names and classifies each into a *family* (`darts_global`, `prophet`,
-`tspulse`). The actual construction happens in ``run_benchmark.py``, which owns
-the runtime configuration (artifact paths, devices, TSPulse settings).
+`tspulse`, `interp`, `linear`). The actual construction happens in
+``run_benchmark.py``, which owns the runtime configuration (artifact paths,
+devices, TSPulse settings).
 
 Optional families are gated by dependency availability: ``Prophet`` requires
 ``darts.models.Prophet`` and ``TSPulse``/``TSPulse_FineTuned`` require
@@ -27,7 +28,11 @@ from airquality.imputation.imputers import (
 DARTS_GLOBAL = "darts_global"
 PROPHET = "prophet"
 TSPULSE = "tspulse"
+INTERP = "interp"
+LINEAR = "linear"
 
+INTERP_MODEL_NAME = "interp"
+LINEAR_MODEL_NAME = "LinearInterp"
 PROPHET_MODEL_NAME = "Prophet"
 TSPULSE_ORIGINAL_MODEL_NAME = "TSPulse"
 TSPULSE_FINETUNED_MODEL_NAME = "TSPulse_FineTuned"
@@ -40,7 +45,10 @@ def darts_global_model_names() -> list[str]:
 
 # name -> family for every known imputer (independent of dependency availability).
 def _build_known_families() -> dict[str, str]:
+    """Map every known imputer name to its family (Darts catalog + specials)."""
     families: dict[str, str] = {name: DARTS_GLOBAL for name in darts_global_model_names()}
+    families[INTERP_MODEL_NAME] = INTERP
+    families[LINEAR_MODEL_NAME] = LINEAR
     families[PROPHET_MODEL_NAME] = PROPHET
     families[TSPULSE_ORIGINAL_MODEL_NAME] = TSPULSE
     families[TSPULSE_FINETUNED_MODEL_NAME] = TSPULSE
@@ -106,6 +114,10 @@ __all__ = [
     "DARTS_GLOBAL",
     "PROPHET",
     "TSPULSE",
+    "INTERP",
+    "LINEAR",
+    "INTERP_MODEL_NAME",
+    "LINEAR_MODEL_NAME",
     "PROPHET_MODEL_NAME",
     "TSPULSE_ORIGINAL_MODEL_NAME",
     "TSPULSE_FINETUNED_MODEL_NAME",

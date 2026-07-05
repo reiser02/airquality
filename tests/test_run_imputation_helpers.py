@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from airquality.imputation.imputers import DartsGlobalGapImputer
+from airquality.imputation.registry import resolve_imputer_names
 from airquality.imputation.run_benchmark import (
     BenchmarkRunConfig,
     TSPulseModelConfig,
@@ -91,17 +92,19 @@ def test_summarize_results_by_model_groups_and_sorts() -> None:
 
 
 def test_resolve_requested_models_deduplicates_darts_and_detects_tspulse() -> None:
-    darts, prophet, tspulse_model_names = _resolve_requested_models(
+    darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
         ["TiDE", "TiDE", " TCN ", TSPULSE_ORIGINAL_MODEL_NAME]
     )
 
     assert darts == ["TiDE", "TCN"]
     assert prophet == []
     assert tspulse_model_names == [TSPULSE_ORIGINAL_MODEL_NAME]
+    assert interp == []
+    assert linear == []
 
 
 def test_resolve_requested_models_accepts_explicit_tspulse_variants() -> None:
-    darts, prophet, tspulse_model_names = _resolve_requested_models(
+    darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
         ["TSPulse_FineTuned", "TSPulse", "TSPulse"]
     )
 
@@ -111,16 +114,53 @@ def test_resolve_requested_models_accepts_explicit_tspulse_variants() -> None:
         TSPULSE_FINETUNED_MODEL_NAME,
         TSPULSE_ORIGINAL_MODEL_NAME,
     ]
+    assert interp == []
+    assert linear == []
 
 
 def test_resolve_requested_models_detects_prophet_family() -> None:
-    darts, prophet, tspulse_model_names = _resolve_requested_models(
+    darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
         ["NLinear", "Prophet", "Prophet"]
     )
 
     assert darts == ["NLinear"]
     assert prophet == ["Prophet"]
     assert tspulse_model_names == []
+    assert interp == []
+    assert linear == []
+
+
+def test_resolve_requested_models_detects_linear_family() -> None:
+    darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
+        ["NLinear", "LinearInterp", "LinearInterp"]
+    )
+
+    assert darts == ["NLinear"]
+    assert prophet == []
+    assert tspulse_model_names == []
+    assert interp == []
+    assert linear == ["LinearInterp"]
+
+
+def test_resolve_requested_models_detects_interp_family() -> None:
+    darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
+        ["interp", "interp", "LinearInterp"]
+    )
+
+    assert darts == []
+    assert prophet == []
+    assert tspulse_model_names == []
+    assert interp == ["interp"]
+    assert linear == ["LinearInterp"]
+
+
+def test_resolve_requested_models_accepts_every_registry_name() -> None:
+    # Regression: `resolve_imputer_names(["all"])` used to include `interp`,
+    # which crashed `_resolve_requested_models` with a raw KeyError.
+    buckets = _resolve_requested_models(resolve_imputer_names(["all"]))
+
+    resolved = [name for bucket in buckets for name in bucket]
+    assert sorted(resolved) == sorted(resolve_imputer_names(["all"]))
 
 
 def test_merge_plot_stores_combines_predictions_and_preserves_metadata() -> None:
@@ -203,7 +243,7 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
     )
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark._resolve_requested_models",
-        lambda model_names: (list(model_names), [], []),
+        lambda model_names: (list(model_names), [], [], [], []),
     )
 
     def fake_cfg_get_int(section: str, option: str, default: int) -> int:

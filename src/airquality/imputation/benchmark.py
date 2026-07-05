@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field  # Structured diagnostics for skipped gaps.
+import logging
 from typing import Any, Mapping, Sequence  # Typing utilities for flexible public API.
 
 import numpy as np  # Numeric operations for masks, metrics, and random sampling.
@@ -214,8 +215,12 @@ def _extract_test_series_from_dataset_bundle(
         if scaler is not None and hasattr(scaler, "inverse_transform"):
             try:
                 ts_unscaled = scaler.inverse_transform(ts)
-            except Exception:
-                ts_unscaled = ts
+            except Exception as exc:
+                # Continuing with the scaled series as if it were unscaled would
+                # silently corrupt every metric of this column.
+                raise RuntimeError(
+                    f"Fallo al des-escalar la serie de test de '{col}'"
+                ) from exc
         out_unscaled[col] = _ts_to_series(ts_unscaled, freq=freq, name=col)
 
     return out_unscaled, dict_scalers
@@ -302,7 +307,13 @@ def _compute_gap_mase(
             val = np.nanmean(val)
         val = float(val)
         return val if np.isfinite(val) else float("nan")
-    except Exception:
+    except Exception as exc:
+        # NaN keeps the benchmark running, but the cause must stay visible:
+        # alignment/frequency bugs would otherwise masquerade as missing context.
+        logging.warning(
+            "MASE no computable para el hueco %s-%s: %s",
+            actual_gap.index.min(), actual_gap.index.max(), exc,
+        )
         return float("nan")
 
 

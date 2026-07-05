@@ -3,6 +3,7 @@
 from airquality.imputation.imputers import (
     DartsGlobalGapImputer,
     GapImputer,
+    InterpolationGapImputer,
     ProphetGapImputer,
     TSPulseGapImputer,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "DartsGlobalGapImputer",
     "ProphetGapImputer",
     "TSPulseGapImputer",
+    "InterpolationGapImputer",
     "available_imputer_names",
     "resolve_imputer_family",
     "resolve_imputer_names",

@@ -10,7 +10,12 @@ from airquality.benchmark import main, run_benchmark_from_config
 def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     monkeypatch, tmp_path: Path
 ) -> None:
-    results = pd.DataFrame([{"Modelo": "TiDE", "MAE": 1.0}])
+    results = pd.DataFrame(
+        [
+            {"Modelo": "TiDE", "Gap_Size": 1, "MAE": 1.0},
+            {"Modelo": "TiDE", "Gap_Size": 2, "MAE": 1.5},
+        ]
+    )
     summary = pd.DataFrame([{"Modelo": "TiDE", "MAE_Mean": 1.0}])
     ranking_by_seed = pd.DataFrame([{"Modelo": "TiDE", "Seed": 42, "MAE": 1.0}])
     plot_store = {
@@ -53,6 +58,14 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     assert (tmp_path / "ranking_by_seed.csv").exists()
     assert (tmp_path / "plot_images.csv").exists()
     assert (tmp_path / "plots" / "gap_1" / "Series_A.png").exists()
+    # Aggregated metric-by-gap artifacts (previously never generated).
+    assert artifacts["metric_gap_plot_path"] == tmp_path / "metrics_by_gap.png"
+    assert (tmp_path / "metrics_by_gap.csv").exists()
+    assert (tmp_path / "metrics_by_gap.png").exists()
+
+    metrics_by_gap_df = pd.read_csv(tmp_path / "metrics_by_gap.csv")
+    assert list(metrics_by_gap_df["Gap_Size"]) == [1, 2]
+    assert metrics_by_gap_df["MAE_Mean"].tolist() == [1.0, 1.5]
 
     plot_manifest_df = pd.read_csv(tmp_path / "plot_images.csv")
     assert list(plot_manifest_df["image_path"]) == ["plots/gap_1/Series_A.png"]

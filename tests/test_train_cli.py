@@ -19,7 +19,7 @@ def test_main_trains_from_config(monkeypatch) -> None:
     monkeypatch.setattr("airquality.train.cfg_get_int", fake_cfg_get_int)
     monkeypatch.setattr(
         "airquality.train.cfg_get_csv_list",
-        lambda *args, **kwargs: ("TiDE", "NHiTS"),
+        lambda *args, **kwargs: ("TiDE", "NHiTS", "Prophet"),
     )
 
     def fake_load_and_normalize_series(**kwargs):
@@ -74,8 +74,10 @@ def test_main_trains_from_config(monkeypatch) -> None:
         "min_train_len": 77,
         "val_context_len": 72,
     }
+    # Non-trainable benchmark imputers (e.g. Prophet) are filtered out; only
+    # Darts-global forecasters reach train_global_methods, as a list.
     assert calls["train_kwargs"] == {
         "dataset_bundle": "bundle",
         "size_k": 5,
-        "method_names": ("TiDE", "NHiTS"),
+        "method_names": ["TiDE", "NHiTS"],
     }

@@ -7,7 +7,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Configuración de seguridad
+# El certificado TLS de pma.ayto-cartagena.es sirve una cadena incompleta
+# (falta el intermedio), así que la verificación estándar falla. Por eso las
+# peticiones usan `verify=False` y se silencia el InsecureRequestWarning.
+# Verificado el 2026-07-03: `curl` devuelve "unable to get local issuer
+# certificate". Si el ayuntamiento arregla la cadena, eliminar ambas cosas.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 

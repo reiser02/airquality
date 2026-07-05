@@ -326,11 +326,13 @@ class LossHistoryCallback(Callback):
     """Captura train/val loss por época desde PyTorch Lightning."""
 
     def __init__(self) -> None:
+        """Inicializa los diccionarios de pérdidas por época (train y val)."""
         super().__init__()
         self.train_loss_by_epoch: dict[int, float] = {}
         self.val_loss_by_epoch: dict[int, float] = {}
 
     def on_train_epoch_end(self, trainer: Any, pl_module: Any) -> None:
+        """Registra el train loss de la época desde las métricas del trainer."""
         del pl_module
         epoch = int(getattr(trainer, "current_epoch", 0))
         train_loss = _read_metric_from_callback_metrics(
@@ -341,6 +343,7 @@ class LossHistoryCallback(Callback):
             self.train_loss_by_epoch[epoch] = train_loss
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
+        """Registra el val loss de la época, ignorando el sanity check inicial."""
         del pl_module
         if bool(getattr(trainer, "sanity_checking", False)):
             return
@@ -565,12 +568,16 @@ def fit_darts_model(
                 "`work_dir` y que existan checkpoints previos."
             ) from exc
 
-    fit_kwargs = {
+    fit_kwargs: dict[str, Any] = {
         "series": series_train,
         "verbose": True,
-        "stride": 2,
         "max_samples_per_ts": 256,
     }
+    # `stride` solo existe en TorchForecastingModel.fit; en los modelos de
+    # regresión caería en `**kwargs` y se reenviaría al `fit` de sklearn,
+    # que no lo acepta (TypeError).
+    if "stride" in inspect.signature(model_cls.fit).parameters:
+        fit_kwargs["stride"] = 2
     if series_val and model_cls is not LinearRegressionModel:
         fit_kwargs["val_series"] = series_val
         fit_kwargs["dataloader_kwargs"] = {"num_workers": 2}

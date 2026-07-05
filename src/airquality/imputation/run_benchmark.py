@@ -16,6 +16,8 @@ from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
 from airquality.imputation.benchmark import execute_complete_pipeline
 from airquality.imputation.imputers import (
     DartsGlobalGapImputer,
+    InterpolationGapImputer,
+    LinearGapImputer,
     PROPHET_AVAILABLE,
     ProphetGapImputer,
     TSFM_PUBLIC_AVAILABLE,
@@ -23,10 +25,15 @@ from airquality.imputation.imputers import (
 )
 from airquality.imputation.registry import (
     DARTS_GLOBAL,
+    INTERP as INTERP_FAMILY,
+    INTERP_MODEL_NAME,
+    LINEAR as LINEAR_FAMILY,
+    LINEAR_MODEL_NAME,
     PROPHET as PROPHET_FAMILY,
     TSPULSE as TSPULSE_FAMILY,
+    TSPULSE_FINETUNED_MODEL_NAME,
+    TSPULSE_ORIGINAL_MODEL_NAME,
     resolve_imputer_family,
-    resolve_imputer_names,
 )
 from airquality.modeling.training import build_benchmark_dataset_bundle
 from airquality.modeling.training_config import (
@@ -58,8 +65,6 @@ def _default_metrics() -> tuple[str, ...]:
 DEFAULT_MODEL_NAMES = _default_model_names()
 DEFAULT_GAP_SIZES = _default_gap_sizes()
 DEFAULT_METRICS = _default_metrics()
-TSPULSE_ORIGINAL_MODEL_NAME = "TSPulse"
-TSPULSE_FINETUNED_MODEL_NAME = "TSPulse_FineTuned"
 
 
 def _default_tspulse_model_id() -> str:
@@ -108,6 +113,7 @@ class BenchmarkRunConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> BenchmarkRunConfig:
+        """Rebuild a config from the flat dict serialized for worker processes."""
         return cls(
             size_k=int(raw["size_k"]),
             force_cpu=bool(raw["force_cpu"]),
@@ -280,6 +286,37 @@ def _build_prophet_model_dict(model_names: Sequence[str]) -> dict[str, ProphetGa
     model_dict: dict[str, ProphetGapImputer] = {}
     for model_name in model_names:
         model_dict[model_name] = ProphetGapImputer(model_name=model_name)
+    return model_dict
+
+
+def _build_interp_model_dict(model_names: Sequence[str]) -> dict[str, InterpolationGapImputer]:
+    """Build the seasonal-interpolation baseline (no artifacts, always available).
+
+    ``interp`` is the hour-of-day climatology + time interpolation used by the
+    preprocessing pipeline (`InterpolationGapImputer`), which re-masks the gap
+    timestamps before filling so the benchmark never scores the ground truth.
+    """
+    model_dict: dict[str, InterpolationGapImputer] = {}
+    for model_name in model_names:
+        if model_name == INTERP_MODEL_NAME:
+            model_dict[model_name] = InterpolationGapImputer(model_name=INTERP_MODEL_NAME)
+        else:
+            raise ValueError(f"Modelo de interpolacion no soportado: {model_name}")
+    return model_dict
+
+
+def _build_linear_model_dict(model_names: Sequence[str]) -> dict[str, LinearGapImputer]:
+    """Build the linear-interpolation baseline (no artifacts, always available).
+
+    ``LinearInterp`` is a literal linear interpolation (`LinearGapImputer`): for a
+    size-1 gap it is exactly the mean of the two neighbours.
+    """
+    model_dict: dict[str, LinearGapImputer] = {}
+    for model_name in model_names:
+        if model_name == LINEAR_MODEL_NAME:
+            model_dict[model_name] = LinearGapImputer(model_name=LINEAR_MODEL_NAME)
+        else:
+            raise ValueError(f"Modelo lineal no soportado: {model_name}")
     return model_dict
 
 
@@ -464,10 +501,12 @@ def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
 
 def _resolve_requested_models(
     model_names: Sequence[str],
-) -> tuple[list[str], list[str], list[str]]:
-    """Split requested specs into Darts-global, Prophet, and TSPulse model names.
+) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Split requested specs into Darts-global, Prophet, TSPulse, interp, and linear names.
 
-    Each name is classified by the imputer registry; unknown names raise.
+    Each name is classified by the imputer registry; unknown names raise. The
+    buckets cover every family the registry knows, so anything returned by
+    ``resolve_imputer_names(["all"])`` is accepted.
     """
     if not model_names:
         raise ValueError("`model_names` no puede estar vacio")
@@ -475,10 +514,14 @@ def _resolve_requested_models(
     darts_model_names: list[str] = []
     prophet_model_names: list[str] = []
     tspulse_model_names: list[str] = []
+    interp_model_names: list[str] = []
+    linear_model_names: list[str] = []
     buckets: dict[str, tuple[list[str], set[str]]] = {
         DARTS_GLOBAL: (darts_model_names, set()),
         PROPHET_FAMILY: (prophet_model_names, set()),
         TSPULSE_FAMILY: (tspulse_model_names, set()),
+        INTERP_FAMILY: (interp_model_names, set()),
+        LINEAR_FAMILY: (linear_model_names, set()),
     }
 
     for spec in model_names:
@@ -490,10 +533,22 @@ def _resolve_requested_models(
             names.append(name)
             seen.add(name)
 
-    if not (darts_model_names or prophet_model_names or tspulse_model_names):
+    if not (
+        darts_model_names
+        or prophet_model_names
+        or tspulse_model_names
+        or interp_model_names
+        or linear_model_names
+    ):
         raise ValueError("No se detectaron modelos validos en `model_names`")
 
-    return darts_model_names, prophet_model_names, tspulse_model_names
+    return (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    )
 
 
 def _merge_plot_stores(
@@ -501,6 +556,7 @@ def _merge_plot_stores(
 ) -> dict[int, dict[str, Any]]:
     """Merge per-model plot payloads into one gap-indexed plot store."""
     def _normalize_series_payload(series_payload: Any) -> dict[str, Any]:
+        """Coerce one per-series plot payload into the actual/preds/naive_mase dict."""
         payload = series_payload if isinstance(series_payload, dict) else {}
         preds = payload.get("preds", {})
         return {
@@ -559,6 +615,10 @@ def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, d
         )
     elif family == PROPHET_FAMILY:
         model_dict = _build_prophet_model_dict((model_name,))
+    elif family == INTERP_FAMILY:
+        model_dict = _build_interp_model_dict((model_name,))
+    elif family == LINEAR_FAMILY:
+        model_dict = _build_linear_model_dict((model_name,))
     else:
         model_dict = load_darts_models_from_artifacts(
             repo_root=resolved_root,
@@ -626,9 +686,13 @@ def run_imputation_benchmark(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    darts_model_names, prophet_model_names, tspulse_model_names = _resolve_requested_models(
-        model_names
-    )
+    (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    ) = _resolve_requested_models(model_names)
 
     dataset_bundle = _build_dataset_bundle_from_config(
         repo_root=resolved_root,
@@ -664,9 +728,15 @@ def run_imputation_benchmark(
         else:
             print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
 
+    if interp_model_names:
+        model_dict.update(_build_interp_model_dict(interp_model_names))
+
+    if linear_model_names:
+        model_dict.update(_build_linear_model_dict(linear_model_names))
+
     if not model_dict:
         raise RuntimeError(
-            "No se pudo cargar ningun modelo para benchmark (Darts/Prophet/TSPulse)."
+            "No se pudo cargar ningun modelo para benchmark (Darts/Prophet/TSPulse/interp/linear)."
         )
 
     results_df, plot_store = _execute_benchmark_with_dataset(
@@ -728,9 +798,13 @@ def run_imputation_benchmark_parallel(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    darts_model_names, prophet_model_names, tspulse_model_names = _resolve_requested_models(
-        model_names
-    )
+    (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    ) = _resolve_requested_models(model_names)
 
     eval_model_names = list(darts_model_names)
 
@@ -752,6 +826,12 @@ def run_imputation_benchmark_parallel(
             eval_model_names.extend(tspulse_model_names)
         else:
             print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
+
+    if interp_model_names:
+        eval_model_names.extend(interp_model_names)
+
+    if linear_model_names:
+        eval_model_names.extend(linear_model_names)
 
     if not eval_model_names:
         raise RuntimeError("No hay modelos para evaluar en paralelo.")

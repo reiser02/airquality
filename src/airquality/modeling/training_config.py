@@ -24,7 +24,8 @@ from darts.models import (
     TiDEModel,
     TransformerModel,
 )
-from airquality.config import cfg_get_float, cfg_get_int
+from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
+from airquality.data.io import resolve_device
 
 
 @dataclass(slots=True)
@@ -45,6 +46,7 @@ class BenchmarkDatasetBundle:
     all_series_unscaled: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Valida la coherencia columnas/series y la presencia de sus scalers."""
         if len(self.valid_cols) != len(self.series_test):
             raise ValueError("`valid_cols` y `series_test` deben tener la misma longitud")
 
@@ -93,6 +95,7 @@ class Float32StandardScaler(StandardScaler):
     """StandardScaler que devuelve arrays float32 tras `transform`."""
 
     def transform(self, X: Any, copy: bool | None = None) -> Any:
+        """Transforma como StandardScaler y castea la salida a float32."""
         transformed = super().transform(X, copy=copy)
         return transformed.astype(np.float32, copy=False)
 
@@ -141,6 +144,23 @@ def build_lightning_trainer_kwargs(
     return kwargs
 
 
+def resolve_training_accelerator(cfg: ConfigParser | None = None) -> str:
+    """Resuelve el accelerator de entrenamiento desde `[training] accelerator`.
+
+    Valores admitidos: ``auto`` (por defecto: GPU si hay CUDA disponible, CPU si
+    no), ``gpu`` o ``cpu``. Antes estaba fijado a ``"gpu"`` y el entrenamiento
+    reventaba en máquinas sin CUDA.
+    """
+    requested = cfg_get_str("training", "accelerator", "auto", cfg=cfg).strip().lower()
+    if requested not in {"auto", "gpu", "cpu"}:
+        raise ValueError(
+            f"`[training] accelerator` debe ser 'auto', 'gpu' o 'cpu'; recibido: {requested!r}"
+        )
+    if requested == "auto":
+        return "gpu" if resolve_device("cuda") == "cuda" else "cpu"
+    return requested
+
+
 def make_encoders_full() -> dict[str, Any]:
     """Encoders temporales completos (pasado/futuro) para modelos globales."""
 
@@ -175,6 +195,7 @@ def make_encoders_rnn() -> dict[str, Any]:
 def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type, dict[str, Any]]]:
     """Devuelve el catálogo de modelos y sus hiperparámetros por defecto."""
 
+    accelerator = resolve_training_accelerator(cfg)
     return {
         "TiDE": (
             TiDEModel,
@@ -187,7 +208,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "hidden_size": cfg_get_int("models", "tide_hidden_size", 512, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "NHiTS": (
@@ -199,7 +220,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "layer_widths": cfg_get_int("models", "nhits_layer_widths", 512, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "NLinear": (
@@ -208,7 +229,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "input_chunk_length": cfg_get_int("models", "nlinear_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "DLinear": (
@@ -217,7 +238,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "input_chunk_length": cfg_get_int("models", "dlinear_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "TCN": (
@@ -227,7 +248,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "num_filters": cfg_get_int("models", "tcn_num_filters", 16, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "Transformer": (
@@ -236,7 +257,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "input_chunk_length": cfg_get_int("models", "transformer_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "TSMixer": (
@@ -248,7 +269,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "num_blocks": 3,
                 "add_encoders": make_encoders_full(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "RNN": (
@@ -262,7 +283,7 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
                 "dropout": 0.1,
                 "add_encoders": make_encoders_rnn(),
                 "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs("gpu", True, cfg=cfg),
+                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
             },
         ),
         "LinearRegression": (

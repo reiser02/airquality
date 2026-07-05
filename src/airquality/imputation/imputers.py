@@ -25,6 +25,7 @@ from pandas.tseries.frequencies import to_offset
 
 from darts import TimeSeries
 from airquality.data.io import resolve_device
+from airquality.data.series import ensure_datetime_series
 from airquality.imputation.benchmark import (
     GapContextFailure,
     _gap_windows_to_mask_index,
@@ -91,6 +92,12 @@ class GapImputer(Protocol):
         freq: str,
         config_workers: Mapping[str, Any] | None = None,
     ) -> tuple[pd.Series, list[GapContextFailure]]:
+        """Impute ``gap_windows`` of one series; return ``(predictions, failures)``.
+
+        Predictions are indexed by the pooled mask index and expressed in the
+        original scale; unfillable gaps are reported as
+        :class:`GapContextFailure` entries instead of raising.
+        """
         ...
 
 
@@ -196,17 +203,28 @@ def _derive_context_before_gap(
     -------
     tuple[pd.Series, pd.Series]
         (unscaled_context, scaled_context)
+
+    Raises
+    ------
+    RuntimeError
+        If the scaler fails on a non-empty context. Falling back to the
+        unscaled values would silently mix scales and corrupt every metric
+        downstream, which is worse than failing loudly.
     """
     full = all_series_map[series_name]
     unscaled_context = full.loc[full.index < gap_start].copy()
-    if scaler is not None and hasattr(scaler, "transform"):
-        try:
-            ts_scaled = scaler.transform(TimeSeries.from_series(unscaled_context, freq=freq))
-            scaled_context = _ts_to_series(ts_scaled, freq=freq, name=series_name).astype(np.float32)
-        except Exception:
-            scaled_context = unscaled_context.copy()
-    else:
-        scaled_context = unscaled_context.copy()
+    if scaler is None or not hasattr(scaler, "transform") or len(unscaled_context) == 0:
+        # An empty context is legitimate (gap at the series start): the caller
+        # records it as a GapContextFailure after the min-context check.
+        return unscaled_context, unscaled_context.copy()
+
+    try:
+        ts_scaled = scaler.transform(TimeSeries.from_series(unscaled_context, freq=freq))
+        scaled_context = _ts_to_series(ts_scaled, freq=freq, name=series_name).astype(np.float32)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Fallo al escalar el contexto de '{series_name}' antes del hueco en {gap_start}"
+        ) from exc
     return unscaled_context, scaled_context
 
 
@@ -217,7 +235,14 @@ def _inverse_scale_prediction_series(
     freq: str,
     name: str,
 ) -> pd.Series:
-    """Inverse-transform one prediction series, preserving sparse mask index."""
+    """Inverse-transform one prediction series, preserving sparse mask index.
+
+    Raises
+    ------
+    RuntimeError
+        If the inverse transform fails. Returning the scaled prediction as if
+        it were in the original scale would corrupt the metrics silently.
+    """
     out = pred_series.copy().astype(float)
     out.name = name
 
@@ -230,8 +255,10 @@ def _inverse_scale_prediction_series(
         inv = ts_unscaled.to_series().astype(float).reindex(out.index)
         inv.name = name
         return inv
-    except Exception:
-        return out
+    except Exception as exc:
+        raise RuntimeError(
+            f"Fallo al des-escalar las predicciones de '{name}'"
+        ) from exc
 
 
 def build_tspulse_context_frame(
@@ -244,7 +271,15 @@ def build_tspulse_context_frame(
     timestamp_column: str = "timestamp",
     target_column: str = "value",
 ) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
-    """Build TSPulse-ready context frame from all_series_map + mask."""
+    """Build TSPulse-ready context frame from all_series_map + mask.
+
+    The synthetic-gap timestamps (``mask_index``) are kept as NaN: the official
+    `TimeSeriesImputationPipeline` only substitutes the model reconstruction
+    where the input frame has NaN, so pre-filling them would silence the model
+    (the benchmark would score the pre-fill instead of TSPulse). Only NaN
+    outside the mask (real historical holes / padding) are pre-filled with time
+    interpolation.
+    """
     full = all_series_map[series_name].copy()
     if len(mask_index) > 0:
         full.loc[full.index.intersection(mask_index)] = np.nan
@@ -252,16 +287,21 @@ def build_tspulse_context_frame(
     end_ts = pd.Timestamp(test_index.max())
     context_index = pd.date_range(end=end_ts, periods=int(context_length), freq=freq)
     context_values = full.reindex(context_index)
-    context_values = (
+
+    # Fill only the real (non-mask) missing points; the mask must stay NaN so
+    # the official pipeline imputes it with the model reconstruction.
+    filled = (
         context_values.interpolate(method="time", limit_direction="both")
         .ffill()
         .bfill()
     )
-
-    if context_values.isna().any():
+    in_mask = context_index.isin(mask_index)
+    if filled.loc[~in_mask].isna().any():
         raise ValueError(
             "No fue posible construir un contexto valido para TSPulse tras completar con historial y padding"
         )
+    context_values = filled
+    context_values[in_mask] = np.nan
 
     frame = pd.DataFrame(
         {
@@ -287,11 +327,13 @@ class _DartsContextImputer:
     _uses_external_scaler: bool = False
 
     def __init__(self, model: Any, *, model_name: str = "") -> None:
+        """Wrap one underlying model instance under a benchmark display name."""
         self._model = model
         self.model_name = str(model_name)
 
     @property
     def model(self) -> Any:
+        """The wrapped underlying model instance (``None`` for per-gap fitters)."""
         return self._model
 
     def _context_window(self) -> int:
@@ -410,9 +452,11 @@ class DartsGlobalGapImputer(_DartsContextImputer):
     _uses_external_scaler = True
 
     def _context_window(self) -> int:
+        """Gather exactly the model's inferred minimum context before each gap."""
         return infer_darts_minimum_context(self._model)
 
     def _min_context(self) -> int:
+        """Skip gaps whose clean context is below the model's inferred minimum."""
         return infer_darts_minimum_context(self._model)
 
     def _predict_block(
@@ -423,6 +467,12 @@ class DartsGlobalGapImputer(_DartsContextImputer):
         freq: str,
         config_workers: Mapping[str, Any] | None,
     ) -> pd.Series:
+        """Forecast ``n`` steps from ``context``, retrying predict kwargs variants.
+
+        Tries ``dataloader_kwargs``/``verbose`` combinations first so worker
+        settings apply when the Darts model supports them, falling back to a
+        bare ``predict`` call otherwise.
+        """
         context_ts = TimeSeries.from_series(context, freq=freq).astype(np.float32)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -476,6 +526,7 @@ class ProphetGapImputer(_DartsContextImputer):
         min_context: int = 3,
         prophet_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
+        """Validate Prophet availability and store per-gap fitting options."""
         if not PROPHET_AVAILABLE:
             raise ImportError(
                 "darts.models.Prophet no esta disponible en este entorno"
@@ -486,9 +537,11 @@ class ProphetGapImputer(_DartsContextImputer):
         self._prophet_kwargs = dict(prophet_kwargs or {})
 
     def _context_window(self) -> int:
+        """Request all contiguous clean history (capped by ``_CONTEXT_WINDOW``)."""
         return self._CONTEXT_WINDOW
 
     def _min_context(self) -> int:
+        """Skip gaps with fewer clean points than Prophet's fitting minimum."""
         return self._min_required
 
     def _predict_block(
@@ -499,6 +552,7 @@ class ProphetGapImputer(_DartsContextImputer):
         freq: str,
         config_workers: Mapping[str, Any] | None,
     ) -> pd.Series:
+        """Fit a fresh Prophet on ``context`` and forecast the ``n`` gap steps."""
         del config_workers
         context_ts = TimeSeries.from_series(context, freq=freq)
         model = DartsProphet(**self._prophet_kwargs)
@@ -507,6 +561,116 @@ class ProphetGapImputer(_DartsContextImputer):
             model.fit(context_ts)
             pred_ts = model.predict(n=int(n))
         return pred_ts.to_series().astype(float)
+
+
+# --------------------------------------------------------------------------- #
+# Interpolation adapter (lightweight, no artifacts)
+# --------------------------------------------------------------------------- #
+class InterpolationGapImputer:
+    """Lightweight `GapImputer`: seasonal-aware time interpolation, no artifacts.
+
+    The whole masked series is filled at once by adding back a 24h hour-of-day
+    climatology to the time-interpolated residual (so long gaps fall back to the
+    seasonal mean instead of a flat line). Works in the original scale and ignores
+    the external ``scaler``. Serves as the baseline imputer for the preprocessing
+    pipeline, isolating the effect of removing anomalies.
+    """
+
+    _uses_external_scaler = False
+
+    def __init__(self, *, model_name: str = "interp", seasonality: int = 24) -> None:
+        """Store the display name and the climatology seasonality (24 = hourly)."""
+        self.model_name = str(model_name)
+        self._seasonality = int(seasonality)
+
+    def _fill(self, series: pd.Series, *, freq: str) -> pd.Series:
+        """Return a fully-filled copy of ``series`` (no NaN) on the regular grid."""
+        s = ensure_datetime_series(series, freq=freq, name=str(series.name or "series"))
+        linear = s.interpolate(method="time", limit_direction="both")
+        if self._seasonality == 24:
+            # Hour-of-day climatology + interpolated residual (seasonal fallback).
+            climatology = s.groupby(s.index.hour).transform("mean")
+            residual = (s - climatology).interpolate(method="time", limit_direction="both")
+            seasonal = climatology + residual
+            filled = seasonal.where(seasonal.notna(), linear)
+        else:
+            filled = linear
+        return filled.ffill().bfill()
+
+    def impute_gaps(
+        self,
+        *,
+        series_name: str,
+        all_series_map: Mapping[str, pd.Series],
+        gap_windows: Sequence[pd.DatetimeIndex],
+        test_index: pd.DatetimeIndex,
+        scaler: Any | None = None,
+        freq: str = "h",
+        config_workers: Mapping[str, Any] | None = None,
+    ) -> tuple[pd.Series, list[GapContextFailure]]:
+        """Fill all missing points; return predictions over the mask timestamps."""
+        del scaler, config_workers, test_index  # Interpolation ignores these.
+        mask_index = _gap_windows_to_mask_index(gap_windows)
+        if len(mask_index) == 0:
+            return pd.Series(index=mask_index, dtype=float, name=series_name), []
+
+        # `all_series_map` still holds the true values at the gap timestamps, so
+        # they must be re-masked before filling; otherwise both the interpolation
+        # and the hour-of-day climatology in `_fill` would read the ground truth
+        # back (leakage), like `LinearGapImputer` re-masks too.
+        series = all_series_map[series_name].copy()
+        series.loc[series.index.intersection(mask_index)] = np.nan
+        filled = self._fill(series, freq=freq)
+        return filled.reindex(mask_index).astype(float), []
+
+
+class LinearGapImputer:
+    """Literal linear-interpolation baseline exposed as a `GapImputer`.
+
+    Every missing point is filled by a straight line between its nearest observed
+    neighbours (``pandas.Series.interpolate(method="linear")``); for a size-1 gap
+    this is exactly the mean of the two adjacent values. It works in the original
+    scale and ignores the external ``scaler``. Unlike :class:`InterpolationGapImputer`
+    there is no seasonal climatology term — the fill is purely linear by design.
+    """
+
+    _uses_external_scaler = False
+
+    def __init__(self, *, model_name: str = "LinearInterp") -> None:
+        """Store the display name used in benchmark results."""
+        self.model_name = str(model_name)
+
+    def _fill(self, series: pd.Series, *, freq: str) -> pd.Series:
+        """Return a fully-filled copy of ``series`` (no NaN) using linear interp."""
+        s = ensure_datetime_series(series, freq=freq, name=str(series.name or "series"))
+        return (
+            s.interpolate(method="linear", limit_direction="both").ffill().bfill()
+        )
+
+    def impute_gaps(
+        self,
+        *,
+        series_name: str,
+        all_series_map: Mapping[str, pd.Series],
+        gap_windows: Sequence[pd.DatetimeIndex],
+        test_index: pd.DatetimeIndex,
+        scaler: Any | None = None,
+        freq: str = "h",
+        config_workers: Mapping[str, Any] | None = None,
+    ) -> tuple[pd.Series, list[GapContextFailure]]:
+        """Fill all missing points linearly; return predictions over the mask."""
+        del scaler, config_workers, test_index  # Linear interpolation ignores these.
+        mask_index = _gap_windows_to_mask_index(gap_windows)
+        if len(mask_index) == 0:
+            return pd.Series(index=mask_index, dtype=float, name=series_name), []
+
+        # `all_series_map` still holds the true values at the gap timestamps, so
+        # they must be re-masked before interpolating; otherwise the fill would
+        # just read the ground truth back (leakage), like TSPulse re-masks too.
+        series = all_series_map[series_name].copy()
+        series.loc[series.index.intersection(mask_index)] = np.nan
+        filled = self._fill(series, freq=freq)
+        return filled.reindex(mask_index).astype(float), []
 
 
 # --------------------------------------------------------------------------- #
@@ -662,6 +826,8 @@ __all__ = [
     "DartsGlobalGapImputer",
     "ProphetGapImputer",
     "TSPulseGapImputer",
+    "InterpolationGapImputer",
+    "LinearGapImputer",
     "PROPHET_AVAILABLE",
     "PROPHET_IMPORT_ERROR",
     "TSFM_PUBLIC_AVAILABLE",

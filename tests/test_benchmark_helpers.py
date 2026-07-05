@@ -179,6 +179,33 @@ def test_build_tspulse_context_frame_pads_and_returns_original_test_index() -> N
     assert list(original_index) == list(test.index)
 
 
+def test_build_tspulse_context_frame_keeps_mask_nan_and_fills_real_gaps() -> None:
+    # The synthetic mask must reach the pipeline as NaN (the official pipeline
+    # only uses the model reconstruction where the input is NaN); only real
+    # historical holes are pre-filled.
+    values: list[float | None] = [float(i) for i in range(48)]
+    values[10] = None  # real historical gap -> must be pre-filled
+    full = _series(values, name="S")
+    mask_index = full.index[[40, 41, 42]]  # synthetic gaps -> must stay NaN
+
+    frame, original_index = build_tspulse_context_frame(
+        series_name="S",
+        all_series_map={"S": full},
+        mask_index=mask_index,
+        test_index=full.index[24:],
+        context_length=48,
+        freq="h",
+        timestamp_column="ts",
+        target_column="y",
+    )
+
+    y = pd.Series(frame["y"].to_numpy(), index=pd.DatetimeIndex(frame["ts"]))
+    assert y.loc[mask_index].isna().all()  # mask preserved for the model
+    assert y.drop(mask_index).notna().all()  # everything else filled
+    assert y.loc[full.index[10]] == pytest.approx(10.0)  # real gap interpolated
+    assert list(original_index) == list(full.index[24:])
+
+
 def test_compute_mase_denominator_returns_nan_when_too_short() -> None:
     out = _compute_mase_denominator(_series([1.0, 2.0], name="S"), seasonality_m=2, freq="h")
     assert math.isnan(out)
