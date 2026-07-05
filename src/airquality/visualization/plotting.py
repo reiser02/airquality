@@ -120,6 +120,7 @@ def plot_predictions_by_gap(
         raise ValueError("render_style debe ser one of: line, points, mixed")
 
     def _get_mase_map(serie: str, gap: int) -> dict[str, float]:
+        """Look up per-model MASE values for one (series, gap size) pair."""
         if results_df is None or results_df.empty:
             return {}
 
@@ -138,6 +139,7 @@ def plot_predictions_by_gap(
     def _plot_on_axis(
         ax: Any, series_payload: dict[str, Any], gap: int, serie: str
     ) -> None:
+        """Draw one series' actuals, per-model predictions, and naive reference."""
         mase_map = _get_mase_map(serie, gap)
         preds_payload = series_payload.get("preds", {})
         actual = series_payload.get("actual", pd.Series(dtype=float))
@@ -185,6 +187,7 @@ def plot_predictions_by_gap(
             reverse = legend_sort == "mase_desc"
 
             def _rank(item: tuple[str, pd.Series]) -> float:
+                """Legend sort key: the model's MASE (missing values sort last)."""
                 model_name = item[0]
                 if model_name not in mase_map or not np.isfinite(mase_map[model_name]):
                     return np.inf if not reverse else -np.inf
@@ -335,6 +338,7 @@ def plot_predictions_by_method_grid(
         return
 
     def _to_pd_series(obj: Any) -> pd.Series:
+        """Coerce a Series/TimeSeries payload to a sorted Series (empty otherwise)."""
         if isinstance(obj, pd.Series):
             return obj.sort_index()
         if isinstance(obj, TimeSeries):
@@ -349,6 +353,7 @@ def plot_predictions_by_method_grid(
         method: str,
         gap: int | None,
     ) -> None:
+        """Draw one method's prediction vs. the actual series and title with MAE."""
         actual_clean = actual.dropna()
         pred_clean = pred.dropna()
         mae_value = float("nan")
@@ -442,6 +447,7 @@ def plot_predictions_by_method_grid(
         by_series: dict[str, dict[str, Any]],
         gap: int | None,
     ) -> None:
+        """Render one figure with a grid of per-series subplots for one method."""
         if series_name == "all":
             target_series = list(by_series.keys())
         else:

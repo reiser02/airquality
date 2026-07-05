@@ -5,6 +5,22 @@ from __future__ import annotations
 import pandas as pd
 
 
+def contiguous_observed_segments(series: pd.Series, min_len: int = 1) -> list[pd.Series]:
+    """Split ``series`` into contiguous NaN-free runs of at least ``min_len`` points.
+
+    Used to avoid gluing non-contiguous stretches with ``dropna()`` before
+    seasonal decompositions or windowed detectors: at every gap boundary the
+    daily phase would jump (e.g. 08:00 stitched to 17:00 of another day).
+    """
+    observed = series.notna()
+    block_ids = (observed != observed.shift()).cumsum()
+    return [
+        series.loc[block.index]
+        for _, block in observed.groupby(block_ids)
+        if bool(block.iloc[0]) and len(block) >= int(min_len)
+    ]
+
+
 def get_longest_segment(
     dfs: list[pd.DataFrame],
     w_col: float = 0.6,

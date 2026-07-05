@@ -380,6 +380,46 @@ def test_fit_darts_model_injects_output_chunk_and_validation_fit_kwargs(
     assert calls["fit"]["load_best"] is True
 
 
+def test_fit_darts_model_passes_stride_only_when_fit_supports_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("airquality.modeling.training.build_base_training_kwargs", lambda: {})
+    monkeypatch.setattr("airquality.modeling.training.configure_warnings", lambda quiet: None)
+
+    calls: dict[str, object] = {}
+
+    class TorchLikeModel:
+        def __init__(self, output_chunk_length: int) -> None:
+            del output_chunk_length
+
+        def fit(self, series, verbose=False, stride=1, max_samples_per_ts=None) -> None:
+            calls["fit"] = {"stride": stride, "max_samples_per_ts": max_samples_per_ts}
+
+    ts = TimeSeries.from_series(_series("A", [1.0, 2.0, 3.0, 4.0]), freq="h")
+    fit_darts_model(TorchLikeModel, series_train=[ts], series_val=None, size_k=3, model_kwargs={})
+
+    assert calls["fit"] == {"stride": 2, "max_samples_per_ts": 256}
+
+
+def test_fit_darts_model_trains_linear_regression_without_stride_typeerror() -> None:
+    # Regression: `stride` is not a RegressionModel.fit parameter, so it used to
+    # be forwarded to sklearn's LinearRegression.fit and raise TypeError.
+    ts = TimeSeries.from_series(
+        _series("A", [float(i % 5) for i in range(30)]), freq="h"
+    )
+
+    model = fit_darts_model(
+        LinearRegressionModel,
+        series_train=[ts],
+        series_val=None,
+        size_k=2,
+        model_kwargs={"lags": 3},
+    )
+
+    pred = model.predict(n=2, series=ts)
+    assert len(pred) == 2
+
+
 def test_fit_darts_model_drops_lr_scheduler_when_validation_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

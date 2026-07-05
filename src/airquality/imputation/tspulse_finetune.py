@@ -59,21 +59,20 @@ except Exception as exc:  # pragma: no cover - optional dependency
     TSFM_AVAILABLE = False
     TSFM_IMPORT_ERROR = exc
 
-warnings.filterwarnings("ignore")
-
-
 if TrainerCallback is not None:
 
     class EpochBoundaryCallback(TrainerCallback):
         """Simple epoch boundary logger to complement global-step tqdm progress."""
 
         def on_epoch_begin(self, args, state, control, **kwargs):  # type: ignore[no-untyped-def]
+            """Print an epoch-start separator with the current/total epoch count."""
             current_epoch = 1 if state.epoch is None else int(state.epoch) + 1
             total_epochs = int(getattr(args, "num_train_epochs", 0) or 0)
             print(f"[epoch] {current_epoch}/{total_epochs} started")
             return control
 
         def on_epoch_end(self, args, state, control, **kwargs):  # type: ignore[no-untyped-def]
+            """Print an epoch-finished separator with the current/total epoch count."""
             if state.epoch is None:
                 return control
             current_epoch = int(round(state.epoch))
@@ -305,6 +304,11 @@ def build_training_args(
     seed: int,
     report_to: str,
 ) -> object:
+    """Build HF ``TrainingArguments`` (per-epoch eval/save, best-model reload).
+
+    Falls back to the legacy ``evaluation_strategy`` kwarg name for older
+    transformers versions that predate ``eval_strategy``.
+    """
     common = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
@@ -618,6 +622,10 @@ def run(args: argparse.Namespace) -> None:
     """Execute the full TSPulse fine-tuning workflow from parsed CLI args."""
     _ensure_runtime_dependencies()
 
+    # Silenciar warnings solo dentro del CLI de fine-tuning: a nivel de módulo
+    # silenciaría los warnings de cualquier proceso que lo importe.
+    warnings.filterwarnings("ignore")
+
     set_seed(args.seed)
     np.random.seed(args.seed)
     _validate_run_args(args)
@@ -729,6 +737,7 @@ class ConfigOnlyArgumentParser(argparse.ArgumentParser):
     """Argument parser that re-applies cfg-backed values after CLI parsing."""
 
     def __init__(self, config_defaults: dict[str, object], **kwargs: object) -> None:
+        """Store the cfg-backed values that will be stamped onto parsed args."""
         super().__init__(**kwargs)
         self._config_defaults = dict(config_defaults)
 
@@ -737,6 +746,7 @@ class ConfigOnlyArgumentParser(argparse.ArgumentParser):
         args: Sequence[str] | None = None,
         namespace: argparse.Namespace | None = None,
     ) -> argparse.Namespace:
+        """Parse CLI args, then overwrite every config-backed key with its cfg value."""
         parsed = super().parse_args(args=args, namespace=namespace)
         for key, value in self._config_defaults.items():
             setattr(parsed, key, value)

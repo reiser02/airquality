@@ -13,10 +13,27 @@ from airquality.data.io import configure_warnings, load_and_normalize_series, re
 from airquality.data.segments import get_longest_segment
 from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
 
-from airquality.imputation.benchmark import (
+from airquality.imputation.benchmark import execute_complete_pipeline
+from airquality.imputation.imputers import (
+    DartsGlobalGapImputer,
+    InterpolationGapImputer,
+    LinearGapImputer,
+    PROPHET_AVAILABLE,
+    ProphetGapImputer,
     TSFM_PUBLIC_AVAILABLE,
-    TSPulseHistoricalImputer,
-    execute_complete_pipeline,
+    TSPulseGapImputer,
+)
+from airquality.imputation.registry import (
+    DARTS_GLOBAL,
+    INTERP as INTERP_FAMILY,
+    INTERP_MODEL_NAME,
+    LINEAR as LINEAR_FAMILY,
+    LINEAR_MODEL_NAME,
+    PROPHET as PROPHET_FAMILY,
+    TSPULSE as TSPULSE_FAMILY,
+    TSPULSE_FINETUNED_MODEL_NAME,
+    TSPULSE_ORIGINAL_MODEL_NAME,
+    resolve_imputer_family,
 )
 from airquality.modeling.training import build_benchmark_dataset_bundle
 from airquality.modeling.training_config import (
@@ -48,8 +65,6 @@ def _default_metrics() -> tuple[str, ...]:
 DEFAULT_MODEL_NAMES = _default_model_names()
 DEFAULT_GAP_SIZES = _default_gap_sizes()
 DEFAULT_METRICS = _default_metrics()
-TSPULSE_ORIGINAL_MODEL_NAME = "TSPulse"
-TSPULSE_FINETUNED_MODEL_NAME = "TSPulse_FineTuned"
 
 
 def _default_tspulse_model_id() -> str:
@@ -98,6 +113,7 @@ class BenchmarkRunConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> BenchmarkRunConfig:
+        """Rebuild a config from the flat dict serialized for worker processes."""
         return cls(
             size_k=int(raw["size_k"]),
             force_cpu=bool(raw["force_cpu"]),
@@ -119,35 +135,6 @@ class BenchmarkRunConfig:
             val_context_len=int(raw["val_context_len"]),
             min_train_len_base=int(raw["min_train_len_base"]),
         )
-
-
-def _to_float32_timeseries(series: Any) -> Any:
-    """Best-effort cast of a series-like object to float32."""
-    if hasattr(series, "astype"):
-        try:
-            return series.astype("float32")
-        except Exception:
-            return series
-    return series
-
-
-class Float32InputModelAdapter:
-    """Proxy that casts input series to float32 before model prediction."""
-
-    def __init__(self, model: Any) -> None:
-        self._model = model
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._model, name)
-
-    def predict(self, *args: Any, **kwargs: Any) -> Any:
-        if "series" in kwargs:
-            kwargs["series"] = _to_float32_timeseries(kwargs["series"])
-        elif len(args) >= 2:
-            args_list = list(args)
-            args_list[1] = _to_float32_timeseries(args_list[1])
-            args = tuple(args_list)
-        return self._model.predict(*args, **kwargs)
 
 
 def _resolve_repo_root(repo_root: str | Path | None = None) -> Path:
@@ -252,9 +239,9 @@ def _build_dataset_bundle_from_config(repo_root: Path, config: BenchmarkRunConfi
     )
 
 
-def _build_tspulse_model(model_config: TSPulseModelConfig, freq: str) -> TSPulseHistoricalImputer:
+def _build_tspulse_model(model_config: TSPulseModelConfig, freq: str) -> TSPulseGapImputer:
     """Instantiate the TSPulse imputer adapter from normalized config values."""
-    return TSPulseHistoricalImputer(
+    return TSPulseGapImputer(
         model_id=model_config.model_id,
         revision=model_config.revision,
         model_path=model_config.model_path,
@@ -269,9 +256,9 @@ def _build_tspulse_model_dict(
     *,
     freq: str,
     model_names: Sequence[str],
-) -> dict[str, TSPulseHistoricalImputer]:
+) -> dict[str, TSPulseGapImputer]:
     """Build only the requested benchmark-ready TSPulse variants."""
-    model_dict: dict[str, TSPulseHistoricalImputer] = {}
+    model_dict: dict[str, TSPulseGapImputer] = {}
 
     for model_name in model_names:
         if model_name == TSPULSE_ORIGINAL_MODEL_NAME:
@@ -291,6 +278,45 @@ def _build_tspulse_model_dict(
         else:
             raise ValueError(f"Modelo TSPulse no soportado: {model_name}")
 
+    return model_dict
+
+
+def _build_prophet_model_dict(model_names: Sequence[str]) -> dict[str, ProphetGapImputer]:
+    """Build the requested Prophet imputer variants (Darts local Prophet)."""
+    model_dict: dict[str, ProphetGapImputer] = {}
+    for model_name in model_names:
+        model_dict[model_name] = ProphetGapImputer(model_name=model_name)
+    return model_dict
+
+
+def _build_interp_model_dict(model_names: Sequence[str]) -> dict[str, InterpolationGapImputer]:
+    """Build the seasonal-interpolation baseline (no artifacts, always available).
+
+    ``interp`` is the hour-of-day climatology + time interpolation used by the
+    preprocessing pipeline (`InterpolationGapImputer`), which re-masks the gap
+    timestamps before filling so the benchmark never scores the ground truth.
+    """
+    model_dict: dict[str, InterpolationGapImputer] = {}
+    for model_name in model_names:
+        if model_name == INTERP_MODEL_NAME:
+            model_dict[model_name] = InterpolationGapImputer(model_name=INTERP_MODEL_NAME)
+        else:
+            raise ValueError(f"Modelo de interpolacion no soportado: {model_name}")
+    return model_dict
+
+
+def _build_linear_model_dict(model_names: Sequence[str]) -> dict[str, LinearGapImputer]:
+    """Build the linear-interpolation baseline (no artifacts, always available).
+
+    ``LinearInterp`` is a literal linear interpolation (`LinearGapImputer`): for a
+    size-1 gap it is exactly the mean of the two neighbours.
+    """
+    model_dict: dict[str, LinearGapImputer] = {}
+    for model_name in model_names:
+        if model_name == LINEAR_MODEL_NAME:
+            model_dict[model_name] = LinearGapImputer(model_name=LINEAR_MODEL_NAME)
+        else:
+            raise ValueError(f"Modelo lineal no soportado: {model_name}")
     return model_dict
 
 
@@ -447,7 +473,7 @@ def load_darts_models_from_artifacts(
 
         _apply_inference_trainer_overrides(model)
 
-        loaded[model_name] = Float32InputModelAdapter(model)
+        loaded[model_name] = DartsGlobalGapImputer(model, model_name=model_name)
 
     if not loaded:
         raise RuntimeError(
@@ -475,40 +501,54 @@ def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
 
 def _resolve_requested_models(
     model_names: Sequence[str],
-) -> tuple[list[str], list[str]]:
-    """Split requested model specs into explicit Darts and TSPulse model names."""
+) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Split requested specs into Darts-global, Prophet, TSPulse, interp, and linear names.
+
+    Each name is classified by the imputer registry; unknown names raise. The
+    buckets cover every family the registry knows, so anything returned by
+    ``resolve_imputer_names(["all"])`` is accepted.
+    """
     if not model_names:
         raise ValueError("`model_names` no puede estar vacio")
 
     darts_model_names: list[str] = []
-    seen_darts: set[str] = set()
+    prophet_model_names: list[str] = []
     tspulse_model_names: list[str] = []
-    seen_tspulse: set[str] = set()
+    interp_model_names: list[str] = []
+    linear_model_names: list[str] = []
+    buckets: dict[str, tuple[list[str], set[str]]] = {
+        DARTS_GLOBAL: (darts_model_names, set()),
+        PROPHET_FAMILY: (prophet_model_names, set()),
+        TSPULSE_FAMILY: (tspulse_model_names, set()),
+        INTERP_FAMILY: (interp_model_names, set()),
+        LINEAR_FAMILY: (linear_model_names, set()),
+    }
 
     for spec in model_names:
         name = spec.strip()
         if not name:
             continue
+        names, seen = buckets[resolve_imputer_family(name)]
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
 
-        if name == TSPULSE_ORIGINAL_MODEL_NAME:
-            if name not in seen_tspulse:
-                tspulse_model_names.append(name)
-                seen_tspulse.add(name)
-            continue
-        if name == TSPULSE_FINETUNED_MODEL_NAME:
-            if name not in seen_tspulse:
-                tspulse_model_names.append(name)
-                seen_tspulse.add(name)
-            continue
-
-        if name not in seen_darts:
-            darts_model_names.append(name)
-            seen_darts.add(name)
-
-    if not darts_model_names and not tspulse_model_names:
+    if not (
+        darts_model_names
+        or prophet_model_names
+        or tspulse_model_names
+        or interp_model_names
+        or linear_model_names
+    ):
         raise ValueError("No se detectaron modelos validos en `model_names`")
 
-    return darts_model_names, tspulse_model_names
+    return (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    )
 
 
 def _merge_plot_stores(
@@ -516,6 +556,7 @@ def _merge_plot_stores(
 ) -> dict[int, dict[str, Any]]:
     """Merge per-model plot payloads into one gap-indexed plot store."""
     def _normalize_series_payload(series_payload: Any) -> dict[str, Any]:
+        """Coerce one per-series plot payload into the actual/preds/naive_mase dict."""
         payload = series_payload if isinstance(series_payload, dict) else {}
         preds = payload.get("preds", {})
         return {
@@ -565,24 +606,19 @@ def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, d
         config=config,
     )
 
-    if model_name == TSPULSE_ORIGINAL_MODEL_NAME:
-        model_dict: dict[str, Any] = {
-            TSPULSE_ORIGINAL_MODEL_NAME: _build_tspulse_model(
-                replace(config.tspulse, model_path=None),
-                freq=config.freq,
-            )
-        }
-    elif model_name == TSPULSE_FINETUNED_MODEL_NAME:
-        if config.tspulse.model_path is None:
-            raise RuntimeError(
-                "No se puede evaluar TSPulse_FineTuned sin `tspulse_model_path`."
-            )
-        model_dict = {
-            TSPULSE_FINETUNED_MODEL_NAME: _build_tspulse_model(
-                config.tspulse,
-                freq=config.freq,
-            )
-        }
+    family = resolve_imputer_family(model_name)
+    if family == TSPULSE_FAMILY:
+        model_dict: dict[str, Any] = _build_tspulse_model_dict(
+            config.tspulse,
+            freq=config.freq,
+            model_names=(model_name,),
+        )
+    elif family == PROPHET_FAMILY:
+        model_dict = _build_prophet_model_dict((model_name,))
+    elif family == INTERP_FAMILY:
+        model_dict = _build_interp_model_dict((model_name,))
+    elif family == LINEAR_FAMILY:
+        model_dict = _build_linear_model_dict((model_name,))
     else:
         model_dict = load_darts_models_from_artifacts(
             repo_root=resolved_root,
@@ -650,7 +686,13 @@ def run_imputation_benchmark(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    darts_model_names, tspulse_model_names = _resolve_requested_models(model_names)
+    (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    ) = _resolve_requested_models(model_names)
 
     dataset_bundle = _build_dataset_bundle_from_config(
         repo_root=resolved_root,
@@ -668,6 +710,12 @@ def run_imputation_benchmark(
             )
         )
 
+    if prophet_model_names:
+        if PROPHET_AVAILABLE:
+            model_dict.update(_build_prophet_model_dict(prophet_model_names))
+        else:
+            print("[warn] darts Prophet no esta disponible; se omite Prophet.")
+
     if tspulse_model_names:
         if TSFM_PUBLIC_AVAILABLE:
             model_dict.update(
@@ -680,9 +728,15 @@ def run_imputation_benchmark(
         else:
             print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
 
+    if interp_model_names:
+        model_dict.update(_build_interp_model_dict(interp_model_names))
+
+    if linear_model_names:
+        model_dict.update(_build_linear_model_dict(linear_model_names))
+
     if not model_dict:
         raise RuntimeError(
-            "No se pudo cargar ningun modelo para benchmark (Darts/TSPulse)."
+            "No se pudo cargar ningun modelo para benchmark (Darts/Prophet/TSPulse/interp/linear)."
         )
 
     results_df, plot_store = _execute_benchmark_with_dataset(
@@ -744,9 +798,22 @@ def run_imputation_benchmark_parallel(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    darts_model_names, tspulse_model_names = _resolve_requested_models(model_names)
+    (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    ) = _resolve_requested_models(model_names)
 
     eval_model_names = list(darts_model_names)
+
+    if prophet_model_names:
+        if PROPHET_AVAILABLE:
+            eval_model_names.extend(prophet_model_names)
+        else:
+            print("[warn] darts Prophet no esta disponible; se omite Prophet.")
+
     if tspulse_model_names:
         if TSFM_PUBLIC_AVAILABLE:
             if (
@@ -759,6 +826,12 @@ def run_imputation_benchmark_parallel(
             eval_model_names.extend(tspulse_model_names)
         else:
             print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
+
+    if interp_model_names:
+        eval_model_names.extend(interp_model_names)
+
+    if linear_model_names:
+        eval_model_names.extend(linear_model_names)
 
     if not eval_model_names:
         raise RuntimeError("No hay modelos para evaluar en paralelo.")

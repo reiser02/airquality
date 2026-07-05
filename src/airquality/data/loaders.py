@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 from pathlib import Path
 
@@ -37,6 +38,32 @@ def _load_csv_df(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path, index_col=0, parse_dates=True)
 
 
+def load_raw_5m(
+    pollutant: str,
+    base_dir: str = "data/raw/datos_estaciones_5m",
+) -> list[tuple[str, pd.DataFrame]]:
+    """Discover and load the raw 5-minute series for one pollutant.
+
+    Globs ``<base_dir>/<station>/<station>_<pollutant>.csv`` (the layout produced
+    by the scraper) and returns ``(station_name, dataframe)`` pairs sorted by
+    station, each a single value column indexed by the ``fecha`` datetime column.
+    The dataframes are ready to feed to
+    :func:`airquality.data.preprocessing.preprocess`.
+    """
+    pattern = os.path.join(base_dir, "*", f"*_{pollutant}.csv")
+    out: list[tuple[str, pd.DataFrame]] = []
+    for file_path in sorted(glob.glob(pattern)):
+        station = os.path.basename(os.path.dirname(file_path))
+        df = _load_csv_df(file_path)
+        if df is None or df.empty:
+            continue
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[~df.index.isna()]
+        out.append((station, df.sort_index()))
+    return out
+
+
 def load_to_df(file_path: str, name_from_path: bool = True) -> pd.DataFrame | None:
     """Load a supported file into a dataframe, optionally renaming its column."""
     path = Path(file_path)
@@ -58,9 +85,11 @@ def load_to_df(file_path: str, name_from_path: bool = True) -> pd.DataFrame | No
 
         return df
     except UnsupportedFileFormatError as exc:
-        print(f"Skipping file {file_path}: {exc}")
+        # A dropped file silently changes the dataset composition: keep the
+        # skip visible in logs (not just stdout).
+        logging.warning("Skipping file %s: %s", file_path, exc)
     except Exception as exc:
-        print(f"Error processing {file_path}: {exc}")
+        logging.warning("Error processing %s (file dropped from dataset): %s", file_path, exc)
         return None
 
     return None
