@@ -88,7 +88,7 @@ def test_inject_short_series_returns_zero_labels():
 def test_apply_anomaly_segment_unknown_type_raises():
     arr = np.zeros(10, dtype=np.float32)
     with pytest.raises(ValueError):
-        apply_anomaly_segment(arr, arr, 0, 4, "bogus", np.random.default_rng(0), 1.0)
+        apply_anomaly_segment(arr, 0, 4, "bogus", np.random.default_rng(0), 1.0)
 
 
 def test_inject_is_deterministic_for_seed():

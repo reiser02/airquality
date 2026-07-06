@@ -15,7 +15,7 @@ from matplotlib.ticker import FuncFormatter
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .anomalies import ANOMALY_TYPES, apply_anomaly_segment, inject_synthetic_anomalies
+from .anomalies import ANOMALY_PROFILE, ANOMALY_TYPES, apply_anomaly_segment, inject_synthetic_anomalies
 from .metrics import DEFAULT_MAX_DETECTION_RATE
 
 plt.rcParams.update(
@@ -58,17 +58,13 @@ ANOMALY_TYPE_COLORS = {
     "spikes": "#d6453c",
     "scale": "#5b8c5a",
     "noise": "#9b59b6",
-    "cutoff": "#f28c38",
-    "contextual": "#8c6d4b",
-    "speedup": "#cf6ba9",
+    "drift": "#e08214",
 }
 ANOMALY_TYPE_LABELS = {
     "spikes": "spikes — pico puntual (±4σ)",
     "scale": "scale — segmento ×0.25 o ×2",
     "noise": "noise — ruido gaussiano añadido (2σ)",
-    "cutoff": "cutoff — segmento aplanado al cuantil 0.75",
-    "contextual": "contextual — segmento invertido + desplazado",
-    "speedup": "speedup — segmento comprimido (×2 velocidad)",
+    "drift": "drift — descalibración progresiva del sensor (sesgo + ganancia + ruido crecientes)",
     "combined": "combined — un segmento de cada tipo",
 }
 
@@ -474,16 +470,17 @@ def _inject_all_anomaly_types(
     rng = np.random.default_rng(seed)
     injected = values.astype(np.float32, copy=True)
     scale = float(np.std(values) or 1.0)
-    max_len = max(4, min(32, len(values) // 20))
     slot = max(1, len(values) // len(ANOMALY_TYPES))
     segments: list[tuple[int, int, str]] = []
     for index, anomaly_type in enumerate(ANOMALY_TYPES):
-        length = 1 if anomaly_type == "spikes" else int(rng.integers(2, max(3, min(max_len, slot - 2)) + 1))
+        low_span, high_span = ANOMALY_PROFILE[anomaly_type]["span"]
+        length = low_span if low_span == high_span else int(rng.integers(low_span, high_span + 1))
+        length = min(length, max(1, slot - 2))
         low = index * slot + 1
         high = max(low + 1, (index + 1) * slot - length - 1)
         start = min(int(rng.integers(low, high)), len(values) - length)
         end = start + length
-        apply_anomaly_segment(injected, values, start, end, anomaly_type, rng, scale)
+        apply_anomaly_segment(injected, start, end, anomaly_type, rng, scale)
         segments.append((start, end, anomaly_type))
     return injected.astype(np.float32), segments
 
