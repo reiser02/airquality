@@ -224,3 +224,50 @@ def test_run_comparison_from_config_end_to_end(tmp_path, monkeypatch):
     assert (tmp_path / "summary.csv").exists()
     for col in ("rmse_raw", "rmse_pre", "rmse_delta", "rmse_improve_pct"):
         assert col in summary_df.columns
+
+
+def test_backtest_mase_matches_mae_over_seasonal_naive_denominator():
+    from darts import TimeSeries
+    from darts.metrics import mae
+
+    from airquality.forecasting.backtest import _compute_backtest_mase
+
+    rng = np.random.default_rng(13)
+    n = 400
+    idx = pd.date_range("2024-01-01", periods=n, freq="h")
+    insample = pd.Series(
+        10 + 3 * np.sin(2 * np.pi * np.arange(n) / 24.0) + rng.normal(0, 0.5, n),
+        index=idx,
+        name="S",
+    )
+    insample.iloc[30:35] = np.nan
+
+    hold_idx = pd.date_range(idx[-1] + pd.Timedelta(hours=1), periods=48, freq="h")
+    actual_vals = 10 + 3 * np.sin(2 * np.pi * np.arange(48) / 24.0) + rng.normal(0, 0.5, 48)
+    actual = TimeSeries.from_series(pd.Series(actual_vals, index=hold_idx), freq="h")
+    pred = TimeSeries.from_series(
+        pd.Series(actual_vals + rng.normal(0, 0.7, 48), index=hold_idx), freq="h"
+    )
+
+    # darts.metrics.mase must equal MAE over the in-sample seasonal-naive MAE
+    # computed on the interpolated training history (the documented convention).
+    filled = insample.interpolate(method="time", limit_direction="both").ffill().bfill()
+    values = filled.to_numpy(dtype=float)
+    denominator = float(np.mean(np.abs(values[24:] - values[:-24])))
+
+    out = _compute_backtest_mase(actual, pred, insample, seasonality_m=24, freq="h")
+    assert out == pytest.approx(float(mae(actual, pred)) / denominator, rel=1e-9)
+
+
+def test_backtest_mase_returns_nan_when_history_is_too_short():
+    from darts import TimeSeries
+
+    from airquality.forecasting.backtest import _compute_backtest_mase
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="h")
+    insample = pd.Series(np.arange(10, dtype=float), index=idx, name="S")
+    hold_idx = pd.date_range(idx[-1] + pd.Timedelta(hours=1), periods=4, freq="h")
+    ts = TimeSeries.from_series(pd.Series([1.0, 2.0, 3.0, 4.0], index=hold_idx), freq="h")
+
+    out = _compute_backtest_mase(ts, ts, insample, seasonality_m=24, freq="h")
+    assert np.isnan(out)
