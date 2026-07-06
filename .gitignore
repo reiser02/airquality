@@ -1,8 +1,10 @@
 /couta/
 .agents
+.claude/
 reports
 lightning_logs
 darts_logs
+/docs/
 
 # Python cache/build artifacts
 __pycache__/
