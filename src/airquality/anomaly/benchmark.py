@@ -63,6 +63,7 @@ from .metrics import (
     detect_mask,
     detection_rate,
     mad_threshold,
+    vus_sliding_window,
 )
 from .registry import (
     MODEL_REGISTRY,
@@ -75,7 +76,6 @@ ENSEMBLE_NAME = "Ensemble"
 MODES = ("unlabeled", "synthetic")
 UNLABELED_METRIC_KEYS = ["detection_rate"]
 SYNTHETIC_METRIC_KEYS = ["auroc", "aupr", "vus_pr", "vus_roc", "affiliation_f1"]
-DEFAULT_ENSEMBLE_WINDOW = 100
 
 # Synthetic mode injects a single variant: a per-segment mix of the anomaly
 # shapes, applied directly to the real series (see :mod:`.anomalies`).
@@ -303,15 +303,17 @@ def _score_case_synthetic(
     select_model = model_cls(seed=config.seed, **model_kwargs)
     select_model.fit(case.values_select)
     select_scores = np.asarray(select_model.score(case.values_select), dtype=np.float64)
-    select_window = int(getattr(select_model, "window_size", DEFAULT_ENSEMBLE_WINDOW) or DEFAULT_ENSEMBLE_WINDOW)
+    # The VUS window comes from the labels (median anomaly length, original VUS
+    # convention), never from the detector: every model must be scored with the
+    # same tolerance for their VUS values to be comparable.
+    select_window = vus_sliding_window(case.labels_select)
     vus_pr_select = compute_metrics(case.labels_select, select_scores, select_window)["vus_pr"]
 
     # Held-out evaluation injection: every reported metric/score comes from here.
     model, scores, fit_seconds, inference_seconds = _fit_score_timed(
         model_cls, model_kwargs, case.values, config.seed, device
     )
-    window_size = int(getattr(model, "window_size", DEFAULT_ENSEMBLE_WINDOW) or DEFAULT_ENSEMBLE_WINDOW)
-    metrics = compute_metrics(case.labels, scores, window_size)
+    metrics = compute_metrics(case.labels, scores, vus_sliding_window(case.labels))
     return {
         "series_name": case.name,
         "series_length": int(case.values.shape[0]),
@@ -540,7 +542,7 @@ def _build_synthetic_ensemble(
         score_arrays = [detector_results[name]["per_case"][index]["scores"] for name in top_models]
         weights = [select_by_model[name] for name in top_models]
         fused = consensus(score_arrays, config.ensemble_method, config.seed, weights=weights)
-        metrics = compute_metrics(case.labels, fused, DEFAULT_ENSEMBLE_WINDOW)
+        metrics = compute_metrics(case.labels, fused, vus_sliding_window(case.labels))
 
         timings = [detector_results[name]["per_case"][index]["timing"] for name in top_models]
         ensemble_results.append(
@@ -742,7 +744,7 @@ def recompute_ensemble(
             weights = [select_by_model[name] for name in top_models]
             fused = consensus(score_arrays, method=method, weights=weights)
             labels = scores_npz[f"__labels__case{i}"]
-            metrics = compute_metrics(labels, fused, DEFAULT_ENSEMBLE_WINDOW)
+            metrics = compute_metrics(labels, fused, vus_sliding_window(labels))
             ensemble_vus_pr_list.append(metrics["vus_pr"])
 
         out: dict[str, float] = {name: saved["models"][name]["macro_metrics"]["vus_pr"] for name in model_names}

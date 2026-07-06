@@ -121,6 +121,35 @@ def test_compute_metrics_empty_returns_zero_dict():
     assert all(value == 0.0 for value in metrics.values())
 
 
+def test_vus_sliding_window_is_median_segment_length():
+    from airquality.anomaly.metrics import vus_sliding_window
+
+    labels = np.zeros(60, dtype=np.int64)
+    labels[2:4] = 1  # length 2
+    labels[10:15] = 1  # length 5
+    labels[30:40] = 1  # length 10
+    assert vus_sliding_window(labels) == 5
+
+
+def test_vus_sliding_window_handles_edges_and_spikes():
+    from airquality.anomaly.metrics import vus_sliding_window
+
+    labels = np.zeros(20, dtype=np.int64)
+    labels[0] = 1  # spike at the start
+    labels[19] = 1  # spike at the end
+    assert vus_sliding_window(labels) == 1
+
+    all_anomalous = np.ones(7, dtype=np.int64)
+    assert vus_sliding_window(all_anomalous) == 7
+
+
+def test_vus_sliding_window_defaults_to_one_without_anomalies():
+    from airquality.anomaly.metrics import vus_sliding_window
+
+    assert vus_sliding_window(np.zeros(10, dtype=np.int64)) == 1
+    assert vus_sliding_window(np.array([], dtype=np.int64)) == 1
+
+
 # --- score binarization (median + k*MAD) -----------------------------------
 
 

@@ -38,6 +38,7 @@ from .metrics import (
     detect_mask,
     detection_rate,
     mad_threshold,
+    vus_sliding_window,
 )
 from .registry import MODEL_REGISTRY, resolve_model_names
 
@@ -61,4 +62,5 @@ __all__ = [
     "resolve_model_names",
     "run_benchmark",
     "split_by_detection_rate",
+    "vus_sliding_window",
 ]

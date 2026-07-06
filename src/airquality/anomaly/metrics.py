@@ -77,12 +77,30 @@ def detection_rate(mask: np.ndarray) -> float:
     return float(mask.mean())
 
 
+def vus_sliding_window(labels: np.ndarray) -> int:
+    """VUS sliding-window tolerance: the median labeled anomaly length.
+
+    Follows the original VUS convention (thedatumorg/VUS README:
+    ``slidingWindow = int(np.median(get_list_anomaly(labels)))``): the window
+    is a property of the labels, computed once and shared by every detector so
+    their VUS values are comparable. Returns 1 when there are no anomalies.
+    """
+    flat = np.asarray(labels, dtype=np.int8).ravel()
+    boundaries = np.diff(np.concatenate(([0], (flat != 0).astype(np.int8), [0])))
+    lengths = np.flatnonzero(boundaries == -1) - np.flatnonzero(boundaries == 1)
+    if lengths.size == 0:
+        return 1
+    return max(1, int(np.median(lengths)))
+
+
 def compute_metrics(labels: np.ndarray, scores: np.ndarray, window_size: int) -> dict[str, float]:
     """Compute the supervised metric set for one scored series (synthetic mode).
 
-    ``window_size`` is the sliding-window tolerance used by VUS; scores are
-    min-max normalized first. Returns all-zero metrics when there are no
-    positive labels (metrics would be undefined).
+    ``window_size`` is the sliding-window tolerance used by VUS — pass the same
+    label-derived value (:func:`vus_sliding_window`) for every detector scored
+    on a series, so their VUS values are comparable. Scores are min-max
+    normalized first. Returns all-zero metrics when there are no positive
+    labels (metrics would be undefined).
     """
     if len(labels) == 0 or np.sum(labels) == 0:
         return {
