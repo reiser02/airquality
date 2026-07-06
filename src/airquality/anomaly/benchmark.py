@@ -38,7 +38,6 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
-import inspect
 import json
 import logging
 from multiprocessing import get_context
@@ -65,7 +64,12 @@ from .metrics import (
     detection_rate,
     mad_threshold,
 )
-from .registry import MODEL_REGISTRY, resolve_model_class, resolve_model_names
+from .registry import (
+    MODEL_REGISTRY,
+    filter_model_kwargs as _filter_model_kwargs,
+    resolve_model_class,
+    resolve_model_names,
+)
 
 ENSEMBLE_NAME = "Ensemble"
 MODES = ("unlabeled", "synthetic")
@@ -192,15 +196,6 @@ class AnomalyBenchmarkConfig:
     min_series_points: int = 600
     series_limit: int | None = None
     output_dir: str | None = None
-
-
-def _filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str, object]:
-    """Keep only kwargs the detector's ``__init__`` accepts (e.g. drop ``device``)."""
-    parameters = inspect.signature(model_cls.__init__).parameters
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return dict(kwargs)
-    valid = set(parameters) - {"self"}
-    return {key: value for key, value in kwargs.items() if key in valid}
 
 
 def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:

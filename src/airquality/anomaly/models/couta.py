@@ -13,7 +13,6 @@ from typing import Any
 import numpy as np
 import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import DataLoader
 
@@ -23,6 +22,8 @@ from .common import (
     GenIASWindowGenerator,
     aggregate_tail_scores,
     log_epoch,
+    resize_delta,
+    resolve_training_stride,
     rolling_windows_nd,
     subsample_windows,
 )
@@ -90,16 +91,6 @@ class COUTAGenIASGenerator(COUTAGenerator):
         """Train the GenIAS backend on a subsample of the normal training windows."""
         self.backend.fit(subsample_windows(train_windows, self.max_windows, self.backend.seed))
 
-    @staticmethod
-    def _resize_delta(delta: Tensor, target_length: int) -> Tensor:
-        source_length = int(delta.shape[0])
-        if source_length == target_length:
-            return delta
-        if source_length == 1:
-            return delta.repeat(target_length, 1)
-        resized = F.interpolate(delta.transpose(0, 1).unsqueeze(0), size=target_length, mode="linear", align_corners=False)
-        return resized.squeeze(0).transpose(0, 1)
-
     def generate_batch(self, batch_seqs: Tensor, seed: int) -> tuple[Tensor, Tensor]:
         batch_neg, mask = self.backend.generate_batch(batch_seqs)
         aligned_batch = batch_seqs.clone()
@@ -117,7 +108,7 @@ class COUTAGenIASGenerator(COUTAGenerator):
             delta = batch_neg[index, start:end] - batch_seqs[index, start:end]
             target_start = int(cut_start[index])
             target_length = length - target_start
-            resized_delta = self._resize_delta(delta, target_length)
+            resized_delta = resize_delta(delta, target_length)
             if torch.max(torch.abs(resized_delta)) <= 1e-6:
                 aligned_batch[index] = fallback_batch[index]
                 continue
@@ -272,8 +263,8 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
         return self.generator
 
     def _resolve_training_stride(self, num_raw_windows: int) -> int:
-        """Mirror CARLABase's window-count cap so training cost stops scaling with series length."""
-        return max(1, -(-num_raw_windows // self.max_windows))
+        """Stride that keeps the training-window count near ``max_windows``."""
+        return resolve_training_stride(num_raw_windows, self.max_windows)
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Train the one-class TCN: fix the SVDD center, then optimize both losses."""
@@ -303,8 +294,10 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
         criterion_ssl = nn.MSELoss(reduction="mean")
         optimizer = torch.optim.Adam(self.net.parameters(), lr=self.learning_rate)
         neg_batch_size = max(1, int(self.neg_batch_ratio * self.batch_size))
+        # One DataLoader for every epoch: each iteration draws a fresh shuffle
+        # permutation from the torch RNG either way.
+        loader = DataLoader(dataset, batch_size=self.batch_size, drop_last=True, shuffle=True)
         for epoch in range(self.num_epochs):
-            loader = DataLoader(dataset, batch_size=self.batch_size, drop_last=True, shuffle=True)
             epoch_losses = []
             epoch_oc_losses = []
             epoch_ssl_losses = []

@@ -6,6 +6,8 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+import pickle
+import tempfile
 from typing import Any, Sequence
 
 import pandas as pd
@@ -595,38 +597,89 @@ def _merge_plot_stores(
     return dict(sorted(merged.items(), key=lambda item: item[0]))
 
 
-def _run_parallel_model_task(task: dict[str, Any]) -> tuple[str, pd.DataFrame, dict[int, dict[str, Any]]]:
-    """Worker entry point that benchmarks one model in a separate process."""
-    model_name = str(task["model_name"])
-    resolved_root = _resolve_repo_root(task.get("repo_root"))
-    config = BenchmarkRunConfig.from_mapping(task)
+# Per-process caches used by pooled benchmark workers. The dataset bundle is
+# identical for every model (and every Monte Carlo seed), so each worker loads
+# the pickle once; heavy model artifacts (Darts weights, TSPulse checkpoints)
+# are reused across seeds when the task opts in via `reuse_loaded_models`.
+_WORKER_BUNDLE_CACHE: dict[str, BenchmarkDatasetBundle] = {}
+_WORKER_MODEL_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-    dataset_bundle = _build_dataset_bundle_from_config(
-        repo_root=resolved_root,
-        config=config,
-    )
 
+def _load_worker_dataset_bundle(
+    task: dict[str, Any],
+    resolved_root: Path,
+    config: BenchmarkRunConfig,
+) -> BenchmarkDatasetBundle:
+    """Load the shared pickled dataset bundle, or rebuild it when not provided."""
+    bundle_path = task.get("dataset_bundle_path")
+    if bundle_path is None:
+        return _build_dataset_bundle_from_config(repo_root=resolved_root, config=config)
+
+    key = str(bundle_path)
+    if key not in _WORKER_BUNDLE_CACHE:
+        with open(key, "rb") as handle:
+            bundle = pickle.load(handle)
+        _WORKER_BUNDLE_CACHE.clear()
+        _WORKER_BUNDLE_CACHE[key] = bundle
+    return _WORKER_BUNDLE_CACHE[key]
+
+
+def _build_model_dict_for_model(
+    model_name: str,
+    resolved_root: Path,
+    config: BenchmarkRunConfig,
+) -> dict[str, Any]:
+    """Construct the single-model benchmark dict for one registry name."""
     family = resolve_imputer_family(model_name)
     if family == TSPULSE_FAMILY:
-        model_dict: dict[str, Any] = _build_tspulse_model_dict(
+        return _build_tspulse_model_dict(
             config.tspulse,
             freq=config.freq,
             model_names=(model_name,),
         )
-    elif family == PROPHET_FAMILY:
-        model_dict = _build_prophet_model_dict((model_name,))
-    elif family == INTERP_FAMILY:
-        model_dict = _build_interp_model_dict((model_name,))
-    elif family == LINEAR_FAMILY:
-        model_dict = _build_linear_model_dict((model_name,))
-    else:
-        model_dict = load_darts_models_from_artifacts(
-            repo_root=resolved_root,
-            size_k=config.size_k,
-            model_names=(model_name,),
-            force_cpu=config.force_cpu,
-            strict=False,
+    if family == PROPHET_FAMILY:
+        return _build_prophet_model_dict((model_name,))
+    if family == INTERP_FAMILY:
+        return _build_interp_model_dict((model_name,))
+    if family == LINEAR_FAMILY:
+        return _build_linear_model_dict((model_name,))
+    return load_darts_models_from_artifacts(
+        repo_root=resolved_root,
+        size_k=config.size_k,
+        model_names=(model_name,),
+        force_cpu=config.force_cpu,
+        strict=False,
+    )
+
+
+def _run_parallel_model_task(
+    task: dict[str, Any],
+    dataset_bundle: BenchmarkDatasetBundle | None = None,
+) -> tuple[str, pd.DataFrame, dict[int, dict[str, Any]]]:
+    """Worker entry point that benchmarks one model (in-process or pooled)."""
+    model_name = str(task["model_name"])
+    resolved_root = _resolve_repo_root(task.get("repo_root"))
+    config = BenchmarkRunConfig.from_mapping(task)
+
+    if dataset_bundle is None:
+        dataset_bundle = _load_worker_dataset_bundle(task, resolved_root, config)
+
+    if task.get("reuse_loaded_models"):
+        cache_key = (
+            model_name,
+            str(resolved_root),
+            config.size_k,
+            config.force_cpu,
+            config.freq,
+            config.tspulse,
         )
+        if cache_key not in _WORKER_MODEL_CACHE:
+            _WORKER_MODEL_CACHE[cache_key] = _build_model_dict_for_model(
+                model_name, resolved_root, config
+            )
+        model_dict = _WORKER_MODEL_CACHE[cache_key]
+    else:
+        model_dict = _build_model_dict_for_model(model_name, resolved_root, config)
 
     results_df, plot_store = _execute_benchmark_with_dataset(
         model_dict=model_dict,
@@ -748,6 +801,67 @@ def run_imputation_benchmark(
     return results_df, ranking_df, plot_store
 
 
+def _resolve_parallel_eval_names(
+    model_names: Sequence[str],
+    config: BenchmarkRunConfig,
+) -> list[str]:
+    """Resolve the evaluable model list, applying optional-dependency policies.
+
+    Prophet/TSPulse names are dropped with a warning when their dependency is
+    missing; requesting ``TSPulse_FineTuned`` without a model path raises.
+    """
+    (
+        darts_model_names,
+        prophet_model_names,
+        tspulse_model_names,
+        interp_model_names,
+        linear_model_names,
+    ) = _resolve_requested_models(model_names)
+
+    eval_model_names = list(darts_model_names)
+
+    if prophet_model_names:
+        if PROPHET_AVAILABLE:
+            eval_model_names.extend(prophet_model_names)
+        else:
+            print("[warn] darts Prophet no esta disponible; se omite Prophet.")
+
+    if tspulse_model_names:
+        if TSFM_PUBLIC_AVAILABLE:
+            if (
+                TSPULSE_FINETUNED_MODEL_NAME in tspulse_model_names
+                and config.tspulse.model_path is None
+            ):
+                raise RuntimeError(
+                    "No se puede evaluar TSPulse_FineTuned sin `tspulse_model_path`."
+                )
+            eval_model_names.extend(tspulse_model_names)
+        else:
+            print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
+
+    if interp_model_names:
+        eval_model_names.extend(interp_model_names)
+
+    if linear_model_names:
+        eval_model_names.extend(linear_model_names)
+
+    if not eval_model_names:
+        raise RuntimeError("No hay modelos para evaluar en paralelo.")
+
+    return eval_model_names
+
+
+def _resolve_parallel_max_workers(
+    max_workers: int | None,
+    eval_model_names: Sequence[str],
+) -> int:
+    """Clamp the requested worker count to `[1, n_models]` (default: half the CPUs)."""
+    if max_workers is None:
+        cpu_count = os.cpu_count() or 1
+        max_workers = min(len(eval_model_names), max(1, cpu_count // 2))
+    return max(1, min(int(max_workers), len(eval_model_names)))
+
+
 def run_imputation_benchmark_parallel(
     repo_root: str | Path | None = None,
     size_k: int | None = None,
@@ -798,49 +912,16 @@ def run_imputation_benchmark_parallel(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    (
-        darts_model_names,
-        prophet_model_names,
-        tspulse_model_names,
-        interp_model_names,
-        linear_model_names,
-    ) = _resolve_requested_models(model_names)
+    eval_model_names = _resolve_parallel_eval_names(model_names, config)
+    max_workers = _resolve_parallel_max_workers(max_workers, eval_model_names)
 
-    eval_model_names = list(darts_model_names)
-
-    if prophet_model_names:
-        if PROPHET_AVAILABLE:
-            eval_model_names.extend(prophet_model_names)
-        else:
-            print("[warn] darts Prophet no esta disponible; se omite Prophet.")
-
-    if tspulse_model_names:
-        if TSFM_PUBLIC_AVAILABLE:
-            if (
-                TSPULSE_FINETUNED_MODEL_NAME in tspulse_model_names
-                and config.tspulse.model_path is None
-            ):
-                raise RuntimeError(
-                    "No se puede evaluar TSPulse_FineTuned sin `tspulse_model_path`."
-                )
-            eval_model_names.extend(tspulse_model_names)
-        else:
-            print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
-
-    if interp_model_names:
-        eval_model_names.extend(interp_model_names)
-
-    if linear_model_names:
-        eval_model_names.extend(linear_model_names)
-
-    if not eval_model_names:
-        raise RuntimeError("No hay modelos para evaluar en paralelo.")
-
-    if max_workers is None:
-        cpu_count = os.cpu_count() or 1
-        max_workers = min(len(eval_model_names), max(1, cpu_count // 2))
-    max_workers = max(1, min(int(max_workers), len(eval_model_names)))
-
+    # The bundle is identical for every model: build it once in the parent and
+    # share it (directly in-process, or as one pickle that each pooled worker
+    # loads once) instead of re-reading every raw file in every worker.
+    dataset_bundle = _build_dataset_bundle_from_config(
+        repo_root=resolved_root,
+        config=config,
+    )
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
     tasks = [
         {
@@ -851,10 +932,16 @@ def run_imputation_benchmark_parallel(
     ]
 
     if max_workers == 1:
-        outputs = [_run_parallel_model_task(task) for task in tasks]
+        outputs = [_run_parallel_model_task(task, dataset_bundle) for task in tasks]
     else:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            outputs = list(executor.map(_run_parallel_model_task, tasks))
+        with tempfile.TemporaryDirectory(prefix="airquality_bench_") as tmp_dir:
+            bundle_path = Path(tmp_dir) / "dataset_bundle.pkl"
+            with bundle_path.open("wb") as handle:
+                pickle.dump(dataset_bundle, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            for task in tasks:
+                task["dataset_bundle_path"] = str(bundle_path)
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                outputs = list(executor.map(_run_parallel_model_task, tasks))
 
     results_df = pd.concat([item[1] for item in outputs], ignore_index=True)
     plot_store = _merge_plot_stores([item[2] for item in outputs])
@@ -948,6 +1035,11 @@ def run_imputation_benchmark_parallel_montecarlo(
 ]:
     """Ejecuta benchmark de imputacion en varias semillas (Monte Carlo).
 
+    El dataset bundle se construye UNA vez y el pool de workers persiste entre
+    semillas, de modo que cada worker carga sus artefactos de modelo una sola
+    vez y los reutiliza (los resultados por semilla no dependen de ello: cada
+    tarea crea su RNG a partir de su `random_seed`).
+
     Devuelve:
     - `results_mc_df`: resultados fila-a-fila con columnas extra `Seed` y `MonteCarlo_Run`.
     - `summary_mc_df`: resumen por modelo sobre rankings por semilla.
@@ -960,42 +1052,73 @@ def run_imputation_benchmark_parallel_montecarlo(
         seed_step=seed_step,
     )
 
-    results_runs: list[pd.DataFrame] = []
-    total_runs = len(seed_list)
-    for run_idx, seed in enumerate(seed_list, start=1):
-        if progress:
-            print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
+    configure_warnings(quiet=quiet_logs)
+    resolved_root = _resolve_repo_root(repo_root)
+    config = _load_benchmark_run_config(
+        force_cpu=force_cpu,
+        local_files_only=local_files_only,
+        hf_token=hf_token,
+        size_k=size_k,
+        tspulse_model_id=tspulse_model_id,
+        tspulse_revision=tspulse_revision,
+        tspulse_model_path=tspulse_model_path,
+        gap_sizes=gap_sizes,
+        num_gaps=num_gaps,
+        gap_strategy=gap_strategy,
+        metrics=metrics,
+        random_seed=int(seed_list[0]),
+        seasonality_m=seasonality_m,
+        freq=freq,
+        val_size=val_size,
+        val_context_len=val_context_len,
+        min_train_len_base=min_train_len_base,
+    )
+    model_names = _default_model_names() if model_names is None else model_names
+    eval_model_names = _resolve_parallel_eval_names(model_names, config)
+    workers = _resolve_parallel_max_workers(max_workers, eval_model_names)
 
-        run_results, _, _ = (
-            run_imputation_benchmark_parallel(
-                repo_root=repo_root,
-                size_k=size_k,
-                model_names=model_names,
-                force_cpu=force_cpu,
-                quiet_logs=quiet_logs,
-                local_files_only=local_files_only,
-                hf_token=hf_token,
-                tspulse_model_id=tspulse_model_id,
-                tspulse_revision=tspulse_revision,
-                tspulse_model_path=tspulse_model_path,
-                gap_sizes=gap_sizes,
-                num_gaps=num_gaps,
-                gap_strategy=gap_strategy,
-                metrics=metrics,
-                random_seed=int(seed),
-                seasonality_m=seasonality_m,
-                freq=freq,
-                val_size=val_size,
-                val_context_len=val_context_len,
-                min_train_len_base=min_train_len_base,
-                max_workers=max_workers,
-            )
-        )
+    dataset_bundle = _build_dataset_bundle_from_config(
+        repo_root=resolved_root,
+        config=config,
+    )
+    task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
+    task_common["reuse_loaded_models"] = True
 
-        run_results = run_results.copy()
+    def _seed_tasks(seed: int) -> list[dict[str, Any]]:
+        return [
+            {**task_common, "model_name": model_name, "random_seed": int(seed)}
+            for model_name in eval_model_names
+        ]
+
+    def _collect_run(run_idx: int, seed: int, outputs: list[Any]) -> pd.DataFrame:
+        run_results = pd.concat([item[1] for item in outputs], ignore_index=True)
         run_results["Seed"] = int(seed)
         run_results["MonteCarlo_Run"] = int(run_idx)
-        results_runs.append(run_results)
+        return run_results
+
+    results_runs: list[pd.DataFrame] = []
+    total_runs = len(seed_list)
+    if workers == 1:
+        for run_idx, seed in enumerate(seed_list, start=1):
+            if progress:
+                print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
+            outputs = [
+                _run_parallel_model_task(task, dataset_bundle)
+                for task in _seed_tasks(seed)
+            ]
+            results_runs.append(_collect_run(run_idx, seed, outputs))
+    else:
+        with tempfile.TemporaryDirectory(prefix="airquality_bench_") as tmp_dir:
+            bundle_path = Path(tmp_dir) / "dataset_bundle.pkl"
+            with bundle_path.open("wb") as handle:
+                pickle.dump(dataset_bundle, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            task_common["dataset_bundle_path"] = str(bundle_path)
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                for run_idx, seed in enumerate(seed_list, start=1):
+                    if progress:
+                        print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
+                    outputs = list(executor.map(_run_parallel_model_task, _seed_tasks(seed)))
+                    results_runs.append(_collect_run(run_idx, seed, outputs))
 
     results_mc_df = pd.concat(results_runs, ignore_index=True)
     metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in results_mc_df.columns]

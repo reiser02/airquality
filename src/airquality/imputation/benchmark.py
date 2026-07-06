@@ -8,9 +8,6 @@ from typing import Any, Mapping, Sequence  # Typing utilities for flexible publi
 
 import numpy as np  # Numeric operations for masks, metrics, and random sampling.
 import pandas as pd  # Time-indexed series/dataframe processing.
-from pandas.tseries.frequencies import (
-    to_offset,
-)  # Frequency-aware timestamp arithmetic.
 
 from darts import TimeSeries  # Darts time series container used across the module.
 from darts.metrics import mase as darts_mase
@@ -86,13 +83,10 @@ def _serialize_plot_gap_payload(payload: PlotGapPayload) -> dict[str, Any]:
     return serialized
 
 
-_ensure_datetime_series = ensure_datetime_series
-
-
 def _ts_to_series(ts: TimeSeries, freq: str, name: str) -> pd.Series:
     """Convert Darts `TimeSeries` into normalized `pd.Series`."""
     out = to_pd_series(ts, freq=freq, name=name)
-    return _ensure_datetime_series(out, freq=freq, name=name)
+    return ensure_datetime_series(out, freq=freq, name=name)
 
 
 def _normalize_series_collection(
@@ -122,7 +116,7 @@ def _normalize_series_collection(
             if series_like.name is not None
             else f"{default_prefix}_0"
         )
-        out[name] = _ensure_datetime_series(series_like, freq=freq, name=name)
+        out[name] = ensure_datetime_series(series_like, freq=freq, name=name)
         return out
 
     if isinstance(series_like, TimeSeries):
@@ -135,7 +129,7 @@ def _normalize_series_collection(
         if not isinstance(series_like.index, pd.DatetimeIndex):
             raise TypeError("DataFrame de series debe tener DatetimeIndex")
         for col in series_like.columns:
-            out[str(col)] = _ensure_datetime_series(
+            out[str(col)] = ensure_datetime_series(
                 series_like[col], freq=freq, name=str(col)
             )
         return out
@@ -146,7 +140,7 @@ def _normalize_series_collection(
             if isinstance(value, pd.Series):
                 s = value.copy()
                 s.name = name
-                out[name] = _ensure_datetime_series(s, freq=freq, name=name)
+                out[name] = ensure_datetime_series(s, freq=freq, name=name)
             elif isinstance(value, TimeSeries):
                 out[name] = _ts_to_series(value, freq=freq, name=name)
             elif isinstance(value, pd.DataFrame):
@@ -156,7 +150,7 @@ def _normalize_series_collection(
                     )
                 s = value.iloc[:, 0].copy()
                 s.name = name
-                out[name] = _ensure_datetime_series(s, freq=freq, name=name)
+                out[name] = ensure_datetime_series(s, freq=freq, name=name)
             else:
                 raise TypeError(f"Tipo no soportado para '{name}': {type(value)}")
         return out
@@ -168,7 +162,7 @@ def _normalize_series_collection(
                 s = value.copy()
                 if s.name is None:
                     s.name = auto
-                out[str(s.name)] = _ensure_datetime_series(
+                out[str(s.name)] = ensure_datetime_series(
                     s, freq=freq, name=str(s.name)
                 )
             elif isinstance(value, TimeSeries):
@@ -183,7 +177,7 @@ def _normalize_series_collection(
                 s = value.iloc[:, 0].copy()
                 if s.name is None:
                     s.name = auto
-                out[str(s.name)] = _ensure_datetime_series(
+                out[str(s.name)] = ensure_datetime_series(
                     s, freq=freq, name=str(s.name)
                 )
             else:
@@ -398,38 +392,44 @@ def _generate_hybrid_tspulse_gaps(
     block_missing = max(0, total_missing - random_missing)
 
     block_count = max(1, block_missing // max(1, gap_size))
-    block_windows = _generate_block_gaps(
-        series=series,
-        gap_size=gap_size,
-        num_gaps=block_count,
+    block_starts = _sample_non_overlapping_starts(
+        n_points=len(series),
+        gap_size=int(gap_size),
+        num_gaps=int(block_count),
         rng=rng,
-        freq=freq,
         min_gap_points=1,
     )
+    block_windows = [_build_gap_index(series.index[s], gap_size, freq=freq) for s in block_starts]
 
-    used_points: set[pd.Timestamp] = set()
-    for window in block_windows:
-        used_points.update(window.tolist())
+    # Work on integer positions instead of Timestamp sets: on the regular test
+    # grid `position +- 1` is exactly `timestamp +- freq`, and boolean-array
+    # lookups avoid hashing millions of Timestamp objects. The shuffle draws
+    # the same RNG stream as the previous list-of-timestamps shuffle (it only
+    # depends on the sequence length), so the sampled gaps are unchanged.
+    n_points = len(series)
+    used = np.zeros(n_points, dtype=bool)
+    for start in block_starts:
+        used[start : start + int(gap_size)] = True
 
-    offset = to_offset(freq)
-    available_points = list(series.index)
-    rng.shuffle(available_points)
+    candidate_positions = list(range(n_points))
+    rng.shuffle(candidate_positions)
 
-    random_points: list[pd.Timestamp] = []
-    for ts in available_points:
-        point = pd.Timestamp(ts)
-        if point in used_points:
+    random_positions: list[int] = []
+    for pos in candidate_positions:
+        if used[pos]:
             continue
-        if (point - offset) in used_points or (point + offset) in used_points:
+        if (pos > 0 and used[pos - 1]) or (pos + 1 < n_points and used[pos + 1]):
             continue
 
-        random_points.append(point)
-        used_points.add(point)
-        if len(random_points) >= random_missing:
+        random_positions.append(pos)
+        used[pos] = True
+        if len(random_positions) >= random_missing:
             break
 
-    random_points = sorted(random_points)
-    point_windows = [_build_gap_index(ts, 1, freq=freq) for ts in random_points]
+    random_positions.sort()
+    point_windows = [
+        _build_gap_index(series.index[pos], 1, freq=freq) for pos in random_positions
+    ]
 
     return sorted(block_windows + point_windows, key=lambda idx: pd.Timestamp(idx[0]))
 
@@ -471,11 +471,13 @@ def _build_gap_windows_for_series(
             freq=freq,
         )
 
-    test_index_set = set(ts_test.index.tolist())
+    # `get_indexer` reuses the index's cached hash engine across windows, so
+    # membership is vectorized instead of building Timestamp sets per window.
+    test_index = pd.DatetimeIndex(ts_test.index)
     return [
         w
         for w in windows
-        if set(pd.DatetimeIndex(w).tolist()).issubset(test_index_set)
+        if len(w) == 0 or (test_index.get_indexer(pd.DatetimeIndex(w)) >= 0).all()
     ]
 
 
@@ -517,37 +519,6 @@ def _gap_windows_to_mask_index(
     return idx.sort_values().drop_duplicates()
 
 
-def _mask_test_series(
-    test_series: pd.Series,
-    gap_windows: Sequence[pd.DatetimeIndex],
-) -> tuple[pd.Series, pd.DatetimeIndex]:
-    """Apply NaNs at gap windows and return `(masked_series, mask_index)`."""
-    mask_index = _gap_windows_to_mask_index(gap_windows)
-    masked = test_series.copy()
-    if len(mask_index) > 0:
-        masked.loc[masked.index.intersection(mask_index)] = np.nan
-    return masked, mask_index
-
-
-def _compute_mase_denominator(
-    insample: pd.Series, *, seasonality_m: int, freq: str
-) -> float:
-    """Compute MASE denominator from in-sample history (`mean(|y_t - y_{t-m}|)`)."""
-    if len(insample) <= int(seasonality_m):
-        return float("nan")
-
-    s = _ensure_datetime_series(insample, freq=freq, name="insample")
-    s = s.interpolate(method="time", limit_direction="both").ffill().bfill()
-    values = s.to_numpy(dtype=float)
-    m = int(seasonality_m)
-
-    if len(values) <= m:
-        return float("nan")
-
-    denom = float(np.mean(np.abs(values[m:] - values[:-m])))
-    return denom if np.isfinite(denom) and denom > 0 else float("nan")
-
-
 def _compute_metrics_on_mask(
     *,
     y_true: pd.Series,
@@ -586,7 +557,7 @@ def _build_plot_store_series_payloads(
     mask_index_by_series: dict[str, pd.DatetimeIndex] = {}
 
     for series_name, ts_test in test_map_unscaled.items():
-        _, mask_index = _mask_test_series(ts_test, gaps_per_series[series_name])
+        mask_index = _gap_windows_to_mask_index(gaps_per_series[series_name])
         mask_index_by_series[series_name] = mask_index
         reference_full = all_series_map[series_name]
 

@@ -29,7 +29,6 @@ imputation step can fill them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import inspect
 import logging
 
 import numpy as np
@@ -41,7 +40,11 @@ from airquality.anomaly.metrics import (
     DEFAULT_THRESHOLD_K,
     detect_mask,
 )
-from airquality.anomaly.registry import resolve_model_class, resolve_model_names
+from airquality.anomaly.registry import (
+    filter_model_kwargs as _filter_model_kwargs,
+    resolve_model_class,
+    resolve_model_names,
+)
 from airquality.data.segments import contiguous_observed_segments
 from airquality.data.series import ensure_datetime_series
 
@@ -63,15 +66,6 @@ class CleaningResult:
     mask: pd.Series  # boolean, indexed like the input series (True = anomaly)
     n_flagged: int = 0
     detection_rate: float = 0.0  # rate of the final consensus mask
-
-
-def _filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str, object]:
-    """Keep only kwargs the detector's ``__init__`` accepts (pattern from pipeline.py)."""
-    parameters = inspect.signature(model_cls.__init__).parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        return dict(kwargs)
-    valid = set(parameters) - {"self"}
-    return {key: value for key, value in kwargs.items() if key in valid}
 
 
 def _fit_score(model_cls: type, values: np.ndarray, *, seed: int, device: str) -> np.ndarray:

@@ -29,7 +29,6 @@ from .carla import (
 from .common import (
     BaseTimeSeriesAnomalyDetector,
     GenIASWindowGenerator,
-    aggregate_strided_scores,
     aggregate_tail_scores,
     ensure_2d,
     fit_standardizer_nd,
@@ -110,7 +109,6 @@ __all__ = [
     "ResNetRepresentation",
     "TSPulse",
     "TSRepository",
-    "aggregate_strided_scores",
     "aggregate_tail_scores",
     "ensure_2d",
     "entropy",

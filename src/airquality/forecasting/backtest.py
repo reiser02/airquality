@@ -21,7 +21,7 @@ import pandas as pd
 
 from darts import TimeSeries, concatenate
 from darts.dataprocessing.transformers import Scaler
-from darts.metrics import mae, rmse
+from darts.metrics import mae, mase as darts_mase, rmse
 from darts.utils.missing_values import extract_subseries
 from sklearn.preprocessing import StandardScaler
 
@@ -30,19 +30,41 @@ from airquality.modeling.training import fit_darts_model
 from airquality.modeling.training_config import build_model_configs
 
 
-def _seasonal_naive_mae(series: pd.Series, *, seasonality_m: int) -> float:
-    """In-sample seasonal-naive MAE (``mean|y_t - y_{t-m}|``), the MASE denominator.
+def _compute_backtest_mase(
+    actual: TimeSeries,
+    pred: TimeSeries,
+    insample: pd.Series,
+    *,
+    seasonality_m: int,
+    freq: str,
+) -> float:
+    """MASE of the holdout forecast via :func:`darts.metrics.mase`.
 
-    Gaps are interpolated first so the denominator uses the full history; matches
-    the convention of ``imputation.benchmark._compute_mase_denominator``.
+    ``insample`` is the training history: darts requires it to end exactly one
+    step before ``pred`` starts, which holds by construction here. Its gaps are
+    time-interpolated first so the seasonal-naive scale uses the full history
+    (same convention as ``imputation.benchmark._compute_gap_mase``). Returns
+    NaN when darts cannot compute the metric (short or constant history).
     """
-    s = series.interpolate(method="time", limit_direction="both").ffill().bfill()
-    values = s.to_numpy(dtype=float)
-    m = int(seasonality_m)
-    if len(values) <= m:
+    try:
+        insample_clean = (
+            insample.interpolate(method="time", limit_direction="both").ffill().bfill()
+        )
+        insample_ts = TimeSeries.from_series(insample_clean, freq=freq)
+        value = darts_mase(
+            actual_series=actual,
+            pred_series=pred,
+            insample=insample_ts,
+            m=int(seasonality_m),
+            intersect=True,
+        )
+        if isinstance(value, (list, np.ndarray)):
+            value = np.nanmean(value)
+        value = float(value)
+        return value if np.isfinite(value) else float("nan")
+    except Exception as exc:
+        logging.warning("[mase] no computable sobre el holdout: %s", exc)
         return float("nan")
-    denom = float(np.mean(np.abs(values[m:] - values[:-m])))
-    return denom if np.isfinite(denom) and denom > 0 else float("nan")
 
 
 def _longest_observed_run(series: pd.Series) -> tuple[int, int]:
@@ -189,11 +211,13 @@ def backtest_forecast(
         warnings.simplefilter("ignore")
         result["rmse"] = float(rmse(actual, pred))
         result["mae"] = float(mae(actual, pred))
-    # MASE = forecast MAE / in-sample seasonal-naive MAE (computed over the full
-    # observed training history, matching the imputation benchmark's convention).
-    denom = _seasonal_naive_mae(train_s, seasonality_m=seasonality_m)
-    if np.isfinite(denom) and denom > 0:
-        result["mase"] = float(result["mae"] / denom)
+        result["mase"] = _compute_backtest_mase(
+            actual,
+            pred,
+            train_s,
+            seasonality_m=seasonality_m,
+            freq=freq,
+        )
     result["n_eval"] = int(len(actual))
     return result
 

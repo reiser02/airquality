@@ -4,8 +4,11 @@ Trimmed copy of the ``metricor`` class from VUS 0.0.6
 (``vus/utils/metrics.py``, The DATUM Lab, Apache-2.0). Only the methods needed
 to reproduce ``generate_curve``'s ``avg_auc_3d`` (VUS_ROC) and ``avg_ap_3d``
 (VUS_PR) are kept: ``range_convers_new``, ``new_sequence``, ``sequencing`` and
-``RangeAUC_volume_opt``. The methods are copied verbatim so results match the
-original ``vus.metrics.get_metrics`` exactly. See ``NOTICE`` for attribution.
+``RangeAUC_volume_opt``. The methods are copied from upstream so results match
+the original ``vus.metrics.get_metrics`` exactly; the only local change is
+hoisting the per-threshold prediction masks out of the window loop in
+``RangeAUC_volume_opt`` (identical arrays, identical results, O(windowSize)
+times fewer full-series comparisons). See ``NOTICE`` for attribution.
 """
 
 from __future__ import annotations
@@ -89,9 +92,14 @@ class metricor:
         tp = np.zeros(thre)
         N_pred = np.zeros(thre)
 
-        for k, i in enumerate(np.linspace(0, len(score) - 1, thre).astype(int)):
-            threshold = score_sorted[i]
-            pred = score >= threshold
+        # The per-threshold prediction masks do not depend on `window`, so they
+        # are computed once here instead of `thre` times per window level (the
+        # upstream code recomputed `score >= threshold` inside the window loop).
+        # Same arrays, same order: results are bit-identical to the original.
+        threshold_positions = np.linspace(0, len(score) - 1, thre).astype(int)
+        pred_masks = [score >= score_sorted[i] for i in threshold_positions]
+
+        for k, pred in enumerate(pred_masks):
             N_pred[k] = np.sum(pred)
 
         for window in window_3d:
@@ -103,9 +111,7 @@ class metricor:
             Precision_list = np.ones(thre + 1)
             j = 0
 
-            for i in np.linspace(0, len(score) - 1, thre).astype(int):
-                threshold = score_sorted[i]
-                pred = score >= threshold
+            for pred in pred_masks:
                 labels = labels_extended.copy()
                 existence = 0
 

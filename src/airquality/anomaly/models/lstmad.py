@@ -8,7 +8,13 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from .common import BaseTimeSeriesAnomalyDetector, log_epoch, rolling_windows_nd, subsample_windows
+from .common import (
+    BaseTimeSeriesAnomalyDetector,
+    log_epoch,
+    resolve_training_stride,
+    rolling_windows_nd,
+    subsample_windows,
+)
 
 
 class LSTMADNet(nn.Module):
@@ -71,8 +77,8 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
         self.error_cov_inv_: np.ndarray | None = None
 
     def _resolve_training_stride(self, num_raw_windows: int) -> int:
-        """Mirror CARLABase's window-count cap so training cost stops scaling with series length."""
-        return max(1, -(-num_raw_windows // self.max_windows))
+        """Stride that keeps the training-window count near ``max_windows``."""
+        return resolve_training_stride(num_raw_windows, self.max_windows)
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Train the LSTM forecaster, then fit a Gaussian on its prediction errors."""

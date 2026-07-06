@@ -196,8 +196,16 @@ def _derive_context_before_gap(
     all_series_map: Mapping[str, pd.Series],
     scaler: Any | None,
     freq: str,
+    required_context: int | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Derive unscaled and scaled context before the gap starting at gap_start.
+
+    When ``required_context`` is given, the history is first trimmed to the
+    time window that can possibly feed a clean left context of that many grid
+    steps (``_build_clean_left_context`` never reads past the first NaN slot,
+    so anything earlier can only be dead weight). This avoids copying and
+    scaling the whole history once per gap; scaling is elementwise, so the
+    resulting context values are identical.
 
     Returns
     -------
@@ -212,7 +220,17 @@ def _derive_context_before_gap(
         downstream, which is worse than failing loudly.
     """
     full = all_series_map[series_name]
-    unscaled_context = full.loc[full.index < gap_start].copy()
+    unscaled_context = full.loc[full.index < gap_start]
+
+    if required_context is not None and len(unscaled_context) > 0:
+        # Clamp by the number of available points so the offset multiplication
+        # cannot overflow the Timestamp range (Prophet requests ~1e9 points).
+        span = min(int(required_context), len(unscaled_context))
+        earliest_needed = pd.Timestamp(gap_start) - span * to_offset(freq)
+        if unscaled_context.index[0] < earliest_needed:
+            unscaled_context = unscaled_context.loc[unscaled_context.index >= earliest_needed]
+
+    unscaled_context = unscaled_context.copy()
     if scaler is None or not hasattr(scaler, "transform") or len(unscaled_context) == 0:
         # An empty context is legitimate (gap at the series start): the caller
         # records it as a GapContextFailure after the min-context check.
@@ -389,6 +407,7 @@ class _DartsContextImputer:
                 all_series_map=all_series_map,
                 scaler=scaler if use_scaled else None,
                 freq=freq,
+                required_context=context_window,
             )
             context_series = scaled_context if use_scaled else unscaled_context
 
@@ -451,6 +470,13 @@ class DartsGlobalGapImputer(_DartsContextImputer):
 
     _uses_external_scaler = True
 
+    def __init__(self, model: Any, *, model_name: str = "") -> None:
+        """Wrap one pretrained Darts global model under a benchmark name."""
+        super().__init__(model, model_name=model_name)
+        #: Extra predict kwargs that succeeded last time; retried first so the
+        #: failing signature variants are not re-attempted on every gap.
+        self._predict_extra_kwargs: dict[str, Any] | None = None
+
     def _context_window(self) -> int:
         """Gather exactly the model's inferred minimum context before each gap."""
         return infer_darts_minimum_context(self._model)
@@ -478,6 +504,8 @@ class DartsGlobalGapImputer(_DartsContextImputer):
             warnings.simplefilter("ignore")
             predict_base_kwargs = {"n": int(n), "series": context_ts}
             predict_attempts: list[dict[str, Any]] = []
+            if self._predict_extra_kwargs is not None:
+                predict_attempts.append(self._predict_extra_kwargs)
             if config_workers:
                 worker_kwargs = dict(config_workers)
                 predict_attempts.append(
@@ -492,6 +520,7 @@ class DartsGlobalGapImputer(_DartsContextImputer):
             for extra_kwargs in predict_attempts:
                 try:
                     pred_ts = self._model.predict(**predict_base_kwargs, **extra_kwargs)
+                    self._predict_extra_kwargs = extra_kwargs
                     break
                 except TypeError as exc:
                     last_type_error = exc

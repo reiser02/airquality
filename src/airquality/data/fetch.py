@@ -55,6 +55,11 @@ def ejecutar_scraper() -> None:
 
     print(f"Iniciando captura masiva desde {fecha_inicio.date()}")
 
+    # Una sesion reutiliza la conexion TLS entre las ~100 peticiones en vez de
+    # renegociar el handshake por cada estacion x contaminante.
+    session = requests.Session()
+    session.verify = False
+
     for ent_id, nombre_corto in estaciones.items():
         ruta_sensor = base_dir / nombre_corto
         ruta_sensor.mkdir(parents=True, exist_ok=True)
@@ -83,7 +88,7 @@ def ejecutar_scraper() -> None:
             }
 
             try:
-                response = requests.post(url, json=payload, verify=False, timeout=60)
+                response = session.post(url, json=payload, timeout=60)
                 response.raise_for_status()
                 time.sleep(1)
                 data = response.json()

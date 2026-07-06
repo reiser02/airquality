@@ -18,7 +18,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from ..windowing import aggregate_window_scores
-from .common import BaseTimeSeriesAnomalyDetector, GenIASWindowGenerator, log_epoch, rolling_windows_nd, subsample_windows
+from .common import (
+    BaseTimeSeriesAnomalyDetector,
+    GenIASWindowGenerator,
+    log_epoch,
+    resize_delta,
+    resolve_training_stride,
+    rolling_windows_nd,
+    subsample_windows,
+)
 
 
 class CarlaAnomalyGenerator:
@@ -208,16 +216,6 @@ class CarlaGenIASGenerator(CarlaAnomalyGenerator):
         start = int(np.random.randint(0, max_start + 1)) if max_start > 0 else 0
         return start, start + target_length
 
-    @staticmethod
-    def _resize_delta(delta: Tensor, target_length: int) -> Tensor:
-        source_length = int(delta.shape[0])
-        if source_length == target_length:
-            return delta
-        if source_length == 1:
-            return delta.repeat(target_length, 1)
-        resized = F.interpolate(delta.transpose(0, 1).unsqueeze(0), size=target_length, mode="linear", align_corners=False)
-        return resized.squeeze(0).transpose(0, 1)
-
     def generate_window(self, window: Tensor) -> Tensor:
         batch = window.unsqueeze(0)
         patched_batch, mask_batch = self.backend.generate_batch(batch)
@@ -229,7 +227,7 @@ class CarlaGenIASGenerator(CarlaAnomalyGenerator):
         source_end = int(changed[-1].item()) + 1
         delta = patched[source_start:source_end] - window[source_start:source_end]
         target_start, target_end = self._select_target_span(int(window.shape[0]))
-        resized_delta = self._resize_delta(delta, target_end - target_start)
+        resized_delta = resize_delta(delta, target_end - target_start)
         anomalous = window.clone()
         anomalous[target_start:target_end] = anomalous[target_start:target_end] + resized_delta
         return anomalous
@@ -604,8 +602,8 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         return self.generator
 
     def _resolve_training_stride(self, num_raw_windows: int) -> int:
-        """Scale the training stride so window count stays near max_windows, mirroring how upstream CARLA picks a coarser stride (1/5/10) for longer per-dataset series instead of always taking one window per timestep."""
-        return max(1, -(-num_raw_windows // self.max_windows))
+        """Stride that keeps the training-window count near ``max_windows``."""
+        return resolve_training_stride(num_raw_windows, self.max_windows)
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Run the two CARLA stages: contrastive pretext, then head classification.
@@ -753,8 +751,11 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
             ts_repository_aug.reset()
         if real_aug:
             ts_repository.resize(3)
-        con_data = torch.empty((0,) + tuple(loader.dataset[0]["ts_org"].shape), dtype=torch.float32)
-        con_target = torch.empty(0, dtype=torch.long)
+        # Collect per-batch pieces and concatenate once at the end: repeated
+        # `torch.cat` on the accumulator copies everything gathered so far on
+        # every batch (quadratic time and memory churn).
+        con_data_parts: list[Tensor] = []
+        con_target_parts: list[Tensor] = []
         with torch.no_grad():
             for batch in loader:
                 ts_org = batch["ts_org"].float().to(self.device)
@@ -764,30 +765,42 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
                 if ts_repository_aug is not None:
                     ts_repository_aug.update(outputs, targets)
                 if real_aug:
-                    con_data = torch.cat((con_data, ts_org.cpu()), dim=0)
-                    con_target = torch.cat((con_target, targets.cpu()), dim=0)
+                    con_data_parts.append(ts_org.cpu())
+                    con_target_parts.append(targets.cpu())
                     ts_w_augment = batch["ts_w_augment"].float().to(self.device)
                     weak_targets = torch.full((ts_w_augment.shape[0],), 2, dtype=torch.long, device=self.device)
                     weak_outputs = model(ts_w_augment.transpose(1, 2))
                     ts_repository.update(weak_outputs, weak_targets)
                     ts_ss_augment = batch["ts_ss_augment"].float().to(self.device)
                     subseq_targets = torch.full((ts_ss_augment.shape[0],), 4, dtype=torch.long, device=self.device)
-                    con_data = torch.cat((con_data, ts_ss_augment.cpu()), dim=0)
-                    con_target = torch.cat((con_target, subseq_targets.cpu()), dim=0)
+                    con_data_parts.append(ts_ss_augment.cpu())
+                    con_target_parts.append(subseq_targets.cpu())
                     subseq_outputs = model(ts_ss_augment.transpose(1, 2))
                     ts_repository.update(subseq_outputs, subseq_targets)
                     if ts_repository_aug is not None:
                         ts_repository_aug.update(subseq_outputs, subseq_targets)
         if real_aug:
+            sample_shape = tuple(loader.dataset[0]["ts_org"].shape)
+            con_data = (
+                torch.cat(con_data_parts, dim=0)
+                if con_data_parts
+                else torch.empty((0, *sample_shape), dtype=torch.float32)
+            )
+            con_target = (
+                torch.cat(con_target_parts, dim=0)
+                if con_target_parts
+                else torch.empty(0, dtype=torch.long)
+            )
             return RepositoryAugmentedDataset(con_data, con_target)
         return None
 
     def _build_train_repository_dataset(self, pretext_dataset: PretextDataset) -> tuple[RepositoryAugmentedDataset, np.ndarray, np.ndarray]:
         base_loader = DataLoader(pretext_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
+        # Repositories stay on CPU: `update()` stores detached CPU copies and
+        # neighbor mining runs in NumPy, so device residency only wasted VRAM
+        # and transfers.
         repository_base = TSRepository(len(pretext_dataset), self.features_dim, self.num_clusters, self.temperature)
-        repository_base.to(self.device)
         repository_aug = TSRepository(len(pretext_dataset) * 2, self.features_dim, self.num_clusters, self.temperature)
-        repository_aug.to(self.device)
         repo_dataset = self._fill_ts_repository(
             base_loader,
             self.pretext_model,
@@ -807,7 +820,6 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         dataset = RepositoryAugmentedDataset(torch.from_numpy(val_windows), targets)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
         repository_val = TSRepository(len(val_windows), self.features_dim, self.num_clusters, self.temperature)
-        repository_val.to(self.device)
         self._fill_ts_repository(loader, self.pretext_model, repository_val, real_aug=False, ts_repository_aug=None)
         furthest_indices, nearest_indices = repository_val.furthest_nearest_neighbors(10)
         return nearest_indices, furthest_indices

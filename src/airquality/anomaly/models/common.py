@@ -18,6 +18,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .genias import GenIAS, GeniasLossConfig, compute_losses, patch_anomalies
@@ -90,31 +91,65 @@ def subsample_windows(windows: np.ndarray, max_windows: int, seed: int) -> np.nd
     return windows[indices]
 
 
-def aggregate_strided_scores(window_scores: np.ndarray, series_length: int, window_size: int, stride: int) -> np.ndarray:
-    """Average strided window scores back onto the original timeline."""
+def resolve_training_stride(num_raw_windows: int, max_windows: int) -> int:
+    """Scale the training stride so the window count stays near ``max_windows``.
 
-    totals = np.zeros(series_length, dtype=np.float64)
-    counts = np.zeros(series_length, dtype=np.float64)
-    for index, score in enumerate(window_scores):
-        start = index * stride
-        end = min(start + window_size, series_length)
-        totals[start:end] += float(score)
-        counts[start:end] += 1.0
-    counts[counts == 0.0] = 1.0
-    return (totals / counts).astype(np.float32)
+    Mirrors how upstream CARLA picks a coarser stride (1/5/10) for longer
+    per-dataset series instead of always taking one window per timestep; shared
+    by every windowed detector that caps its training windows.
+    """
+    return max(1, -(-num_raw_windows // max_windows))
+
+
+def resize_delta(delta: Tensor, target_length: int) -> Tensor:
+    """Linearly resample a ``[length, features]`` delta to ``target_length`` steps.
+
+    Used by the GenIAS-backed generators to splice a generated anomaly span
+    into a target span of a different length.
+    """
+    source_length = int(delta.shape[0])
+    if source_length == target_length:
+        return delta
+    if source_length == 1:
+        return delta.repeat(target_length, 1)
+    resized = F.interpolate(
+        delta.transpose(0, 1).unsqueeze(0), size=target_length, mode="linear", align_corners=False
+    )
+    return resized.squeeze(0).transpose(0, 1)
 
 
 def aggregate_tail_scores(window_scores: np.ndarray, series_length: int, window_size: int, tail_length: int) -> np.ndarray:
-    """Average window scores onto the trailing portion of each overlapping window."""
+    """Average window scores onto the trailing portion of each overlapping window.
 
+    Window ``s`` contributes its score to the last ``tail_length`` timesteps it
+    covers. For untruncated windows that tail is ``[s + window_size - tail,
+    s + window_size - 1]``, so the contributions per timestep form a contiguous
+    range of window starts and can be summed with a float64 prefix sum (O(n)).
+    Windows cut short by the series end (only possible when more windows than
+    ``series_length - window_size + 1`` are passed) keep the explicit loop.
+    """
+    scores = np.asarray(window_scores, dtype=np.float64)
+    n_windows = scores.shape[0]
+    tail = max(1, min(tail_length, window_size))
     totals = np.zeros(series_length, dtype=np.float64)
     counts = np.zeros(series_length, dtype=np.float64)
-    clamped_tail_length = max(1, min(tail_length, window_size))
-    for start, score in enumerate(window_scores):
+
+    full_limit = min(n_windows - 1, series_length - window_size)
+    if full_limit >= 0:
+        prefix = np.concatenate(([0.0], np.cumsum(scores[: full_limit + 1])))
+        positions = np.arange(series_length)
+        lo = np.maximum(positions - window_size + 1, 0)
+        hi = np.minimum(positions - window_size + tail, full_limit)
+        covered = hi >= lo
+        totals[covered] = prefix[hi[covered] + 1] - prefix[lo[covered]]
+        counts[covered] = hi[covered] - lo[covered] + 1
+
+    for start in range(max(full_limit + 1, 0), n_windows):
         end = min(start + window_size, series_length)
-        tail_start = max(start, end - clamped_tail_length)
-        totals[tail_start:end] += float(score)
+        tail_start = max(start, end - tail)
+        totals[tail_start:end] += scores[start]
         counts[tail_start:end] += 1.0
+
     counts[counts == 0.0] = 1.0
     return (totals / counts).astype(np.float32)
 

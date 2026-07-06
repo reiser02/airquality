@@ -28,12 +28,7 @@ from airquality.config import cfg_get_csv_list, cfg_get_float, cfg_get_int, cfg_
 from airquality.data.io import load_and_normalize_series
 from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
 from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
-from airquality.forecasting.fill import build_imputer, impute_series
-
-
-def _repo_root() -> Path:
-    """Return the repository root (three levels above ``src/airquality/forecasting/``)."""
-    return Path(__file__).resolve().parents[3]
+from airquality.forecasting.fill import _repo_root, build_imputer, impute_series
 
 
 def _build_output_dir() -> Path:

@@ -10,7 +10,6 @@ from darts import TimeSeries
 
 from airquality.imputation.benchmark import (
     _compute_gap_mase,
-    _compute_mase_denominator,
     _compute_metrics_on_mask,
     _gap_windows_to_mask_index,
     _normalize_series_collection,
@@ -204,11 +203,6 @@ def test_build_tspulse_context_frame_keeps_mask_nan_and_fills_real_gaps() -> Non
     assert y.drop(mask_index).notna().all()  # everything else filled
     assert y.loc[full.index[10]] == pytest.approx(10.0)  # real gap interpolated
     assert list(original_index) == list(full.index[24:])
-
-
-def test_compute_mase_denominator_returns_nan_when_too_short() -> None:
-    out = _compute_mase_denominator(_series([1.0, 2.0], name="S"), seasonality_m=2, freq="h")
-    assert math.isnan(out)
 
 
 def test_compute_metrics_on_mask_computes_selected_metrics() -> None:

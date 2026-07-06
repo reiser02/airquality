@@ -8,6 +8,7 @@ detectors sequentially). ``TSPulse`` is registered only when its optional
 
 from __future__ import annotations
 
+import inspect
 import warnings
 
 from .models import (
@@ -50,6 +51,19 @@ if TSPULSE_AVAILABLE:
 def resolve_model_class(model_name: str) -> type:
     """Return the detector class registered under ``model_name`` (KeyError if unknown)."""
     return MODEL_REGISTRY[model_name]
+
+
+def filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str, object]:
+    """Keep only kwargs the detector's ``__init__`` accepts (e.g. drop ``device``).
+
+    Shared by the anomaly benchmark and the production cleaning so both build
+    detectors from the same registry with the same construction rule.
+    """
+    parameters = inspect.signature(model_cls.__init__).parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+    valid = set(parameters) - {"self"}
+    return {key: value for key, value in kwargs.items() if key in valid}
 
 
 def resolve_model_names(model_names: list[str] | None) -> list[str]:

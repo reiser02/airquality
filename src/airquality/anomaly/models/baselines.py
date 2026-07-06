@@ -12,7 +12,6 @@ from typing import Any
 import warnings
 
 import numpy as np
-import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 
@@ -231,12 +230,38 @@ class HampelDetector(BaseGlobalAnomalyDetector):
         return np.max(np.stack(feature_scores, axis=1), axis=1).astype(np.float32)
 
     def _rolling_score(self, series: np.ndarray) -> np.ndarray:
-        """Score one feature: |x − rolling median| / (1.4826 · rolling MAD)."""
-        rolling = pd.Series(series).rolling(window=self.window_size, center=True, min_periods=1)
-        median = rolling.median().to_numpy()
-        mad = rolling.apply(lambda window: np.median(np.abs(window - np.median(window))), raw=True).to_numpy()
+        """Score one feature: |x − rolling median| / (1.4826 · rolling MAD).
+
+        Vectorized over the full interior windows with ``sliding_window_view``;
+        only the truncated edge windows (pandas ``center=True, min_periods=1``
+        semantics: window ``[i - w//2, i + (w-1) - w//2]`` clipped to bounds)
+        fall back to per-position medians. Computed in float64 like pandas'
+        rolling, so scores match the previous ``rolling.apply`` implementation.
+        """
+        values = np.asarray(series, dtype=np.float64)
+        n = values.size
+        w = int(self.window_size)
+        left = w // 2
+        right = w - 1 - left
+
+        median = np.empty(n, dtype=np.float64)
+        mad = np.empty(n, dtype=np.float64)
+        if n >= w:
+            windows = np.lib.stride_tricks.sliding_window_view(values, w)
+            med_full = np.median(windows, axis=1)
+            median[left : n - right] = med_full
+            mad[left : n - right] = np.median(np.abs(windows - med_full[:, None]), axis=1)
+            edge_positions = [*range(left), *range(n - right, n)]
+        else:
+            edge_positions = range(n)
+        for i in edge_positions:
+            chunk = values[max(0, i - left) : min(n, i + right + 1)]
+            center = np.median(chunk)
+            median[i] = center
+            mad[i] = np.median(np.abs(chunk - center))
+
         scale = np.maximum(1.4826 * mad, self.mad_epsilon)
-        return (np.abs(series - median) / scale).astype(np.float32)
+        return (np.abs(values - median) / scale).astype(np.float32)
 
 
 class Hampel6Detector(HampelDetector):

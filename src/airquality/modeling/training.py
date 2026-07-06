@@ -70,7 +70,7 @@ def build_scaled_train_val_series(
 
     for series_df in series_dfs:
         col = str(series_df.columns[0])
-        series = series_df.iloc[:, 0].astype(np.float32).copy()
+        series = series_df.iloc[:, 0].astype(np.float32)
         series.name = col
 
         ts = TimeSeries.from_series(series, freq="h")
@@ -149,7 +149,7 @@ def build_training_dataset_bundle(
             raise ValueError(f"Nombre de serie duplicado en `series_dfs`: {col}")
         seen_names.add(col)
 
-        series_full = series_df.iloc[:, 0].astype(np.float32).copy()
+        series_full = series_df.iloc[:, 0].astype(np.float32)
         series_full.name = col
 
         series_copy = series_full.copy()
@@ -202,9 +202,12 @@ def build_benchmark_dataset_bundle(
             raise ValueError(f"Nombre de serie duplicado en `series_dfs`: {col}")
         seen_names.add(col)
 
-        series_full = series_df.iloc[:, 0].astype(np.float32).copy()
+        # `astype` already returns a fresh copy; `series_full` is never mutated
+        # afterwards (the NaN masking happens on `series_copy`), so it can be
+        # stored in `all_series_unscaled` without further copies.
+        series_full = series_df.iloc[:, 0].astype(np.float32)
         series_full.name = col
-        all_series_unscaled[col] = series_full.copy()
+        all_series_unscaled[col] = series_full
 
         series_copy = series_full.copy()
         if col in longest_segment.columns:
@@ -238,9 +241,9 @@ def build_benchmark_dataset_bundle(
             )
         seen_names.add(col)
 
-        series_full = series_raw.astype(np.float32).copy()
+        series_full = series_raw.astype(np.float32)
         series_full.name = col
-        all_series_unscaled[col] = series_full.copy()
+        all_series_unscaled[col] = series_full
 
         split_idx = int(len(series_full) * float(test_only_train_fraction))
         split_idx = max(1, min(split_idx, len(series_full) - 1))
@@ -271,7 +274,7 @@ def build_benchmark_dataset_bundle(
         dict_scalers=dict_scalers,
         valid_cols=valid_cols,
         all_series_unscaled={
-            col: all_series_unscaled[col].copy()
+            col: all_series_unscaled[col]
             for col in valid_cols
             if col in all_series_unscaled
         },
