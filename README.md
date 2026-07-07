@@ -221,13 +221,22 @@ This uses `src/airquality/data/fetch.py`.
 uv run python -m airquality.data.fetch
 ```
 
+Options:
+
+```bash
+uv run python -m airquality.data.fetch --query hourly --pollutants CO NO2 PM10 O3 PM1 PM2.5 --start-date 2026-06-12
+```
+
 What it does:
 
 - requests station data from the Cartagena API
-- fetches `CO`, `NO2`, `PM10`, and `O3`
+- defaults to raw 5-minute data from `2024-01-01`
+- fetches `CO`, `NO2`, `PM10`, and `O3` by default
+- can fetch hourly SQL averages with `--query hourly`
+- accepts pollutant lists with `--pollutants`; `PM2.5` and `PM2_5` are normalized to `PM25`
 - saves per-station CSV files under `datos_estaciones/`
 
-This scraper uses hard-coded stations and date defaults inside the module, so change the file if you need different stations, pollutant lists, or date ranges.
+Stations are still defined inside the module; use CLI args for query mode, pollutant lists, and the start date.
 
 ## Programmatic Usage
 
@@ -244,6 +253,7 @@ benchmark_artifacts = run_benchmark_from_config()
 Useful lower-level modules:
 
 - `airquality.data.io.load_and_normalize_series()` for loading configured datasets
+- `airquality.data.fetch.ejecutar_scraper(contaminantes=[...], fecha_inicio=..., query="hourly")` for scraping from Python
 - `airquality.data.segments.get_longest_segment()` for the held-out block selection
 - `airquality.modeling.training.build_training_dataset_bundle()` for train/validation construction
 - `airquality.imputation.run_benchmark.run_imputation_benchmark_parallel()` for direct benchmark orchestration

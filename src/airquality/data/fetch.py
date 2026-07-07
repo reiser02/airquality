@@ -1,21 +1,68 @@
 """Download pollutant measurements from the Cartagena data API."""
 
-import requests
-import pandas as pd
-import urllib3
+import argparse
+import re
 import time
 from datetime import datetime
 from pathlib import Path
 
-# El certificado TLS de pma.ayto-cartagena.es sirve una cadena incompleta
-# (falta el intermedio), así que la verificación estándar falla. Por eso las
-# peticiones usan `verify=False` y se silencia el InsecureRequestWarning.
-# Verificado el 2026-07-03: `curl` devuelve "unable to get local issuer
-# certificate". Si el ayuntamiento arregla la cadena, eliminar ambas cosas.
+import pandas as pd
+import requests
+import urllib3
+
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-def ejecutar_scraper() -> None:
+DEFAULT_POLLUTANTS = ["CO", "NO2", "PM10", "O3"]
+DEFAULT_START_DATE = datetime(2024, 1, 1)
+POLLUTANT_ALIASES = {"PM2.5": "PM25", "PM2_5": "PM25"}
+
+
+def _parse_date(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _normalize_pollutants(values: list[str]) -> list[str]:
+    pollutants: list[str] = []
+    for value in values:
+        for item in value.split(","):
+            pollutant = POLLUTANT_ALIASES.get(item.strip().upper(), item.strip().upper())
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", pollutant):
+                raise ValueError(f"Contaminante no valido para SQL: {item!r}")
+            pollutants.append(pollutant)
+    return pollutants
+
+
+def _build_stmt(cont: str, query: str) -> str:
+    if query == "hourly":
+        return f"""
+        SELECT date_trunc('hour', time_index) AS time,
+        avg({cont}) AS "{cont}"
+        FROM mtairquality.etairqualityobserved
+        WHERE time_index >= floor(try_cast(? AS BIGINT) / 3600000) * 3600000
+        AND time_index <= floor(try_cast(? AS BIGINT) / 3600000) * 3600000
+        AND entity_id = ?
+        AND {cont} >= 0 AND {cont} < 100000
+        GROUP BY time
+        ORDER BY time ASC
+        """
+    return f"""
+    SELECT time_index AS time,
+    {cont} AS "{cont}"
+    FROM mtairquality.etairqualityobserved
+    WHERE time_index >= ? AND time_index <= ?
+    AND entity_id = ?
+    AND {cont} >= 0 AND {cont} < 100000
+    ORDER BY 1 ASC
+    """
+
+
+def ejecutar_scraper(
+    contaminantes: list[str] | None = None,
+    fecha_inicio: datetime | None = None,
+    query: str = "5min",
+) -> None:
     """Fetch all configured station pollutants and save them as CSV files."""
     estaciones = {
         "urn:ngsi:AirQualityObserved:HOP94e6867be9fa": "Aquatec - Calle Jorge Juan",
@@ -46,17 +93,16 @@ def ejecutar_scraper() -> None:
         "urn:ngsi:AirQualityObserved:HOPa842e389da1e": "AQ1 BusCT",
     }
 
-    contaminantes = ["CO", "NO2", "PM10", "O3"]
-    fecha_inicio = datetime(2024, 1, 1)
+    contaminantes = contaminantes or DEFAULT_POLLUTANTS
+    fecha_inicio = fecha_inicio or DEFAULT_START_DATE
     fecha_fin = datetime.now()
 
     url = "https://pma.ayto-cartagena.es/visualizador/api/datasources/proxy/1/_sql"
     base_dir = Path("datos_estaciones")
 
-    print(f"Iniciando captura masiva desde {fecha_inicio.date()}")
+    print(f"Iniciando captura masiva {query} desde {fecha_inicio.date()}")
 
-    # Una sesion reutiliza la conexion TLS entre las ~100 peticiones en vez de
-    # renegociar el handshake por cada estacion x contaminante.
+
     session = requests.Session()
     session.verify = False
 
@@ -67,19 +113,8 @@ def ejecutar_scraper() -> None:
         print(f"\n Procesando: {nombre_corto}")
 
         for cont in contaminantes:
-            # SQL Query
-            stmt = f"""
-            SELECT time_index AS time,
-            {cont} AS "{cont}"
-            FROM mtairquality.etairqualityobserved
-            WHERE time_index >= ? AND time_index <= ?
-            AND entity_id = ?
-            AND {cont} >= 0 AND {cont} < 100000
-            ORDER BY 1 ASC
-            """
-
             payload = {
-                "stmt": stmt,
+                "stmt": _build_stmt(cont, query),
                 "args": [
                     int(fecha_inicio.timestamp() * 1000),
                     int(fecha_fin.timestamp() * 1000),
@@ -97,9 +132,10 @@ def ejecutar_scraper() -> None:
                     df = pd.DataFrame(data["rows"], columns=["fecha", cont])
                     df["fecha"] = pd.to_datetime(df["fecha"], unit="ms")
                     df = df.sort_values("fecha")
-                    df["fecha"] = df["fecha"].dt.floor("5min")
+                    freq = "h" if query == "hourly" else "5min"
+                    df["fecha"] = df["fecha"].dt.floor(freq)
                     df = df.drop_duplicates(subset="fecha", keep="first")
-                    df = df.set_index("fecha").asfreq("5min")
+                    df = df.set_index("fecha").asfreq(freq)
 
                     # Nombre del archivo: nombreSensor_CONTAMINANTE.csv
                     nombre_archivo = f"{nombre_corto}_{cont}.csv"
@@ -114,5 +150,33 @@ def ejecutar_scraper() -> None:
                 print(f"  Error en {cont}: {e}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--query",
+        choices=["5min", "hourly"],
+        default="5min",
+        help="Consulta cruda a 5 minutos o media horaria en SQL.",
+    )
+    parser.add_argument(
+        "--pollutants",
+        nargs="+",
+        default=DEFAULT_POLLUTANTS,
+        help="Contaminantes separados por espacios o comas. PM2.5 se normaliza a PM25.",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=_parse_date,
+        default=DEFAULT_START_DATE,
+        help="Fecha inicial ISO, por ejemplo 2024-01-01.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    ejecutar_scraper()
+    args = _parse_args()
+    ejecutar_scraper(
+        contaminantes=_normalize_pollutants(args.pollutants),
+        fecha_inicio=args.start_date,
+        query=args.query,
+    )
