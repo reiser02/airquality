@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pollution"
 version = "0.1.0"
@@ -30,6 +34,9 @@ dependencies = [
 # Our suite lives in tests/. The vendored `genias/` project ships its own tests
 # and its own env, so keep it out of `uv run pytest` at the repo root.
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu118" }
