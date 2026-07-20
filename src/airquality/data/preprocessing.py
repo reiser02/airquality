@@ -10,7 +10,7 @@ media, no minimizar NaN. Frente al AVG del SQL se anaden tres reglas:
 
 - la media usa SOLO lecturas por encima del umbral (no la basura cercana a 0),
 - exige al menos ``MIN_USEFUL`` lecturas utiles en la hora (cobertura minima),
-- los tramos congelados (sensor atascado) se ponen a 0 antes de promediar.
+- los tramos congelados (sensor atascado) se excluyen antes de promediar.
 
 Como el SQL no hace nada de esto (media simple, sin minimo de lecturas, sin
 tratamiento de congelados sub-horarios), estas reglas pueden dejar MAS NaN que
@@ -28,8 +28,8 @@ from airquality.data.series import ensure_datetime_series
 
 # Limites de deteccion por contaminante (mismas unidades que los datos crudos).
 DETECTION_LIMITS = {
-    "CO": 6.0,
-    "NO2": 3.762,
+    "CO": 0.0,
+    "NO2": 0.0,
 }
 
 RAW_FREQ = "5min"
@@ -41,17 +41,14 @@ MIN_USEFUL = 3   # lecturas utiles minimas en la hora para calcular la media
 def frozen_mask(series: pd.Series, min_run: int = MIN_RUN) -> pd.Series:
     """Marca (True) tramos de valores identicos consecutivos de longitud >= min_run.
 
-    Los NaN no rompen ni alargan un tramo (se ignoran al comparar). Con datos de
-    5 min, ``min_run=6`` equivale a 30 minutos de sensor atascado.
+    Los NaN rompen el tramo. Con datos de 5 min, ``min_run=6`` equivale a 30
+    minutos continuos de sensor atascado.
     """
-    mask = pd.Series(False, index=series.index)
-    valid = series.dropna()
-    if valid.empty:
-        return mask
-    block = (valid != valid.shift()).cumsum()
-    run_len = block.map(block.value_counts())
-    mask.loc[valid.index[run_len >= min_run]] = True
-    return mask
+    valid = series.notna()
+    same_as_previous = valid & series.shift().notna() & series.eq(series.shift())
+    block = (~same_as_previous).cumsum()
+    run_len = valid.groupby(block).transform("sum")
+    return valid & run_len.ge(min_run)
 
 
 def hourly_mean(
@@ -64,19 +61,16 @@ def hourly_mean(
     """Media horaria a partir de datos de 5 minutos.
 
     Se fija la frecuencia a 5 min (12 ranuras por hora; los huecos pasan a NaN).
-    Los valores congelados se ponen a 0 para que caigan por debajo del umbral.
-    Una lectura es "util" si supera el umbral. Si al menos ``min_useful`` lecturas
-    de la hora son utiles, la media se calcula con ESAS; si no, la hora es NaN.
+    Una lectura es "util" si supera el umbral y no pertenece a un tramo
+    congelado. Si al menos ``min_useful`` lecturas de la hora son utiles, la
+    media se calcula con ESAS; si no, la hora es NaN.
     """
     threshold = DETECTION_LIMITS[pollutant]
     col = df.columns[0]
     series = ensure_datetime_series(df[col], freq=RAW_FREQ, name=col)
 
-    # Congelados -> 0: asi cuentan como por debajo del umbral.
-    series = series.mask(frozen_mask(series, min_run=min_run), 0)
-
     hour = series.index.floor(HOURLY_FREQ)
-    is_useful = series >= threshold
+    is_useful = (series >= threshold) & ~frozen_mask(series, min_run=min_run)
 
     n_useful = is_useful.groupby(hour).sum()
     mean_useful = series.where(is_useful).groupby(hour).mean()
@@ -93,17 +87,17 @@ def preprocess(
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
 ):
-    """Pipeline completo: 5 min -> media horaria -> eliminacion de congelados.
+    """Pipeline completo: 5 min -> media horaria -> marcado de congelados.
 
     Para cada estacion calcula la media horaria (:func:`hourly_mean`, que ya
-    garantiza valor >= umbral o NaN) y elimina los congelados a nivel horario:
-    toda fila igual a la anterior (repeticion consecutiva) se descarta y se
+    garantiza valor >= umbral o NaN) y marca los congelados a nivel horario:
+    toda fila igual a la anterior (repeticion consecutiva) pasa a NaN y se
     conserva la primera de cada bloque. No hace falta filtrar por umbral (la
     media nunca queda por debajo) ni los NaN (no estorban al comparar ni aguas
     abajo, donde se vuelve a re-rejillar).
 
     Devuelve las series horarias limpias y el numero de filas congeladas
-    eliminadas por estacion.
+    marcadas por estacion.
     """
     processed = []
     frozen_counts = []
@@ -116,6 +110,7 @@ def preprocess(
         # (NaN != NaN), asi que solo caen las repeticiones reales de valor.
         is_frozen = col == col.shift()
         frozen_counts.append(int(is_frozen.sum()))
-        processed.append(hourly[~is_frozen])
+        hourly.loc[is_frozen, hourly.columns[0]] = pd.NA
+        processed.append(hourly)
 
     return processed, frozen_counts

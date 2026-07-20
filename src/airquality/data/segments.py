@@ -13,7 +13,10 @@ def contiguous_observed_segments(series: pd.Series, min_len: int = 1) -> list[pd
     daily phase would jump (e.g. 08:00 stitched to 17:00 of another day).
     """
     observed = series.notna()
-    block_ids = (observed != observed.shift()).cumsum()
+    boundaries = observed != observed.shift()
+    if isinstance(series.index, pd.DatetimeIndex):
+        boundaries |= series.index.to_series().diff().ne(pd.Timedelta(hours=1))
+    block_ids = boundaries.cumsum()
     return [
         series.loc[block.index]
         for _, block in observed.groupby(block_ids)

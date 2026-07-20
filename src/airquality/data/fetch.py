@@ -62,6 +62,7 @@ def ejecutar_scraper(
     contaminantes: list[str] | None = None,
     fecha_inicio: datetime | None = None,
     query: str = "5min",
+    output_dir: str | Path = "datos_estaciones",
 ) -> None:
     """Fetch all configured station pollutants and save them as CSV files."""
     estaciones = {
@@ -98,56 +99,56 @@ def ejecutar_scraper(
     fecha_fin = datetime.now()
 
     url = "https://pma.ayto-cartagena.es/visualizador/api/datasources/proxy/1/_sql"
-    base_dir = Path("datos_estaciones")
+    base_dir = Path(output_dir)
 
     print(f"Iniciando captura masiva {query} desde {fecha_inicio.date()}")
 
 
-    session = requests.Session()
-    session.verify = False
+    with requests.Session() as session:
+        session.verify = False
 
-    for ent_id, nombre_corto in estaciones.items():
-        ruta_sensor = base_dir / nombre_corto
-        ruta_sensor.mkdir(parents=True, exist_ok=True)
+        for ent_id, nombre_corto in estaciones.items():
+            ruta_sensor = base_dir / nombre_corto
+            ruta_sensor.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n Procesando: {nombre_corto}")
+            print(f"\n Procesando: {nombre_corto}")
 
-        for cont in contaminantes:
-            payload = {
-                "stmt": _build_stmt(cont, query),
-                "args": [
-                    int(fecha_inicio.timestamp() * 1000),
-                    int(fecha_fin.timestamp() * 1000),
-                    ent_id,
-                ],
-            }
+            for cont in contaminantes:
+                payload = {
+                    "stmt": _build_stmt(cont, query),
+                    "args": [
+                        int(fecha_inicio.timestamp() * 1000),
+                        int(fecha_fin.timestamp() * 1000),
+                        ent_id,
+                    ],
+                }
 
-            try:
-                response = session.post(url, json=payload, timeout=60)
-                response.raise_for_status()
-                time.sleep(1)
-                data = response.json()
+                try:
+                    response = session.post(url, json=payload, timeout=60)
+                    response.raise_for_status()
+                    time.sleep(1)
+                    data = response.json()
 
-                if "rows" in data and data["rows"]:
-                    df = pd.DataFrame(data["rows"], columns=["fecha", cont])
-                    df["fecha"] = pd.to_datetime(df["fecha"], unit="ms")
-                    df = df.sort_values("fecha")
-                    freq = "h" if query == "hourly" else "5min"
-                    df["fecha"] = df["fecha"].dt.floor(freq)
-                    df = df.drop_duplicates(subset="fecha", keep="first")
-                    df = df.set_index("fecha").asfreq(freq)
+                    if "rows" in data and data["rows"]:
+                        df = pd.DataFrame(data["rows"], columns=["fecha", cont])
+                        df["fecha"] = pd.to_datetime(df["fecha"], unit="ms")
+                        df = df.sort_values("fecha")
+                        freq = "h" if query == "hourly" else "5min"
+                        df["fecha"] = df["fecha"].dt.floor(freq)
+                        df = df.drop_duplicates(subset="fecha", keep="first")
+                        df = df.set_index("fecha").asfreq(freq)
 
-                    # Nombre del archivo: nombreSensor_CONTAMINANTE.csv
-                    nombre_archivo = f"{nombre_corto}_{cont}.csv"
-                    df.to_csv(ruta_sensor / nombre_archivo)
-                    print(f"  {cont}: {len(df)} filas guardadas.")
-                else:
-                    print(f"  {cont}: No se encontraron datos.")
+                        # Nombre del archivo: nombreSensor_CONTAMINANTE.csv
+                        nombre_archivo = f"{nombre_corto}_{cont}.csv"
+                        df.to_csv(ruta_sensor / nombre_archivo)
+                        print(f"  {cont}: {len(df)} filas guardadas.")
+                    else:
+                        print(f"  {cont}: No se encontraron datos.")
 
-            except requests.exceptions.HTTPError as e:
-                print(f"  Error HTTP en {cont}: {e}")
-            except Exception as e:
-                print(f"  Error en {cont}: {e}")
+                except requests.exceptions.HTTPError as e:
+                    print(f"  Error HTTP en {cont}: {e}")
+                except Exception as e:
+                    print(f"  Error en {cont}: {e}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -170,6 +171,12 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_START_DATE,
         help="Fecha inicial ISO, por ejemplo 2024-01-01.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("datos_estaciones"),
+        help="Directorio donde se guardan los CSV por estacion.",
+    )
     return parser.parse_args()
 
 
@@ -179,4 +186,5 @@ if __name__ == "__main__":
         contaminantes=_normalize_pollutants(args.pollutants),
         fecha_inicio=args.start_date,
         query=args.query,
+        output_dir=args.output_dir,
     )
