@@ -34,20 +34,20 @@ def test_frozen_mask_ignores_short_runs() -> None:
     assert not frozen_mask(s, min_run=6).any()
 
 
-def test_frozen_mask_skips_nan_when_measuring_run() -> None:
-    # Los NaN no rompen el tramo: siguen siendo seis 2.0 "consecutivos".
+def test_frozen_mask_nan_breaks_run() -> None:
+    # Ninguno de los tres tramos separados por NaN alcanza min_run.
     s = pd.Series([2.0, 2.0, np.nan, 2.0, 2.0, np.nan, 2.0, 2.0])
-    assert int(frozen_mask(s, min_run=6).sum()) == 6
+    assert not frozen_mask(s, min_run=6).any()
 
 
 # --- hourly_mean ---------------------------------------------------------
 
 
 def test_hourly_mean_averages_only_useful_readings() -> None:
-    # 6 utiles (>=3.762) y 6 basura: media solo de las utiles.
+    # Con el limite actual (0), todas las lecturas no congeladas son utiles.
     vals = [8.52, 6.79, 7.40, 5.81, 4.09, 3.90, 1.0, 1.0, 1.0, 1.88, 1.1, 1.88]
     out = hourly_mean(_series_5m(vals), "NO2")["NO2"]
-    expected = np.mean([8.52, 6.79, 7.40, 5.81, 4.09, 3.90])
+    expected = np.mean(vals)
     assert out.notna().sum() == 1
     assert out.iloc[0] == round(expected, 10) or abs(out.iloc[0] - expected) < 1e-9
 
@@ -94,14 +94,15 @@ def test_preprocess_rescues_hour_a_simple_mean_would_drop() -> None:
     assert count == 0
 
 
-def test_preprocess_drops_consecutive_frozen_hours() -> None:
+def test_preprocess_preserves_frozen_hour_as_nan() -> None:
     # Hora 1: 6 utiles -> media. Hora 2: misma media (congelado horario).
     block = [8.52, 6.79, 7.40, 5.81, 4.09, 3.90, 1.0, 1.0, 1.0, 1.88, 1.1, 1.88]
     df = _series_5m(block * 2)  # dos horas identicas
     (out,), (count,) = preprocess([df], "NO2")
-    col = out[out.columns[0]].dropna()
-    # La segunda hora (repeticion) cae; no quedan duplicados consecutivos.
-    assert (col == col.shift()).sum() == 0
+    expected_index = pd.date_range("2024-01-01", periods=2, freq="h")
+    assert out.index.equals(expected_index)
+    assert out.iloc[0, 0] == pytest.approx(np.mean(block))
+    assert pd.isna(out.iloc[1, 0])
     assert count == 1
 
 
