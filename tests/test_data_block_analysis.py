@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from airquality.data.block_analysis import (
-    _training_window,
+    _worst_case_requirements,
     classify_blocks,
     observed_blocks,
     run_analysis,
@@ -31,6 +31,7 @@ def test_observed_blocks_and_validation_chronology() -> None:
         blocks,
         {"short": 80, "long": 120},
         validation_hours={"short": 48, "long": 96},
+        host_minimum_hours={"short": 128, "long": 216},
     )
 
     # Short can validate on the newest block; long must validate on the older
@@ -45,15 +46,22 @@ def test_observed_blocks_and_validation_chronology() -> None:
     series_summary = pd.DataFrame(
         {
             "pollutant": ["NO2"],
+            "forecast_models": ["NLinear, TiDE"],
             "short_minimum_hours": [80],
             "short_horizon_hours": [8],
             "short_stride_hours": [4],
+            "short_limiting_models": ["NLinear/TiDE"],
+            "short_requested_validation_hours": [48],
+            "short_validation_reserve_hours": [48],
             "short_validation_forecasts": [11],
             "short_host_minimum_hours": [128],
             "short_validation_hours": [48],
             "long_minimum_hours": [120],
             "long_horizon_hours": [48],
             "long_stride_hours": [24],
+            "long_limiting_models": ["NLinear/TiDE"],
+            "long_requested_validation_hours": [96],
+            "long_validation_reserve_hours": [96],
             "long_validation_forecasts": [3],
             "long_host_minimum_hours": [216],
             "long_validation_hours": [96],
@@ -78,23 +86,26 @@ def test_contiguous_observed_segments_splits_missing_hour() -> None:
     assert [segment.tolist() for segment in segments] == [[1.0, 2.0], [3.0, 4.0]]
 
 
-def test_training_window_reserves_complete_test_block() -> None:
-    index = pd.date_range("2024-01-01", periods=500, freq="h")
-    series = pd.Series(range(500), index=index, dtype=float)
-    series.iloc[168:180] = None
-
-    train, details = _training_window(
-        series,
-        holdout=192,
+def test_worst_case_requirements_use_native_model_geometry() -> None:
+    requirements = _worst_case_requirements(
+        ("TCN", "RNN"),
         context=72,
-        host_minimum=168,
-        test_alignment=48,
+        horizons={"short": 8, "long": 48},
+        strides={"short": 4, "long": 24},
+        validation_hours={"short": 48, "long": 96},
+        seasonality_m=24,
     )
 
-    assert train is not None and train.index[-1] == index[179]
-    assert train.last_valid_index() == index[167]
-    assert details["test_block_start"] == index[180]
-    assert details["test_hours"] == 240
+    assert requirements["short"] == {
+        "minimum_hours": 80,
+        "prediction_context_hours": 72,
+        "host_minimum_hours": 152,
+        "validation_hours": 72,
+        "validation_forecasts": 1,
+        "limiting_models": "TCN",
+    }
+    assert requirements["long"]["host_minimum_hours"] == 216
+    assert requirements["long"]["limiting_models"] == "TCN"
 
 
 def test_analysis_rejects_validation_shorter_than_horizon(tmp_path) -> None:

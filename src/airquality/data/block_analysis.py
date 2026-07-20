@@ -26,9 +26,15 @@ from airquality.anomaly.presentation import (
     GRID_COLOR,
     TEXT_COLOR,
 )
+from airquality.config import cfg_get_csv_list, cfg_get_int
 from airquality.data.loaders import load_raw_5m
 from airquality.data.preprocessing import MIN_RUN, MIN_USEFUL, preprocess
 from airquality.data.series import ensure_datetime_series
+from airquality.forecasting.backtest import (
+    get_forecast_model_requirements,
+    select_holdout_window,
+)
+from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.paths import create_run_dir
 
 SHORT_COLOR = "#3d7ab5"
@@ -51,10 +57,78 @@ def observed_blocks(series: pd.Series) -> pd.DataFrame:
     )
 
 
+def _worst_case_requirements(
+    model_names: tuple[str, ...],
+    *,
+    context: int,
+    horizons: dict[str, int],
+    strides: dict[str, int],
+    validation_hours: dict[str, int],
+    seasonality_m: int,
+) -> dict[str, dict[str, object]]:
+    """Return conservative native geometry among configured forecast models."""
+    if not model_names:
+        raise ValueError("Debe configurarse al menos un modelo de forecasting")
+
+    configs = resolve_forecasting_model_configs(
+        list(model_names), seasonality_m=seasonality_m, context_length=context
+    )
+    out: dict[str, dict[str, object]] = {}
+    for regime, horizon in horizons.items():
+        candidates = []
+        for name, config in configs.items():
+            native = get_forecast_model_requirements(
+                config,
+                size_k=horizon,
+                seasonality_m=seasonality_m,
+                context_len=context,
+            )
+            reserve = (
+                max(validation_hours[regime], native.validation_target_length)
+                if native.validation_target_offset is not None
+                else 0
+            )
+            candidates.append(
+                {
+                    "model": name,
+                    "minimum": native.min_train_series_length,
+                    "prediction_context": native.prediction_context_length,
+                    "reserve": reserve,
+                    "host": native.min_train_series_length + reserve,
+                    "validation_forecasts": (
+                        (reserve - native.validation_target_length) // strides[regime] + 1
+                        if reserve
+                        else 0
+                    ),
+                }
+            )
+
+        host_minimum = max(int(item["host"]) for item in candidates)
+        limiting = [item for item in candidates if item["host"] == host_minimum]
+        validation_reserve = max(int(item["reserve"]) for item in candidates)
+        validation_limiting = [
+            item for item in candidates if item["reserve"] == validation_reserve
+        ]
+        out[regime] = {
+            "minimum_hours": max(int(item["minimum"]) for item in candidates),
+            "prediction_context_hours": max(
+                int(item["prediction_context"]) for item in candidates
+            ),
+            "host_minimum_hours": host_minimum,
+            "validation_hours": validation_reserve,
+            "validation_forecasts": min(
+                int(item["validation_forecasts"]) for item in validation_limiting
+            ),
+            "limiting_models": "/".join(str(item["model"]) for item in limiting),
+        }
+    return out
+
+
 def classify_blocks(
     blocks: pd.DataFrame,
     regimes: dict[str, int],
     validation_hours: dict[str, int],
+    host_minimum_hours: dict[str, int],
 ) -> pd.DataFrame:
     """Mark eligible, validation-host, and chronologically usable blocks."""
     out = blocks.copy()
@@ -63,7 +137,7 @@ def classify_blocks(
     for regime, minimum in regimes.items():
         validation = validation_hours[regime]
         eligible = out["hours"].ge(minimum)
-        host_capable = out["hours"].ge(minimum + validation)
+        host_capable = out["hours"].ge(host_minimum_hours[regime])
         out[f"{regime}_eligible"] = eligible
         out[f"{regime}_host_capable"] = host_capable
         out[f"{regime}_validation_host"] = False
@@ -83,43 +157,6 @@ def classify_blocks(
     return out
 
 
-def _training_window(
-    series: pd.Series,
-    *,
-    holdout: int,
-    context: int,
-    host_minimum: int,
-    test_alignment: int,
-) -> tuple[pd.Series | None, dict[str, object]]:
-    blocks = observed_blocks(series)
-    details: dict[str, object] = {
-        "full_blocks": len(blocks),
-        "full_observed_hours": int(series.notna().sum()),
-        "max_full_block": int(blocks["hours"].max()) if not blocks.empty else 0,
-    }
-    for i in range(len(blocks) - 1, -1, -1):
-        test_block = blocks.iloc[i]
-        test_hours = ((int(test_block["hours"]) - context) // test_alignment) * test_alignment
-        if test_hours < holdout:
-            continue
-        if not blocks.iloc[:i]["hours"].ge(host_minimum).any():
-            continue
-
-        test_block_start = pd.Timestamp(test_block["start"])
-        holdout_end = pd.Timestamp(test_block["end"])
-        holdout_start = holdout_end - pd.Timedelta(hours=test_hours - 1)
-        train = series.loc[: test_block_start - pd.Timedelta(hours=1)]
-        return train, details | {
-            "test_block_start": test_block_start,
-            "holdout_start": holdout_start,
-            "holdout_end": holdout_end,
-            "test_hours": test_hours,
-            "prior_observed_hours": int(train.notna().sum()),
-        }
-
-    return None, details | {"exclusion_reason": "no_test_and_validation_host_pair"}
-
-
 def analyze_raw_blocks(
     base_dir: str | Path,
     pollutants: tuple[str, ...],
@@ -135,6 +172,8 @@ def analyze_raw_blocks(
     test_alignment: int,
     min_run: int,
     min_useful: int,
+    forecast_models: tuple[str, ...],
+    seasonality_m: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build per-block, per-series, and excluded-series audit tables."""
     regimes = {"short": context + short_horizon, "long": context + long_horizon}
@@ -147,6 +186,29 @@ def analyze_raw_blocks(
         for regime in regimes
     ):
         raise ValueError("Horizonte, stride y validacion de cada regimen deben ser validos")
+    requirements = _worst_case_requirements(
+        forecast_models,
+        context=context,
+        horizons=horizons,
+        strides=strides,
+        validation_hours=validation_hours,
+        seasonality_m=seasonality_m,
+    )
+    regimes = {
+        regime: int(requirements[regime]["minimum_hours"]) for regime in requirements
+    }
+    host_minimum_hours = {
+        regime: int(requirements[regime]["host_minimum_hours"])
+        for regime in requirements
+    }
+    validation_reserves = {
+        regime: int(requirements[regime]["validation_hours"])
+        for regime in requirements
+    }
+    prediction_context = max(
+        int(requirements[regime]["prediction_context_hours"])
+        for regime in requirements
+    )
     block_frames: list[pd.DataFrame] = []
     series_rows: list[dict[str, object]] = []
     excluded_rows: list[dict[str, object]] = []
@@ -163,20 +225,48 @@ def analyze_raw_blocks(
             series = ensure_datetime_series(
                 hourly.iloc[:, 0], freq="h", name=f"{station}/{pollutant}"
             )
-            train, details = _training_window(
+            full_blocks = observed_blocks(series)
+            details: dict[str, object] = {
+                "full_blocks": len(full_blocks),
+                "full_observed_hours": int(series.notna().sum()),
+                "max_full_block": (
+                    int(full_blocks["hours"].max()) if not full_blocks.empty else 0
+                ),
+            }
+            window = select_holdout_window(
                 series,
                 holdout=holdout,
-                context=context,
-                host_minimum=max(
-                    regimes[regime] + validation_hours[regime] for regime in regimes
-                ),
+                context_len=prediction_context,
+                train_min_len=max(regimes.values()),
+                validation_len=max(validation_hours.values()),
+                host_min_len=max(host_minimum_hours.values()),
                 test_alignment=test_alignment,
             )
-            if train is None:
-                excluded_rows.append({"pollutant": pollutant, "station": station} | details)
+            if window is None:
+                excluded_rows.append(
+                    {"pollutant": pollutant, "station": station}
+                    | details
+                    | {"exclusion_reason": "no_test_and_validation_host_pair"}
+                )
                 continue
 
-            blocks = classify_blocks(observed_blocks(train), regimes, validation_hours)
+            train = series.loc[window["train_index"]]
+            details |= {
+                "test_block_start": window["test_block_start"],
+                "holdout_start": window["holdout_start"],
+                "holdout_end": window["holdout_end"],
+                "test_hours": window["test_hours"],
+                "prior_observed_hours": int(train.notna().sum()),
+            }
+            training_blocks = full_blocks.loc[
+                full_blocks["end"].lt(window["test_block_start"])
+            ].reset_index(drop=True)
+            blocks = classify_blocks(
+                training_blocks,
+                regimes,
+                validation_reserves,
+                host_minimum_hours,
+            )
             blocks.insert(0, "station", station)
             blocks.insert(0, "pollutant", pollutant)
             block_frames.append(blocks)
@@ -188,6 +278,7 @@ def analyze_raw_blocks(
                 "holdout_end": details["holdout_end"],
                 "test_block_start": details["test_block_start"],
                 "test_hours": details["test_hours"],
+                "forecast_models": ", ".join(forecast_models),
                 "observed_hours": int(blocks["hours"].sum()),
                 "total_blocks": len(blocks),
                 "max_block_hours": int(blocks["hours"].max()),
@@ -200,12 +291,13 @@ def analyze_raw_blocks(
                     f"{regime}_minimum_hours": regimes[regime],
                     f"{regime}_horizon_hours": horizons[regime],
                     f"{regime}_stride_hours": strides[regime],
-                    f"{regime}_host_minimum_hours": regimes[regime] + validation_hours[regime],
-                    f"{regime}_validation_forecasts": (
-                        validation_hours[regime] - horizons[regime]
-                    )
-                    // strides[regime]
-                    + 1,
+                    f"{regime}_host_minimum_hours": host_minimum_hours[regime],
+                    f"{regime}_limiting_models": requirements[regime]["limiting_models"],
+                    f"{regime}_requested_validation_hours": validation_hours[regime],
+                    f"{regime}_validation_reserve_hours": validation_reserves[regime],
+                    f"{regime}_validation_forecasts": requirements[regime][
+                        "validation_forecasts"
+                    ],
                     f"{regime}_eligible_blocks": int(eligible.sum()),
                     f"{regime}_host_candidates": int(blocks[f"{regime}_host_capable"].sum()),
                     f"{regime}_used_blocks": int(used.sum()),
@@ -214,7 +306,9 @@ def analyze_raw_blocks(
                     f"{regime}_effective_training_hours": int(
                         blocks[f"{regime}_training_hours"].sum()
                     ),
-                    f"{regime}_validation_hours": validation_hours[regime] if host.any() else 0,
+                    f"{regime}_validation_hours": (
+                        validation_reserves[regime] if host.any() else 0
+                    ),
                     f"{regime}_trainable": bool(host.any()),
                 }
                 row[f"{regime}_retained_pct"] = (
@@ -238,6 +332,7 @@ def summarize_blocks(blocks: pd.DataFrame, series: pd.DataFrame) -> pd.DataFrame
         selected_series = series if pollutant == "TOTAL" else series.loc[series["pollutant"] == pollutant]
         row: dict[str, object] = {
             "pollutant": pollutant,
+            "forecast_models": selected_series["forecast_models"].iloc[0],
             "series": len(selected_series),
             "total_blocks": len(group),
             "observed_hours": int(group["hours"].sum()),
@@ -257,6 +352,15 @@ def summarize_blocks(blocks: pd.DataFrame, series: pd.DataFrame) -> pd.DataFrame
                 ),
                 f"{regime}_stride_hours": int(
                     selected_series[f"{regime}_stride_hours"].iloc[0]
+                ),
+                f"{regime}_limiting_models": selected_series[
+                    f"{regime}_limiting_models"
+                ].iloc[0],
+                f"{regime}_requested_validation_hours": int(
+                    selected_series[f"{regime}_requested_validation_hours"].iloc[0]
+                ),
+                f"{regime}_validation_reserve_hours": int(
+                    selected_series[f"{regime}_validation_reserve_hours"].iloc[0]
                 ),
                 f"{regime}_validation_forecasts": int(
                     selected_series[f"{regime}_validation_forecasts"].iloc[0]
@@ -278,6 +382,24 @@ def summarize_blocks(blocks: pd.DataFrame, series: pd.DataFrame) -> pd.DataFrame
             }
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _requirement_note(table: pd.DataFrame) -> str:
+    row = (
+        table.loc[table["pollutant"] == "TOTAL"].iloc[0]
+        if "TOTAL" in table["pollutant"].values
+        else table.iloc[0]
+    )
+    parts = [
+        f"{regime} {int(row[f'{regime}_host_minimum_hours'])} h "
+        f"({row[f'{regime}_limiting_models']})"
+        for regime in ("short", "long")
+    ]
+    return (
+        f"Peor caso entre modelos configurados ({row['forecast_models']}): "
+        + "; ".join(parts)
+        + "."
+    )
 
 
 def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
@@ -304,18 +426,16 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
     validation_labels = []
     for regime, display in (("short", "Short"), ("long", "Long")):
         minimum = int(total[f"{regime}_minimum_hours"])
-        horizon = int(total[f"{regime}_horizon_hours"])
         stride = int(total[f"{regime}_stride_hours"])
         host_minimum = int(total[f"{regime}_host_minimum_hours"])
-        validation = host_minimum - minimum
-        context = minimum - horizon
+        validation = int(total[f"{regime}_validation_reserve_hours"])
         forecasts = int(total[f"{regime}_validation_forecasts"])
         labels.append(
-            f"{display}\ntrain: {context} + {horizon} = {minimum} h\n"
-            f"validación: +{validation} h, stride {stride} ({forecasts} forecasts; "
+            f"{display}\ntrain mínimo nativo: {minimum} h\n"
+            f"validación: +{validation} h, stride {stride} ({forecasts} ventanas; "
             f"anfitrión: {host_minimum} h)"
         )
-        validation_labels.append(f"{display.lower()} {validation} h ({forecasts} forecasts)")
+        validation_labels.append(f"{display.lower()} {validation} h ({forecasts} ventanas)")
     block_counts = np.asarray([total[f"{regime}_used_blocks"] for regime in regimes], dtype=int)
     hour_counts = np.asarray(
         [total[f"{regime}_effective_training_hours"] for regime in regimes], dtype=int
@@ -377,7 +497,8 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
         "Pocos bloques concentran la mayoría de las horas",
         "La proporción retenida ya descuenta validación por serie: "
         + " y ".join(validation_labels)
-        + ".",
+        + ".\n"
+        + _requirement_note(summary),
     )
     figure.tight_layout(rect=(0.03, 0.14, 0.98, 0.89))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -415,7 +536,8 @@ def save_block_length_distribution(path: Path, blocks: pd.DataFrame, series: pd.
     _figure_header(
         figure,
         "Distribución de longitudes",
-        "Cada hueco rompe la serie; las líneas marcan los mínimos de entrenamiento y validación.",
+        "Cada hueco rompe la serie; las líneas marcan los mínimos de entrenamiento y validación.\n"
+        + _requirement_note(series),
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.89))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -460,7 +582,7 @@ def _save_series_comparison(
         axis.spines[["top", "right"]].set_visible(False)
 
     axes[0, -1].legend(loc="lower right")
-    _figure_header(figure, title, subtitle)
+    _figure_header(figure, title, subtitle + "\n" + _requirement_note(series))
     figure.tight_layout(rect=(0.03, 0.02, 0.98, 0.91), w_pad=3)
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
@@ -514,8 +636,17 @@ def run_analysis(
     test_alignment: int = 48,
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
+    forecast_models: tuple[str, ...] | None = None,
+    seasonality_m: int | None = None,
 ) -> dict[str, Path]:
     """Run the pre-study and persist all tables and figures."""
+    if forecast_models is None:
+        forecast_models = cfg_get_csv_list(
+            "forecasting", "forecast_models", ("NLinear", "TiDE")
+        )
+    if seasonality_m is None:
+        seasonality_m = cfg_get_int("benchmark", "seasonality_m", 24)
+
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     blocks, series, excluded = analyze_raw_blocks(
@@ -532,6 +663,8 @@ def run_analysis(
         test_alignment=test_alignment,
         min_run=min_run,
         min_useful=min_useful,
+        forecast_models=forecast_models,
+        seasonality_m=seasonality_m,
     )
     if blocks.empty:
         raise RuntimeError("No eligible series produced training blocks")
@@ -579,17 +712,51 @@ def main() -> None:
     parser.add_argument("--base-dir", default="data/raw/datos_estaciones_5m")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--pollutants", nargs="+", default=["NO2", "CO"])
-    parser.add_argument("--context", type=int, default=72)
-    parser.add_argument("--short-horizon", type=int, default=8)
-    parser.add_argument("--long-horizon", type=int, default=48)
-    parser.add_argument("--short-stride", type=int, default=4)
-    parser.add_argument("--long-stride", type=int, default=24)
-    parser.add_argument("--short-validation-len", type=int, default=48)
-    parser.add_argument("--long-validation-len", type=int, default=96)
-    parser.add_argument("--holdout", type=int, default=192)
-    parser.add_argument("--test-alignment", type=int, default=48)
+    parser.add_argument(
+        "--context", type=int, default=cfg_get_int("forecasting", "context_len", 72)
+    )
+    parser.add_argument(
+        "--short-horizon",
+        type=int,
+        default=cfg_get_int("forecasting", "short_horizon", 8),
+    )
+    parser.add_argument(
+        "--long-horizon",
+        type=int,
+        default=cfg_get_int("forecasting", "long_horizon", 48),
+    )
+    parser.add_argument(
+        "--short-stride",
+        type=int,
+        default=cfg_get_int("forecasting", "short_stride", 4),
+    )
+    parser.add_argument(
+        "--long-stride",
+        type=int,
+        default=cfg_get_int("forecasting", "long_stride", 24),
+    )
+    parser.add_argument(
+        "--short-validation-len",
+        type=int,
+        default=cfg_get_int("forecasting", "short_validation_len", 48),
+    )
+    parser.add_argument(
+        "--long-validation-len",
+        type=int,
+        default=cfg_get_int("forecasting", "long_validation_len", 96),
+    )
+    parser.add_argument(
+        "--holdout", type=int, default=cfg_get_int("forecasting", "holdout", 192)
+    )
+    parser.add_argument(
+        "--test-alignment",
+        type=int,
+        default=cfg_get_int("forecasting", "test_alignment", 48),
+    )
     parser.add_argument("--min-run", type=int, default=MIN_RUN)
     parser.add_argument("--min-useful", type=int, default=MIN_USEFUL)
+    parser.add_argument("--forecast-models", nargs="+", default=None)
+    parser.add_argument("--seasonality-m", type=int, default=None)
     args = parser.parse_args()
 
     output_dir = (
@@ -614,6 +781,8 @@ def main() -> None:
         test_alignment=args.test_alignment,
         min_run=args.min_run,
         min_useful=args.min_useful,
+        forecast_models=(tuple(args.forecast_models) if args.forecast_models else None),
+        seasonality_m=args.seasonality_m,
     )
 
 
