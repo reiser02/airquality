@@ -22,7 +22,6 @@ from darts.models import (
     TCNModel,
     TSMixerModel,
     TiDEModel,
-    TransformerModel,
 )
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 from airquality.data.io import resolve_device
@@ -246,15 +245,6 @@ def build_model_configs(cfg: ConfigParser | None = None) -> dict[str, tuple[type
             {
                 "input_chunk_length": cfg_get_int("models", "tcn_input_chunk_length", 72, cfg=cfg),
                 "num_filters": cfg_get_int("models", "tcn_num_filters", 16, cfg=cfg),
-                "add_encoders": make_encoders_past_only(),
-                "loss_fn": MSELoss(),
-                "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),
-            },
-        ),
-        "Transformer": (
-            TransformerModel,
-            {
-                "input_chunk_length": cfg_get_int("models", "transformer_input_chunk_length", 72, cfg=cfg),
                 "add_encoders": make_encoders_past_only(),
                 "loss_fn": MSELoss(),
                 "pl_trainer_kwargs": build_lightning_trainer_kwargs(accelerator, True, cfg=cfg),

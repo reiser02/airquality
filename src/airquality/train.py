@@ -7,36 +7,26 @@ from typing import Any, Sequence
 from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
 from airquality.data.io import load_and_normalize_series
 from airquality.data.segments import get_longest_segment
-from airquality.imputation.registry import DARTS_GLOBAL, resolve_imputer_family
 from airquality.modeling.training import (
     build_training_dataset_bundle,
     train_global_methods,
 )
+from airquality.modeling.training_config import build_model_configs
 
 
 def _select_trainable_methods(method_names: Sequence[str]) -> list[str]:
-    """Keep only Darts-global forecasters; other benchmark imputers aren't trained.
-
-    ``[benchmark] model_names`` is shared with the imputation benchmark and may
-    include names like ``Prophet``, ``TSPulse`` or ``LinearInterp`` that are not
-    trainable Darts artifacts. Those would make ``train_global_methods`` raise, so
-    they are filtered out here (and reported) before training.
-    """
-    trainable: list[str] = []
-    skipped: list[str] = []
-    for name in method_names:
-        if resolve_imputer_family(name) == DARTS_GLOBAL:
-            trainable.append(name)
-        else:
-            skipped.append(name)
-
-    if skipped:
-        print(f"[info] Skipping non-trainable benchmark imputers: {', '.join(skipped)}")
-    if not trainable:
-        raise RuntimeError(
-            "No hay modelos Darts entrenables en `[benchmark] model_names`."
+    """Validate and deduplicate the Darts models selected for training."""
+    requested = list(dict.fromkeys(name.strip() for name in method_names if name.strip()))
+    available = build_model_configs()
+    unknown = [name for name in requested if name not in available]
+    if unknown:
+        raise ValueError(
+            "Modelos no entrenables en `[training] model_names`: "
+            f"{', '.join(unknown)}. Disponibles: {', '.join(available)}"
         )
-    return trainable
+    if not requested:
+        raise RuntimeError("No hay modelos Darts en `[training] model_names`.")
+    return requested
 
 
 def train_from_config() -> dict[str, Any]:
@@ -48,9 +38,18 @@ def train_from_config() -> dict[str, Any]:
     min_train_len_base = cfg_get_int("benchmark", "min_train_len_base", 72)
     method_names = _select_trainable_methods(
         cfg_get_csv_list(
-            "benchmark",
+            "training",
             "model_names",
-            ("TiDE", "NHiTS", "TCN", "TSMixer", "RNN", "NLinear", "DLinear"),
+            (
+                "TiDE",
+                "NHiTS",
+                "NLinear",
+                "DLinear",
+                "TCN",
+                "TSMixer",
+                "RNN",
+                "LinearRegression",
+            ),
         )
     )
 

@@ -1,4 +1,6 @@
-from airquality.train import main
+import pytest
+
+from airquality.train import _select_trainable_methods, main
 
 
 def test_main_trains_from_config(monkeypatch) -> None:
@@ -17,9 +19,16 @@ def test_main_trains_from_config(monkeypatch) -> None:
         return values[(section, option)]
 
     monkeypatch.setattr("airquality.train.cfg_get_int", fake_cfg_get_int)
+
+    def fake_cfg_get_csv_list(section, option, default):
+        del default
+        calls["model_config_key"] = (section, option)
+        return ("TiDE", "NHiTS")
+
+    monkeypatch.setattr("airquality.train.cfg_get_csv_list", fake_cfg_get_csv_list)
     monkeypatch.setattr(
-        "airquality.train.cfg_get_csv_list",
-        lambda *args, **kwargs: ("TiDE", "NHiTS", "Prophet"),
+        "airquality.train.build_model_configs",
+        lambda: {"TiDE": object(), "NHiTS": object()},
     )
 
     def fake_load_and_normalize_series(**kwargs):
@@ -74,10 +83,19 @@ def test_main_trains_from_config(monkeypatch) -> None:
         "min_train_len": 77,
         "val_context_len": 72,
     }
-    # Non-trainable benchmark imputers (e.g. Prophet) are filtered out; only
-    # Darts-global forecasters reach train_global_methods, as a list.
+    assert calls["model_config_key"] == ("training", "model_names")
     assert calls["train_kwargs"] == {
         "dataset_bundle": "bundle",
         "size_k": 5,
         "method_names": ["TiDE", "NHiTS"],
     }
+
+
+def test_select_trainable_methods_rejects_non_darts_names(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "airquality.train.build_model_configs",
+        lambda: {"TiDE": object()},
+    )
+
+    with pytest.raises(ValueError, match=r"\[training\] model_names.*TSPulse"):
+        _select_trainable_methods(["TiDE", "TSPulse"])

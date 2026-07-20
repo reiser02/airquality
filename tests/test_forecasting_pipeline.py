@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import airquality.forecasting.fill as fill
 import airquality.forecasting.pipeline as cp
 from darts import TimeSeries
 
@@ -157,6 +158,53 @@ def test_impute_series_interp_fills_and_preserves_observed():
     assert not filled.isna().any()
     assert filled.iloc[0] == pytest.approx(observed_before)
     assert filled.iloc[7] == pytest.approx(filled.iloc[7])  # finite
+
+
+def test_build_imputer_routes_base_and_finetuned_tspulse(
+    tmp_path, monkeypatch
+):
+    fine_tuned_path = tmp_path / "fine-tuned"
+    fine_tuned_path.mkdir()
+    captured: list[dict[str, object]] = []
+
+    class DummyTSPulse:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    str_values = {
+        ("tspulse", "model_id"): "base-model",
+        ("tspulse", "revision"): "base-revision",
+        ("tspulse", "finetuned_model_path"): "fine-tuned",
+        ("tspulse", "device"): "cpu",
+    }
+    monkeypatch.setattr(fill, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        "airquality.config.cfg_get_str",
+        lambda section, option, default: str_values.get((section, option), default),
+    )
+    monkeypatch.setattr("airquality.config.cfg_get_int", lambda *args, **kwargs: 512)
+    monkeypatch.setattr(
+        "airquality.imputation.imputers.TSPulseGapImputer",
+        DummyTSPulse,
+    )
+
+    build_imputer("TSPulse")
+    build_imputer("TSPulse_FineTuned")
+
+    assert captured[0]["model_path"] is None
+    assert captured[1]["model_path"] == str(fine_tuned_path)
+
+
+def test_build_imputer_rejects_finetuned_tspulse_without_path(monkeypatch):
+    monkeypatch.setattr(
+        "airquality.config.cfg_get_str",
+        lambda section, option, default: ""
+        if (section, option) == ("tspulse", "finetuned_model_path")
+        else default,
+    )
+
+    with pytest.raises(RuntimeError, match="finetuned_model_path"):
+        build_imputer("TSPulse_FineTuned")
 
 
 # --------------------------------------------------------------------------- #

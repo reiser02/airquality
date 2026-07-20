@@ -89,11 +89,9 @@ Controls where series are loaded from and their shared time-series schema.
 
 #### `[benchmark]`
 
-Controls training/benchmark split sizes and benchmark behavior.
+Controls shared split sizes and direct imputation benchmark behavior.
 
 - `size_k`: forecast/imputation horizon used by the benchmark helpers
-- `model_names`: Darts models to train/load
-- `tspulse_model_path`: optional local fine-tuned TSPulse checkpoint
 - `gap_sizes`: synthetic missing-gap sizes
 - `num_gaps`: number of gaps injected per series
 - `gap_strategy`: gap placement strategy
@@ -102,14 +100,23 @@ Controls training/benchmark split sizes and benchmark behavior.
 - `seasonality_m`: seasonality used by MASE
 - `val_size`, `val_context_len`, `min_train_len_base`: shared split settings
 
+#### `[imputation]`
+
+Controls the direct imputation benchmark independently from training.
+
+- `model_names`: explicit methods to evaluate; the default is eight Darts models plus `TSPulse`
+- `strict_artifacts`: abort when a selected Darts `.pt` or Torch checkpoint is absent; set to `false` to omit incomplete artifacts
+- `max_workers`: process limit for model-level parallelism; the default is `1`
+
 #### `[tspulse]`
 
-Controls TSPulse fine-tuning.
+Controls the TSPulse base checkpoint, optional fine-tuned checkpoint, and fine-tuning.
 
 - `target_column_index`: value column chosen from each file
 - `min_non_nan_ratio`: minimum observed ratio required
 - `min_series_points`: minimum series length required
-- Hugging Face model id and revision
+- `model_id` and `revision`: Hugging Face base checkpoint used by `TSPulse`
+- `finetuned_model_path`: local checkpoint used only by an explicitly selected `TSPulse_FineTuned`
 - context length and masking settings
 - epochs, batch sizes, learning rate, weight decay
 - validation fraction and early stopping
@@ -117,7 +124,9 @@ Controls TSPulse fine-tuning.
 
 #### `[training]` and `[models]`
 
-Control Darts trainer hyperparameters and per-model architecture parameters.
+`[training] model_names` explicitly selects the Darts artifacts to train. The
+remaining keys control common trainer hyperparameters, while `[models]` controls
+per-model architecture parameters.
 
 ## Expected Data Layout
 
@@ -151,7 +160,7 @@ What it does:
 - loads the configured dataset
 - finds the longest held-out segment
 - builds train/validation bundles
-- trains the configured models from `benchmark.model_names`
+- trains the configured Darts models from `training.model_names`
 
 Outputs:
 
@@ -168,7 +177,8 @@ uv run python -m airquality.benchmark
 
 What it does:
 
-- loads trained models and benchmark settings from config
+- evaluates the explicit methods from `imputation.model_names`
+- validates every selected Darts artifact before parallel execution
 - runs Monte Carlo imputation evaluation
 - saves benchmark CSVs and rendered plots
 

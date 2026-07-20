@@ -31,6 +31,8 @@ from airquality.imputation.registry import (
     LINEAR,
     PROPHET,
     TSPULSE,
+    TSPULSE_FINETUNED_MODEL_NAME,
+    TSPULSE_ORIGINAL_MODEL_NAME,
     resolve_imputer_family,
 )
 
@@ -38,6 +40,29 @@ from airquality.imputation.registry import (
 def _repo_root() -> Path:
     """Return the repository root (three levels above this module)."""
     return Path(__file__).resolve().parents[3]
+
+
+def _resolve_tspulse_model_path(model_name: str) -> str | None:
+    """Select the base or validated fine-tuned checkpoint for one TSPulse name."""
+    if model_name == TSPULSE_ORIGINAL_MODEL_NAME:
+        return None
+    if model_name != TSPULSE_FINETUNED_MODEL_NAME:
+        raise ValueError(f"Modelo TSPulse no soportado: {model_name}")
+
+    from airquality.config import cfg_get_str
+
+    configured_path = cfg_get_str("tspulse", "finetuned_model_path", "").strip()
+    if not configured_path:
+        raise RuntimeError(
+            "No se puede usar TSPulse_FineTuned sin "
+            "`[tspulse] finetuned_model_path`."
+        )
+    path = Path(configured_path).expanduser()
+    if not path.is_absolute():
+        path = _repo_root() / path
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el checkpoint TSPulse fine-tuned: {path}")
+    return str(path.resolve())
 
 
 def nan_gap_windows(series: pd.Series) -> list[pd.DatetimeIndex]:
@@ -99,7 +124,6 @@ def build_imputer(
         from airquality.config import cfg_get_int, cfg_get_str
         from airquality.imputation.imputers import TSPulseGapImputer
 
-        model_path = cfg_get_str("benchmark", "tspulse_model_path", "") or None
         return TSPulseGapImputer(
             model_id=cfg_get_str(
                 "tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"
@@ -107,7 +131,7 @@ def build_imputer(
             revision=cfg_get_str(
                 "tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"
             ),
-            model_path=model_path,
+            model_path=_resolve_tspulse_model_path(model_name),
             context_length=cfg_get_int("tspulse", "context_length", 512),
             freq=freq,
             device=cfg_get_str("tspulse", "device", "cpu"),
