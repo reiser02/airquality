@@ -187,7 +187,7 @@ def split_train_val_subseries(
     return None
 
 
-def _requirements_for_forecast_model(
+def get_forecast_model_requirements(
     config: ForecastModelConfig,
     *,
     size_k: int,
@@ -293,7 +293,7 @@ def backtest_forecast(
         "origin_rmse_std": float("nan"),
     }
 
-    requirements = _requirements_for_forecast_model(
+    requirements = get_forecast_model_requirements(
         model_config,
         size_k=size_k,
         seasonality_m=seasonality_m,
@@ -427,4 +427,9 @@ def backtest_forecast(
     return result
 
 
-__all__ = ["select_holdout_window", "backtest_forecast", "split_train_val_subseries"]
+__all__ = [
+    "select_holdout_window",
+    "get_forecast_model_requirements",
+    "backtest_forecast",
+    "split_train_val_subseries",
+]

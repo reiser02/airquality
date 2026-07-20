@@ -56,7 +56,11 @@ from airquality.config import (
     get_config,
 )
 from airquality.data.io import load_and_normalize_series
-from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
+from airquality.forecasting.backtest import (
+    backtest_forecast,
+    get_forecast_model_requirements,
+    select_holdout_window,
+)
 from airquality.forecasting.cache import (
     CACHE_VERSION,
     BenchmarkCache,
@@ -78,12 +82,21 @@ from airquality.forecasting.detection import (
     apply_mask_transforms,
     build_detection_strategy,
 )
-from airquality.forecasting.fill import _repo_root, build_imputer, impute_series
+from airquality.forecasting.fill import (
+    _repo_root,
+    _resolve_tspulse_model_path,
+    build_imputer,
+    impute_series,
+)
 from airquality.forecasting.registry import (
     forecast_model_cache_identity,
     resolve_forecasting_model_configs,
 )
-from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
+from airquality.imputation.registry import (
+    DARTS_GLOBAL,
+    TSPULSE,
+    resolve_imputer_family,
+)
 from airquality.paths import create_run_dir
 
 RAW_ARM = "raw"
@@ -258,9 +271,6 @@ def run_benchmark_from_config(
         for regime in regimes
     ):
         raise ValueError("Horizonte, stride y validacion de cada regimen deben ser validos")
-    host_requirement = max(
-        context_len + regime.horizon + regime.validation_len for regime in regimes
-    )
     seed = cfg_get_int("forecasting", "seed", 13)
     device = cfg_get_str("forecasting", "device", "cpu")
     threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
@@ -276,6 +286,35 @@ def run_benchmark_from_config(
         context_length=context_len,
     )
     forecast_models = list(forecast_model_configs)
+    native_requirements = [
+        (
+            regime,
+            get_forecast_model_requirements(
+                config,
+                size_k=regime.horizon,
+                seasonality_m=seasonality_m,
+                context_len=context_len,
+            ),
+        )
+        for regime in regimes
+        for config in forecast_model_configs.values()
+    ]
+    context_requirement = max(
+        context_len,
+        *(native.prediction_context_length for _, native in native_requirements),
+    )
+    train_requirement = max(
+        native.min_train_series_length for _, native in native_requirements
+    )
+    host_requirement = max(
+        native.min_train_series_length
+        + (
+            max(regime.validation_len, native.validation_target_length)
+            if native.validation_target_offset is not None
+            else 0
+        )
+        for regime, native in native_requirements
+    )
     strategy_specs = [
         spec.strip().lower()
         for spec in cfg_get_csv_list("forecasting", "strategies", DEFAULT_STRATEGIES)
@@ -327,8 +366,16 @@ def run_benchmark_from_config(
     runtime_config = get_config()
     training_model_config = effective_config(
         {
-            section: dict(runtime_config.items(section)) if runtime_config.has_section(section) else {}
-            for section in ("training", "models")
+            "training": {
+                key: value
+                for key, value in runtime_config.items("training")
+                if key != "model_names"
+            }
+            if runtime_config.has_section("training")
+            else {},
+            "models": dict(runtime_config.items("models"))
+            if runtime_config.has_section("models")
+            else {},
         }
     )
     cache_config = effective_config(
@@ -366,13 +413,13 @@ def run_benchmark_from_config(
                 "checkpoint": artifact_fingerprint(Path(f"{weights}.ckpt")),
             }
         elif family == TSPULSE:
-            model_path = cfg_get_str("benchmark", "tspulse_model_path", "").strip()
+            model_path = _resolve_tspulse_model_path(imputation_model)
             model_id = cfg_get_str(
                 "tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"
             )
             imputer_config["tspulse"] = effective_config(
                 {
-                    "model_path": model_path or None,
+                    "model_path": model_path,
                     "model_id": model_id,
                     "revision": cfg_get_str(
                         "tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"
@@ -394,8 +441,8 @@ def run_benchmark_from_config(
         window = select_holdout_window(
             series,
             holdout=holdout,
-            context_len=context_len,
-            train_min_len=context_len + max(regime.horizon for regime in regimes),
+            context_len=context_requirement,
+            train_min_len=train_requirement,
             validation_len=max(regime.validation_len for regime in regimes),
             test_alignment=test_alignment,
             freq=freq,
@@ -403,7 +450,8 @@ def run_benchmark_from_config(
         )
         if window is None:
             print(
-                f"[skip] {name}: falta un bloque de test >= {context_len + holdout} h "
+                f"[skip] {name}: falta un bloque de test >= "
+                f"{context_requirement + holdout} h "
                 f"o un bloque anterior de train+validacion >= "
                 f"{host_requirement} h"
             )

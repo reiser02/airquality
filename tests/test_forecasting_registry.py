@@ -5,7 +5,7 @@ from darts import TimeSeries
 
 from airquality.forecasting.backtest import (
     _fit_forecast_model,
-    _requirements_for_forecast_model,
+    get_forecast_model_requirements,
 )
 from airquality.forecasting.registry import (
     ForecastModelConfig,
@@ -38,10 +38,10 @@ def test_local_and_foundation_models_skip_validation_geometry() -> None:
     local = ForecastModelConfig(object, {}, "local")
     foundation = ForecastModelConfig(object, {}, "foundation")
 
-    local_req = _requirements_for_forecast_model(
+    local_req = get_forecast_model_requirements(
         local, size_k=8, seasonality_m=24, context_len=72
     )
-    foundation_req = _requirements_for_forecast_model(
+    foundation_req = get_forecast_model_requirements(
         foundation, size_k=48, seasonality_m=24, context_len=72
     )
 

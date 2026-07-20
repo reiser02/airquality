@@ -6,7 +6,11 @@ imputation) combination — plus the ``raw`` baseline — and compare their
 multi-step forecasting error over a shared observed holdout.
 """
 
-from airquality.forecasting.backtest import backtest_forecast, select_holdout_window
+from airquality.forecasting.backtest import (
+    backtest_forecast,
+    get_forecast_model_requirements,
+    select_holdout_window,
+)
 from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
 from airquality.forecasting.detection import (
     ConsensusDetection,
@@ -45,5 +49,6 @@ __all__ = [
     "impute_series",
     "nan_gap_windows",
     "backtest_forecast",
+    "get_forecast_model_requirements",
     "select_holdout_window",
 ]
