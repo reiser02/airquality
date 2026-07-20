@@ -39,13 +39,8 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
 
     monkeypatch.setattr(
         "airquality.benchmark.run_imputation_benchmark_parallel_montecarlo",
-        lambda: (results, summary, ranking_by_seed),
+        lambda: (results, summary, ranking_by_seed, plot_store),
     )
-    monkeypatch.setattr(
-        "airquality.benchmark.run_imputation_benchmark_parallel",
-        lambda **kwargs: (pd.DataFrame(), pd.DataFrame(), plot_store),
-    )
-    monkeypatch.setattr("airquality.benchmark.cfg_get_int", lambda *args, **kwargs: 42)
     monkeypatch.setattr("airquality.benchmark._build_output_dir", lambda: tmp_path)
 
     artifacts = run_benchmark_from_config()

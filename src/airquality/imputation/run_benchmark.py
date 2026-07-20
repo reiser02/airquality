@@ -230,7 +230,7 @@ def _load_benchmark_run_config(
     )
 
 
-def _build_dataset_bundle_from_config(repo_root: Path, config: BenchmarkRunConfig) -> BenchmarkDatasetBundle:
+def _build_dataset_bundle_from_config(config: BenchmarkRunConfig) -> BenchmarkDatasetBundle:
     """Construct the train/validation/test bundle required for one benchmark run."""
     return build_dataset_bundle_for_imputation(
         size_k=config.size_k,
@@ -475,6 +475,9 @@ def load_darts_models_from_artifacts(
 
         _apply_inference_trainer_overrides(model)
 
+        # These Darts models are pretrained offline by `train_global_methods`;
+        # their training time lives in that step's CSV (not measured here), so
+        # the benchmark records only their imputation cost.
         loaded[model_name] = DartsGlobalGapImputer(model, model_name=model_name)
 
     if not loaded:
@@ -487,13 +490,20 @@ def load_darts_models_from_artifacts(
 
 
 def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
-    """Average benchmark metrics by model and sort by best overall score."""
+    """Average benchmark metrics by model and sort by best overall score.
+
+    ``Train_Seconds`` (preparation/training cost) and ``Impute_Seconds`` (mean
+    imputation wall time), when present, are averaged alongside the error metrics
+    but never used for ordering.
+    """
     metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in results_df.columns]
     if not metric_cols:
         return pd.DataFrame(columns=["Modelo"])
 
+    timing_cols = [c for c in ("Train_Seconds", "Impute_Seconds") if c in results_df.columns]
+    avg_cols = metric_cols + timing_cols
     ranking_df = (
-        results_df.groupby("Modelo", as_index=False)[metric_cols]
+        results_df.groupby("Modelo", as_index=False)[avg_cols]
         .mean(numeric_only=True)
         .sort_values([c for c in ("MASE", "RMSE", "MAE") if c in metric_cols])
         .reset_index(drop=True)
@@ -607,13 +617,12 @@ _WORKER_MODEL_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 def _load_worker_dataset_bundle(
     task: dict[str, Any],
-    resolved_root: Path,
     config: BenchmarkRunConfig,
 ) -> BenchmarkDatasetBundle:
     """Load the shared pickled dataset bundle, or rebuild it when not provided."""
     bundle_path = task.get("dataset_bundle_path")
     if bundle_path is None:
-        return _build_dataset_bundle_from_config(repo_root=resolved_root, config=config)
+        return _build_dataset_bundle_from_config(config=config)
 
     key = str(bundle_path)
     if key not in _WORKER_BUNDLE_CACHE:
@@ -662,7 +671,7 @@ def _run_parallel_model_task(
     config = BenchmarkRunConfig.from_mapping(task)
 
     if dataset_bundle is None:
-        dataset_bundle = _load_worker_dataset_bundle(task, resolved_root, config)
+        dataset_bundle = _load_worker_dataset_bundle(task, config)
 
     if task.get("reuse_loaded_models"):
         cache_key = (
@@ -747,10 +756,7 @@ def run_imputation_benchmark(
         linear_model_names,
     ) = _resolve_requested_models(model_names)
 
-    dataset_bundle = _build_dataset_bundle_from_config(
-        repo_root=resolved_root,
-        config=config,
-    )
+    dataset_bundle = _build_dataset_bundle_from_config(config=config)
     model_dict: dict[str, Any] = {}
     if darts_model_names:
         model_dict.update(
@@ -918,10 +924,7 @@ def run_imputation_benchmark_parallel(
     # The bundle is identical for every model: build it once in the parent and
     # share it (directly in-process, or as one pickle that each pooled worker
     # loads once) instead of re-reading every raw file in every worker.
-    dataset_bundle = _build_dataset_bundle_from_config(
-        repo_root=resolved_root,
-        config=config,
-    )
+    dataset_bundle = _build_dataset_bundle_from_config(config=config)
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
     tasks = [
         {
@@ -1032,6 +1035,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    dict[int, dict[str, Any]],
 ]:
     """Ejecuta benchmark de imputacion en varias semillas (Monte Carlo).
 
@@ -1044,6 +1048,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     - `results_mc_df`: resultados fila-a-fila con columnas extra `Seed` y `MonteCarlo_Run`.
     - `summary_mc_df`: resumen por modelo sobre rankings por semilla.
     - `ranking_by_seed_df`: ranking por modelo en cada corrida/semilla (derivado de `results_mc_df`).
+    - `plot_store`: predicciones de la primera semilla, sin una corrida adicional.
     """
     seed_list = _build_montecarlo_seed_list(
         seeds=seeds,
@@ -1077,10 +1082,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     eval_model_names = _resolve_parallel_eval_names(model_names, config)
     workers = _resolve_parallel_max_workers(max_workers, eval_model_names)
 
-    dataset_bundle = _build_dataset_bundle_from_config(
-        repo_root=resolved_root,
-        config=config,
-    )
+    dataset_bundle = _build_dataset_bundle_from_config(config=config)
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
     task_common["reuse_loaded_models"] = True
 
@@ -1097,6 +1099,7 @@ def run_imputation_benchmark_parallel_montecarlo(
         return run_results
 
     results_runs: list[pd.DataFrame] = []
+    plot_store: dict[int, dict[str, Any]] = {}
     total_runs = len(seed_list)
     if workers == 1:
         for run_idx, seed in enumerate(seed_list, start=1):
@@ -1106,6 +1109,8 @@ def run_imputation_benchmark_parallel_montecarlo(
                 _run_parallel_model_task(task, dataset_bundle)
                 for task in _seed_tasks(seed)
             ]
+            if run_idx == 1:
+                plot_store = _merge_plot_stores([item[2] for item in outputs])
             results_runs.append(_collect_run(run_idx, seed, outputs))
     else:
         with tempfile.TemporaryDirectory(prefix="airquality_bench_") as tmp_dir:
@@ -1118,6 +1123,8 @@ def run_imputation_benchmark_parallel_montecarlo(
                     if progress:
                         print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
                     outputs = list(executor.map(_run_parallel_model_task, _seed_tasks(seed)))
+                    if run_idx == 1:
+                        plot_store = _merge_plot_stores([item[2] for item in outputs])
                     results_runs.append(_collect_run(run_idx, seed, outputs))
 
     results_mc_df = pd.concat(results_runs, ignore_index=True)
@@ -1138,4 +1145,5 @@ def run_imputation_benchmark_parallel_montecarlo(
         results_mc_df,
         summary_mc_df,
         ranking_by_seed_df,
+        plot_store,
     )

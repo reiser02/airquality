@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,6 +13,8 @@ from airquality.imputation.tspulse_finetune import (
     _validate_run_args,
     build_parser,
     build_series_name,
+    build_train_valid_datasets,
+    discover_csv_files,
     run,
     sanitize_name,
     split_long_train_valid,
@@ -27,8 +30,23 @@ def test_build_series_name_avoids_duplicate_value_col_when_in_stem() -> None:
     assert build_series_name(p, "NO2") == "estacion__Aquatec_NO2"
 
 
-def test_split_long_train_valid_generates_contextual_validation() -> None:
-    n = 10
+def test_discover_csv_files_uses_requested_data_root(tmp_path: Path) -> None:
+    expected = tmp_path / "station" / "station_NO2.csv"
+    expected.parent.mkdir()
+    expected.write_text("fecha,NO2\n", encoding="utf-8")
+    (tmp_path / "station" / "station_CO.csv").write_text(
+        "fecha,CO\n", encoding="utf-8"
+    )
+
+    assert discover_csv_files(
+        tmp_path, key_word="NO2", file_extension="csv"
+    ) == [expected.resolve()]
+
+
+def test_train_valid_examples_have_disjoint_observed_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    n = 20
     df = pd.DataFrame(
         {
             "id": ["S"] * n,
@@ -45,8 +63,60 @@ def test_split_long_train_valid_generates_contextual_validation() -> None:
         context_length=2,
     )
 
-    assert len(train) == 8
+    assert len(train) == 16
     assert len(valid) == 4
+    assert set(train["ts"]).isdisjoint(valid["ts"])
+
+    class DummyPreprocessor:
+        id_columns = ["id"]
+        timestamp_column = "ts"
+        target_columns = ["y"]
+        observable_columns: list[str] = []
+        control_columns: list[str] = []
+        conditional_columns: list[str] = []
+        categorical_columns: list[str] = []
+        static_categorical_columns: list[str] = []
+        context_length = 2
+        prediction_length = 0
+
+        def train(self, data: pd.DataFrame) -> None:
+            pass
+
+        def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
+            return data
+
+    class DummyDataset:
+        def __init__(self, data: pd.DataFrame, **kwargs: object) -> None:
+            self.data = data.reset_index(drop=True)
+            self.context_length = int(kwargs["context_length"])
+            self.stride = int(kwargs["stride"])
+            self.enable_padding = kwargs["enable_padding"]
+            self.starts = list(
+                range(0, len(data) - self.context_length + 1, self.stride)
+            )
+
+        def __len__(self) -> int:
+            return len(self.starts)
+
+        def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+            start = self.starts[index]
+            values = self.data["y"].iloc[start : start + self.context_length]
+            return {"past_observed_mask": values.notna().to_numpy()}
+
+    train.loc[train.index[2], "y"] = np.nan
+    valid.loc[valid.index[0], "y"] = np.nan
+    monkeypatch.setattr(
+        "airquality.imputation.tspulse_finetune.ForecastDFDataset", DummyDataset
+    )
+
+    train_dataset, valid_dataset = build_train_valid_datasets(
+        tsp=DummyPreprocessor(), train_df=train, valid_df=valid
+    )
+
+    assert train_dataset.dataset.stride == 2
+    assert train_dataset.dataset.enable_padding is False
+    assert train_dataset.indices == [0, 2, 3, 4, 5, 6, 7]
+    assert valid_dataset.indices == [1]
 
 
 def test_split_long_train_valid_validates_fraction() -> None:
@@ -90,8 +160,8 @@ def test_validate_run_args_rejects_invalid_values(field: str, value: object, mes
 def test_build_parser_resolves_runtime_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_cfg_get_int(section: str, option: str, default: int) -> int:
         overrides = {
-            ("data", "target_column_index"): 2,
-            ("data", "min_series_points"): 123,
+            ("tspulse", "target_column_index"): 2,
+            ("tspulse", "min_series_points"): 123,
             ("tspulse", "context_length"): 64,
             ("tspulse", "epochs"): 7,
             ("tspulse", "seed"): 99,
@@ -100,7 +170,7 @@ def test_build_parser_resolves_runtime_defaults(monkeypatch: pytest.MonkeyPatch)
 
     def fake_cfg_get_float(section: str, option: str, default: float) -> float:
         overrides = {
-            ("data", "min_non_nan_ratio"): 0.25,
+            ("tspulse", "min_non_nan_ratio"): 0.25,
             ("tspulse", "learning_rate"): 2e-4,
             ("tspulse", "mask_ratio"): 0.4,
         }
