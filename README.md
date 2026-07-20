@@ -1,6 +1,8 @@
-## Air Quality Time-Series Training And Imputation
+## Air Quality Time-Series Benchmark
 
 This repository trains forecasting models on air-quality sensor series, evaluates gap-imputation performance, and supports fine-tuning IBM Granite TSPulse on the same data.
+
+The installable distribution is named `airquality-benchmark`; its Python package remains `airquality`.
 
 The code is organized as a Python package under `src/airquality`, with config-driven entrypoints for:
 
@@ -76,7 +78,7 @@ The main shared config is `config/pipeline.cfg`.
 
 #### `[data]`
 
-Controls where series are loaded from and how they are filtered.
+Controls where series are loaded from and their shared time-series schema.
 
 - `data_root`: base dataset directory
 - `base_path_glob`: folders searched for files
@@ -84,9 +86,6 @@ Controls where series are loaded from and how they are filtered.
 - `file_extension`: expected file type, currently `csv`
 - `freq`: sampling frequency, default `h`
 - `timestamp_column`: datetime column name
-- `target_column_index`: value column chosen from each file
-- `min_non_nan_ratio`: minimum observed ratio required
-- `min_series_points`: minimum series length required
 
 #### `[benchmark]`
 
@@ -107,6 +106,9 @@ Controls training/benchmark split sizes and benchmark behavior.
 
 Controls TSPulse fine-tuning.
 
+- `target_column_index`: value column chosen from each file
+- `min_non_nan_ratio`: minimum observed ratio required
+- `min_series_points`: minimum series length required
 - Hugging Face model id and revision
 - context length and masking settings
 - epochs, batch sizes, learning rate, weight decay
@@ -224,7 +226,7 @@ uv run python -m airquality.data.fetch
 Options:
 
 ```bash
-uv run python -m airquality.data.fetch --query hourly --pollutants CO NO2 PM10 O3 PM1 PM2.5 --start-date 2026-06-12
+uv run python -m airquality.data.fetch --query hourly --pollutants CO NO2 PM10 O3 PM1 PM2.5 --start-date 2026-06-12 --output-dir data/raw/datos_estaciones
 ```
 
 What it does:
@@ -234,9 +236,10 @@ What it does:
 - fetches `CO`, `NO2`, `PM10`, and `O3` by default
 - can fetch hourly SQL averages with `--query hourly`
 - accepts pollutant lists with `--pollutants`; `PM2.5` and `PM2_5` are normalized to `PM25`
-- saves per-station CSV files under `datos_estaciones/`
+- saves per-station CSV files under `datos_estaciones/` by default
+- accepts `--output-dir` to select another destination
 
-Stations are still defined inside the module; use CLI args for query mode, pollutant lists, and the start date.
+Stations are still defined inside the module; use CLI args for query mode, pollutant lists, the start date, and the output directory.
 
 ## Programmatic Usage
 
@@ -253,7 +256,7 @@ benchmark_artifacts = run_benchmark_from_config()
 Useful lower-level modules:
 
 - `airquality.data.io.load_and_normalize_series()` for loading configured datasets
-- `airquality.data.fetch.ejecutar_scraper(contaminantes=[...], fecha_inicio=..., query="hourly")` for scraping from Python
+- `airquality.data.fetch.ejecutar_scraper(contaminantes=[...], fecha_inicio=..., query="hourly", output_dir=...)` for scraping from Python
 - `airquality.data.segments.get_longest_segment()` for the held-out block selection
 - `airquality.modeling.training.build_training_dataset_bundle()` for train/validation construction
 - `airquality.imputation.run_benchmark.run_imputation_benchmark_parallel()` for direct benchmark orchestration
