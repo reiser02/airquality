@@ -13,7 +13,7 @@ from typing import Any, Sequence
 import pandas as pd
 from airquality.data.io import configure_warnings, load_and_normalize_series, resolve_device
 from airquality.data.segments import get_longest_segment
-from airquality.config import cfg_get_csv_list, cfg_get_int, cfg_get_str
+from airquality.config import cfg_get_bool, cfg_get_csv_list, cfg_get_int, cfg_get_str
 
 from airquality.imputation.benchmark import execute_complete_pipeline
 from airquality.imputation.imputers import (
@@ -46,11 +46,21 @@ from airquality.modeling.training_config import (
 
 
 def _default_model_names() -> tuple[str, ...]:
-    """Return the default Darts model names configured for benchmarking."""
+    """Return the imputation methods configured for direct benchmarking."""
     return cfg_get_csv_list(
-        "benchmark",
+        "imputation",
         "model_names",
-        ("TiDE", "NHiTS", "TCN", "TSMixer", "RNN", "NLinear", "DLinear"),
+        (
+            "TiDE",
+            "NHiTS",
+            "NLinear",
+            "DLinear",
+            "TCN",
+            "TSMixer",
+            "RNN",
+            "LinearRegression",
+            "TSPulse",
+        ),
     )
 
 
@@ -64,9 +74,14 @@ def _default_metrics() -> tuple[str, ...]:
     return cfg_get_csv_list("benchmark", "metrics", ("mae", "rmse", "mase"))
 
 
-DEFAULT_MODEL_NAMES = _default_model_names()
-DEFAULT_GAP_SIZES = _default_gap_sizes()
-DEFAULT_METRICS = _default_metrics()
+def _default_strict_artifacts() -> bool:
+    """Return whether every selected Darts artifact must exist."""
+    return cfg_get_bool("imputation", "strict_artifacts", True)
+
+
+def _default_max_workers() -> int:
+    """Return the configured process limit for the direct benchmark."""
+    return cfg_get_int("imputation", "max_workers", 1)
 
 
 def _default_tspulse_model_id() -> str:
@@ -81,7 +96,9 @@ def _default_tspulse_revision() -> str:
 
 def _default_tspulse_model_path() -> str | None:
     """Return the optional fine-tuned TSPulse artifact path from config."""
-    return _normalize_tspulse_model_path(cfg_get_str("benchmark", "tspulse_model_path", ""))
+    return _normalize_tspulse_model_path(
+        cfg_get_str("tspulse", "finetuned_model_path", "")
+    )
 
 
 @dataclass(frozen=True)
@@ -271,7 +288,8 @@ def _build_tspulse_model_dict(
         elif model_name == TSPULSE_FINETUNED_MODEL_NAME:
             if model_config.model_path is None:
                 raise RuntimeError(
-                    "No se puede evaluar TSPulse_FineTuned sin `tspulse_model_path`."
+                    "No se puede evaluar TSPulse_FineTuned sin "
+                    "`[tspulse] finetuned_model_path`."
                 )
             model_dict[TSPULSE_FINETUNED_MODEL_NAME] = _build_tspulse_model(
                 model_config,
@@ -406,7 +424,7 @@ def load_darts_models_from_artifacts(
     *,
     repo_root: Path,
     size_k: int,
-    model_names: Sequence[str] = DEFAULT_MODEL_NAMES,
+    model_names: Sequence[str],
     force_cpu: bool = True,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -480,10 +498,6 @@ def load_darts_models_from_artifacts(
         # the benchmark records only their imputation cost.
         loaded[model_name] = DartsGlobalGapImputer(model, model_name=model_name)
 
-    if not loaded:
-        raise RuntimeError(
-            f"No se pudo cargar ningun modelo desde {models_dir}. Revisa size_k={size_k}."
-        )
     if missing:
         print(f"[info] Modelos omitidos por no encontrar pesos: {sorted(missing)}")
     return loaded
@@ -516,9 +530,8 @@ def _resolve_requested_models(
 ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
     """Split requested specs into Darts-global, Prophet, TSPulse, interp, and linear names.
 
-    Each name is classified by the imputer registry; unknown names raise. The
-    buckets cover every family the registry knows, so anything returned by
-    ``resolve_imputer_names(["all"])`` is accepted.
+    Each concrete name is classified by the imputer registry; unknown names
+    raise, and every known family has a destination bucket.
     """
     if not model_names:
         raise ValueError("`model_names` no puede estar vacio")
@@ -560,6 +573,70 @@ def _resolve_requested_models(
         tspulse_model_names,
         interp_model_names,
         linear_model_names,
+    )
+
+
+def _resolve_available_darts_names(
+    model_names: Sequence[str],
+    *,
+    repo_root: Path,
+    size_k: int,
+    strict: bool,
+) -> list[str]:
+    """Validate selected Darts artifacts before benchmark tasks are created."""
+    available: list[str] = []
+    missing: list[Path] = []
+    missing_models: list[str] = []
+    for model_name in model_names:
+        artifact = repo_root / "models" / f"{model_name}_k{size_k}.pt"
+        required = [artifact]
+        if model_name != "LinearRegression":
+            required.append(Path(f"{artifact}.ckpt"))
+        absent = [path for path in required if not path.exists()]
+        if not absent:
+            available.append(model_name)
+        else:
+            missing.extend(absent)
+            missing_models.append(model_name)
+
+    if missing and strict:
+        raise FileNotFoundError(
+            "Faltan artefactos Darts seleccionados: "
+            + ", ".join(str(path) for path in missing)
+        )
+    if missing:
+        print(
+            "[warn] Modelos omitidos por no encontrar pesos: "
+            + ", ".join(missing_models)
+        )
+    return available
+
+
+def _resolve_finetuned_tspulse_config(
+    config: BenchmarkRunConfig,
+    *,
+    repo_root: Path,
+    model_names: Sequence[str],
+) -> BenchmarkRunConfig:
+    """Resolve and validate the local checkpoint requested by TSPulse_FineTuned."""
+    if TSPULSE_FINETUNED_MODEL_NAME not in model_names:
+        return config
+    if config.tspulse.model_path is None:
+        raise RuntimeError(
+            "No se puede evaluar TSPulse_FineTuned sin "
+            "`[tspulse] finetuned_model_path`."
+        )
+
+    model_path = Path(config.tspulse.model_path).expanduser()
+    if not model_path.is_absolute():
+        model_path = repo_root / model_path
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"No existe el checkpoint TSPulse fine-tuned: {model_path}"
+        )
+    return replace(
+        config,
+        tspulse=replace(config.tspulse, model_path=str(model_path.resolve())),
     )
 
 
@@ -657,7 +734,7 @@ def _build_model_dict_for_model(
         size_k=config.size_k,
         model_names=(model_name,),
         force_cpu=config.force_cpu,
-        strict=False,
+        strict=True,
     )
 
 
@@ -720,6 +797,7 @@ def run_imputation_benchmark(
     val_size: int | None = None,
     val_context_len: int | None = None,
     min_train_len_base: int | None = None,
+    strict_artifacts: bool | None = None,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -756,6 +834,25 @@ def run_imputation_benchmark(
         linear_model_names,
     ) = _resolve_requested_models(model_names)
 
+    strict_artifacts = (
+        _default_strict_artifacts()
+        if strict_artifacts is None
+        else bool(strict_artifacts)
+    )
+    darts_model_names = _resolve_available_darts_names(
+        darts_model_names,
+        repo_root=resolved_root,
+        size_k=config.size_k,
+        strict=strict_artifacts,
+    )
+    if tspulse_model_names and not TSFM_PUBLIC_AVAILABLE:
+        raise ImportError("TSPulse fue solicitado, pero `tsfm_public` no esta disponible.")
+    config = _resolve_finetuned_tspulse_config(
+        config,
+        repo_root=resolved_root,
+        model_names=tspulse_model_names,
+    )
+
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
     model_dict: dict[str, Any] = {}
     if darts_model_names:
@@ -765,7 +862,7 @@ def run_imputation_benchmark(
                 size_k=config.size_k,
                 model_names=darts_model_names,
                 force_cpu=config.force_cpu,
-                strict=False,
+                strict=True,
             )
         )
 
@@ -776,16 +873,13 @@ def run_imputation_benchmark(
             print("[warn] darts Prophet no esta disponible; se omite Prophet.")
 
     if tspulse_model_names:
-        if TSFM_PUBLIC_AVAILABLE:
-            model_dict.update(
-                _build_tspulse_model_dict(
-                    config.tspulse,
-                    freq=config.freq,
-                    model_names=tspulse_model_names,
-                )
+        model_dict.update(
+            _build_tspulse_model_dict(
+                config.tspulse,
+                freq=config.freq,
+                model_names=tspulse_model_names,
             )
-        else:
-            print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
+        )
 
     if interp_model_names:
         model_dict.update(_build_interp_model_dict(interp_model_names))
@@ -810,12 +904,11 @@ def run_imputation_benchmark(
 def _resolve_parallel_eval_names(
     model_names: Sequence[str],
     config: BenchmarkRunConfig,
-) -> list[str]:
-    """Resolve the evaluable model list, applying optional-dependency policies.
-
-    Prophet/TSPulse names are dropped with a warning when their dependency is
-    missing; requesting ``TSPulse_FineTuned`` without a model path raises.
-    """
+    *,
+    repo_root: Path,
+    strict_artifacts: bool,
+) -> tuple[list[str], BenchmarkRunConfig]:
+    """Resolve concrete evaluable names before parallel tasks are created."""
     (
         darts_model_names,
         prophet_model_names,
@@ -824,7 +917,12 @@ def _resolve_parallel_eval_names(
         linear_model_names,
     ) = _resolve_requested_models(model_names)
 
-    eval_model_names = list(darts_model_names)
+    eval_model_names = _resolve_available_darts_names(
+        darts_model_names,
+        repo_root=repo_root,
+        size_k=config.size_k,
+        strict=strict_artifacts,
+    )
 
     if prophet_model_names:
         if PROPHET_AVAILABLE:
@@ -833,17 +931,16 @@ def _resolve_parallel_eval_names(
             print("[warn] darts Prophet no esta disponible; se omite Prophet.")
 
     if tspulse_model_names:
-        if TSFM_PUBLIC_AVAILABLE:
-            if (
-                TSPULSE_FINETUNED_MODEL_NAME in tspulse_model_names
-                and config.tspulse.model_path is None
-            ):
-                raise RuntimeError(
-                    "No se puede evaluar TSPulse_FineTuned sin `tspulse_model_path`."
-                )
-            eval_model_names.extend(tspulse_model_names)
-        else:
-            print("[warn] tsfm_public no esta disponible; se omite TSPulse.")
+        if not TSFM_PUBLIC_AVAILABLE:
+            raise ImportError(
+                "TSPulse fue solicitado, pero `tsfm_public` no esta disponible."
+            )
+        config = _resolve_finetuned_tspulse_config(
+            config,
+            repo_root=repo_root,
+            model_names=tspulse_model_names,
+        )
+        eval_model_names.extend(tspulse_model_names)
 
     if interp_model_names:
         eval_model_names.extend(interp_model_names)
@@ -854,7 +951,7 @@ def _resolve_parallel_eval_names(
     if not eval_model_names:
         raise RuntimeError("No hay modelos para evaluar en paralelo.")
 
-    return eval_model_names
+    return eval_model_names, config
 
 
 def _resolve_parallel_max_workers(
@@ -890,6 +987,7 @@ def run_imputation_benchmark_parallel(
     val_context_len: int | None = None,
     min_train_len_base: int | None = None,
     max_workers: int | None = None,
+    strict_artifacts: bool | None = None,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -918,8 +1016,20 @@ def run_imputation_benchmark_parallel(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    eval_model_names = _resolve_parallel_eval_names(model_names, config)
-    max_workers = _resolve_parallel_max_workers(max_workers, eval_model_names)
+    eval_model_names, config = _resolve_parallel_eval_names(
+        model_names,
+        config,
+        repo_root=resolved_root,
+        strict_artifacts=(
+            _default_strict_artifacts()
+            if strict_artifacts is None
+            else bool(strict_artifacts)
+        ),
+    )
+    max_workers = _resolve_parallel_max_workers(
+        _default_max_workers() if max_workers is None else max_workers,
+        eval_model_names,
+    )
 
     # The bundle is identical for every model: build it once in the parent and
     # share it (directly in-process, or as one pickle that each pooled worker
@@ -1026,6 +1136,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     val_context_len: int | None = None,
     min_train_len_base: int | None = None,
     max_workers: int | None = None,
+    strict_artifacts: bool | None = None,
     seeds: Sequence[int] | None = None,
     n_runs: int = 20,
     seed_start: int = 42,
@@ -1079,8 +1190,20 @@ def run_imputation_benchmark_parallel_montecarlo(
         min_train_len_base=min_train_len_base,
     )
     model_names = _default_model_names() if model_names is None else model_names
-    eval_model_names = _resolve_parallel_eval_names(model_names, config)
-    workers = _resolve_parallel_max_workers(max_workers, eval_model_names)
+    eval_model_names, config = _resolve_parallel_eval_names(
+        model_names,
+        config,
+        repo_root=resolved_root,
+        strict_artifacts=(
+            _default_strict_artifacts()
+            if strict_artifacts is None
+            else bool(strict_artifacts)
+        ),
+    )
+    workers = _resolve_parallel_max_workers(
+        _default_max_workers() if max_workers is None else max_workers,
+        eval_model_names,
+    )
 
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)

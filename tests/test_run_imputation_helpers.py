@@ -261,6 +261,10 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
         "airquality.imputation.run_benchmark._resolve_requested_models",
         lambda model_names: (list(model_names), [], [], [], []),
     )
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark._resolve_available_darts_names",
+        lambda model_names, **kwargs: list(model_names),
+    )
 
     def fake_cfg_get_int(section: str, option: str, default: int) -> int:
         overrides = {
@@ -278,7 +282,7 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
         overrides = {
             ("tspulse", "model_id"): "runtime-model",
             ("tspulse", "revision"): "runtime-rev",
-            ("benchmark", "tspulse_model_path"): "runtime/path",
+            ("tspulse", "finetuned_model_path"): "runtime/path",
             ("benchmark", "gap_strategy"): "runtime-strategy",
             ("data", "freq"): "30min",
         }
@@ -289,7 +293,7 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.cfg_get_csv_list",
         lambda section, option, default: {
-            ("benchmark", "model_names"): ("TiDE", "TCN"),
+            ("imputation", "model_names"): ("TiDE", "TCN"),
             ("benchmark", "gap_sizes"): ("2", "6"),
             ("benchmark", "metrics"): ("mae", "rmse"),
         }.get((section, option), default),
@@ -303,7 +307,6 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
         "airquality.imputation.run_benchmark.load_darts_models_from_artifacts",
         lambda **kwargs: {"TiDE": object()},
     )
-
     def fake_execute(*, model_dict: dict[str, object], dataset_bundle: object, config: BenchmarkRunConfig) -> tuple[pd.DataFrame, dict[int, dict[str, object]]]:
         captured["config"] = config
         return pd.DataFrame([{"Modelo": "TiDE", "MAE": 1.0}]), {}
@@ -360,6 +363,10 @@ def test_run_imputation_benchmark_allows_benchmark_overrides_without_dataset_sel
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.load_darts_models_from_artifacts",
         lambda **kwargs: {"TiDE": object()},
+    )
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark._resolve_available_darts_names",
+        lambda model_names, **kwargs: list(model_names),
     )
 
     def fake_execute(*, model_dict: dict[str, object], dataset_bundle: object, config: BenchmarkRunConfig) -> tuple[pd.DataFrame, dict[int, dict[str, object]]]:
@@ -549,6 +556,10 @@ def test_run_imputation_benchmark_smoke_uses_shared_runner_path(
         lambda **kwargs: {"TiDE": object()},
     )
     monkeypatch.setattr(
+        "airquality.imputation.run_benchmark._resolve_available_darts_names",
+        lambda model_names, **kwargs: list(model_names),
+    )
+    monkeypatch.setattr(
         "airquality.imputation.run_benchmark._default_model_names",
         lambda: ("TiDE",),
     )
@@ -603,6 +614,12 @@ def test_run_imputation_benchmark_parallel_max_workers_one_combines_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset_bundle = object()
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "TiDE_k5.pt").touch()
+    (models_dir / "TiDE_k5.pt.ckpt").touch()
+    (models_dir / "TCN_k5.pt").touch()
+    (models_dir / "TCN_k5.pt.ckpt").touch()
 
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
@@ -668,6 +685,8 @@ def test_run_imputation_benchmark_adds_original_and_finetuned_tspulse(
 ) -> None:
     dataset_bundle = object()
     captured: dict[str, object] = {}
+    fine_tuned_path = tmp_path / "models" / "fine-tuned"
+    fine_tuned_path.mkdir(parents=True)
 
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
@@ -723,7 +742,7 @@ def test_run_imputation_benchmark_adds_original_and_finetuned_tspulse(
     assert list(ranking_df["Modelo"]) == ["TSPulse", "TSPulse_FineTuned"]
     assert captured["model_dict"] == {
         "TSPulse": {"model_path": None, "freq": "h"},
-        "TSPulse_FineTuned": {"model_path": "models/fine-tuned", "freq": "h"},
+        "TSPulse_FineTuned": {"model_path": str(fine_tuned_path), "freq": "h"},
     }
 
 
@@ -731,6 +750,7 @@ def test_run_imputation_benchmark_parallel_adds_original_and_finetuned_tspulse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset_bundle = object()
+    (tmp_path / "models" / "fine-tuned").mkdir(parents=True)
 
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
@@ -858,6 +878,8 @@ def test_run_imputation_benchmark_can_request_only_finetuned_tspulse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
+    fine_tuned_path = tmp_path / "models" / "fine-tuned"
+    fine_tuned_path.mkdir(parents=True)
 
     monkeypatch.setattr(
         "airquality.imputation.run_benchmark.configure_warnings",
@@ -917,7 +939,10 @@ def test_run_imputation_benchmark_can_request_only_finetuned_tspulse(
     assert list(results_df["Modelo"]) == [TSPULSE_FINETUNED_MODEL_NAME]
     assert list(ranking_df["Modelo"]) == [TSPULSE_FINETUNED_MODEL_NAME]
     assert captured["model_dict"] == {
-        TSPULSE_FINETUNED_MODEL_NAME: {"model_path": "models/fine-tuned", "freq": "h"},
+        TSPULSE_FINETUNED_MODEL_NAME: {
+            "model_path": str(fine_tuned_path),
+            "freq": "h",
+        },
     }
 
 
@@ -951,3 +976,90 @@ def test_run_imputation_benchmark_rejects_finetuned_tspulse_without_model_path(
             repo_root=tmp_path,
             model_names=[TSPULSE_FINETUNED_MODEL_NAME],
         )
+
+
+def test_run_imputation_benchmark_rejects_unavailable_tspulse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.configure_warnings",
+        lambda quiet: None,
+    )
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.TSFM_PUBLIC_AVAILABLE",
+        False,
+    )
+
+    with pytest.raises(ImportError, match="tsfm_public"):
+        run_imputation_benchmark(
+            repo_root=tmp_path,
+            model_names=[TSPULSE_ORIGINAL_MODEL_NAME],
+        )
+
+
+def test_parallel_benchmark_rejects_missing_darts_artifact_before_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.configure_warnings",
+        lambda quiet: None,
+    )
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark._build_dataset_bundle_from_config",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("dataset must not be built after failed preflight")
+        ),
+    )
+
+    with pytest.raises(FileNotFoundError, match="TiDE_k5.pt"):
+        run_imputation_benchmark_parallel(
+            repo_root=tmp_path,
+            model_names=["TiDE"],
+            strict_artifacts=True,
+        )
+
+
+def test_parallel_benchmark_rejects_missing_torch_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "TiDE_k5.pt").touch()
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.configure_warnings",
+        lambda quiet: None,
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"TiDE_k5\.pt\.ckpt"):
+        run_imputation_benchmark_parallel(
+            repo_root=tmp_path,
+            model_names=["TiDE"],
+            strict_artifacts=True,
+        )
+
+
+def test_parallel_benchmark_non_strict_skips_missing_darts_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark._execute_benchmark_with_dataset",
+        lambda **kwargs: (
+            pd.DataFrame(
+                [{"Modelo": "interp", "MAE": 1.0, "RMSE": 1.0, "MASE": 1.0}]
+            ),
+            {},
+        ),
+    )
+
+    results, _, _ = run_imputation_benchmark_parallel(
+        repo_root=tmp_path,
+        model_names=["TiDE", "interp"],
+        max_workers=1,
+        strict_artifacts=False,
+    )
+
+    assert list(results["Modelo"]) == ["interp"]
