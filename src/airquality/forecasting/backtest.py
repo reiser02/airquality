@@ -14,78 +14,44 @@ effect is carried entirely by the trained model.
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 
 import numpy as np
 import pandas as pd
 
-from darts import TimeSeries, concatenate
+from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
-from darts.metrics import mae, mase as darts_mase, rmse
 from darts.utils.missing_values import extract_subseries
 from sklearn.preprocessing import StandardScaler
 
 from airquality.data.series import ensure_datetime_series
-from airquality.modeling.training import fit_darts_model
-from airquality.modeling.training_config import build_model_configs
+from airquality.forecasting.registry import (
+    ForecastModelConfig,
+    resolve_forecasting_model_configs,
+)
+from airquality.metrics import compute_mase
+from airquality.modeling.training import (
+    DartsModelSeriesRequirements,
+    fit_darts_model,
+    get_model_series_requirements,
+)
 
 
-def _compute_backtest_mase(
-    actual: TimeSeries,
-    pred: TimeSeries,
-    insample: pd.Series,
-    *,
-    seasonality_m: int,
-    freq: str,
-) -> float:
-    """MASE of the holdout forecast via :func:`darts.metrics.mase`.
-
-    ``insample`` is the training history: darts requires it to end exactly one
-    step before ``pred`` starts, which holds by construction here. Its gaps are
-    time-interpolated first so the seasonal-naive scale uses the full history
-    (same convention as ``imputation.benchmark._compute_gap_mase``). Returns
-    NaN when darts cannot compute the metric (short or constant history).
-    """
-    try:
-        insample_clean = (
-            insample.interpolate(method="time", limit_direction="both").ffill().bfill()
-        )
-        insample_ts = TimeSeries.from_series(insample_clean, freq=freq)
-        value = darts_mase(
-            actual_series=actual,
-            pred_series=pred,
-            insample=insample_ts,
-            m=int(seasonality_m),
-            intersect=True,
-        )
-        if isinstance(value, (list, np.ndarray)):
-            value = np.nanmean(value)
-        value = float(value)
-        return value if np.isfinite(value) else float("nan")
-    except Exception as exc:
-        logging.warning("[mase] no computable sobre el holdout: %s", exc)
-        return float("nan")
-
-
-def _longest_observed_run(series: pd.Series) -> tuple[int, int]:
-    """Return ``(start, end)`` positions of the longest contiguous non-NaN run.
-
-    Real station series are gappy and their longest observed block is rarely at
-    the tail, so the eval window is carved from the longest run anywhere.
-    """
+def _observed_runs(series: pd.Series) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` positions of every contiguous non-NaN run, in order."""
     observed = series.notna().to_numpy()
-    best_start, best_end = 0, 0
-    cur_start = None
+    runs: list[tuple[int, int]] = []
+    cur_start: int | None = None
     for i, is_obs in enumerate(observed):
         if is_obs and cur_start is None:
             cur_start = i
         elif not is_obs and cur_start is not None:
-            if i - cur_start > best_end - best_start:
-                best_start, best_end = cur_start, i
+            runs.append((cur_start, i))
             cur_start = None
-    if cur_start is not None and len(observed) - cur_start > best_end - best_start:
-        best_start, best_end = cur_start, len(observed)
-    return best_start, best_end
+    if cur_start is not None:
+        runs.append((cur_start, len(observed)))
+    return runs
 
 
 def select_holdout_window(
@@ -93,30 +59,178 @@ def select_holdout_window(
     *,
     holdout: int,
     context_len: int,
+    train_min_len: int,
+    validation_len: int = 48,
+    test_alignment: int = 48,
     freq: str = "h",
+    host_min_len: int | None = None,
 ) -> dict | None:
-    """Pick a contiguous observed window = ``context_len`` context + ``holdout`` test.
+    """Reserve the latest viable observed block for context plus variable test.
 
-    The window is carved from the **end of the longest contiguous observed run**
-    (anywhere in the series); training uses everything before it. Returns ``None``
-    when the longest run cannot host both context and holdout.
+    A candidate test block must provide at least ``context_len + holdout``
+    points. Its test tail is expanded to the largest multiple of
+    ``test_alignment`` that fits after the context. The whole candidate block is
+    excluded from training, including any short prefix left by alignment.
+
+    A distinct, strictly earlier block must be long enough for
+    ``host_min_len`` when supplied, otherwise for ``train_min_len`` training
+    points plus ``validation_len`` held-out targets.
+    Returns ``None`` when no pair of blocks satisfies both requirements.
     """
+    if min(holdout, context_len, train_min_len, validation_len, test_alignment) <= 0:
+        raise ValueError("Las longitudes de train, validacion y test deben ser positivas")
+    if host_min_len is not None and host_min_len <= 0:
+        raise ValueError("host_min_len debe ser positivo")
+
     s = ensure_datetime_series(series, freq=freq, name=str(series.name or "series"))
-    start, end = _longest_observed_run(s)
-    run_len = end - start
-    needed = context_len + holdout
-    if run_len < needed:
+    runs = _observed_runs(s)
+    host_len = host_min_len or train_min_len + validation_len
+    index = pd.DatetimeIndex(s.index)
+    for i in range(len(runs) - 1, -1, -1):
+        start, end = runs[i]
+        available_test = end - start - context_len
+        test_len = (available_test // test_alignment) * test_alignment
+        if test_len < holdout:
+            continue
+        if not any(host_end - host_start >= host_len for host_start, host_end in runs[:i]):
+            continue
+
+        holdout_start_pos = end - test_len
+        eval_start = holdout_start_pos - context_len
+        return {
+            "train_index": index[:start],
+            "test_block_index": index[start:end],
+            "test_block_start": index[start],
+            "eval_index": index[eval_start:end],
+            "context_index": index[eval_start:holdout_start_pos],
+            "holdout_index": index[holdout_start_pos:end],
+            "holdout_start": index[holdout_start_pos],
+            "holdout_end": index[end - 1],
+            "test_hours": test_len,
+        }
+    return None
+
+
+def split_train_val_subseries(
+    train_ts: TimeSeries,
+    *,
+    input_chunk: int,
+    size_k: int,
+    validation_len: int = 48,
+    validation_stride: int | None = None,
+    requirements: DartsModelSeriesRequirements | None = None,
+) -> tuple[list[TimeSeries], list[TimeSeries]] | None:
+    """Split a (possibly gappy) training series into train/val subseries.
+
+    The validation block driving the Darts EarlyStopping is the tail of the
+    **most recent** gap-free block long enough to host it; training uses only
+    strictly-earlier data (every earlier block plus that host's prefix), and any
+    block *after* the validation host is dropped. Ordering the split this way
+    keeps ``val_loss`` honest: no training point reaches the first native
+    validation target. Only the short recent blocks that cannot host a
+    validation tail are dropped, so a large posterior block is never discarded
+    (it would be the host instead).
+
+    ``val_subs`` contains one exact native Darts fit window per rolling origin.
+    For shifted TCN/RNN datasets, the whole native target sequence is kept
+    strictly after the training boundary. Keeping each window minimal makes
+    Darts produce exactly one validation sample from it.
+
+    Returns ``(train_subs, val_subs)`` or ``None`` when no block can host the
+    model's native fit and validation windows.
+    """
+    validation_stride = size_k if validation_stride is None else validation_stride
+    if min(input_chunk, size_k, validation_len, validation_stride) <= 0:
+        raise ValueError("Las longitudes y el stride de validacion deben ser positivos")
+    if validation_len < size_k:
+        raise ValueError("validation_len debe ser >= size_k")
+
+    if requirements is None:
+        min_len = input_chunk + size_k
+        validation_target_offset: int | None = input_chunk
+        validation_target_length = size_k
+    else:
+        min_len = requirements.min_train_series_length
+        validation_target_offset = requirements.validation_target_offset
+        validation_target_length = requirements.validation_target_length
+
+    # extract_subseries yields the gap-free blocks in chronological order.
+    subseries = [ss for ss in extract_subseries(train_ts, min_gap_size=1) if len(ss) >= min_len]
+    if not subseries:
         return None
 
-    eval_start = end - needed
-    holdout_start_pos = end - holdout
-    index = pd.DatetimeIndex(s.index)
-    return {
-        "eval_index": index[eval_start:end],
-        "context_index": index[eval_start:holdout_start_pos],
-        "holdout_index": index[holdout_start_pos:end],
-        "holdout_start": index[holdout_start_pos],
-    }
+    if validation_target_offset is None:
+        return subseries, []
+
+    # Scan from the newest block back to the first one long enough to host the
+    # fixed validation tail plus a training prefix.
+    for i in range(len(subseries) - 1, -1, -1):
+        val_block = max(validation_target_length, validation_len)
+        if len(subseries[i]) < min_len + val_block:
+            continue
+        val_host = subseries[i]
+        train_subs = [
+            ss for ss in (*subseries[:i], val_host[:-val_block]) if len(ss) >= min_len
+        ]
+        if not train_subs:
+            return None
+        first_target = len(val_host) - val_block
+        val_subs = []
+        for target in range(
+            first_target,
+            len(val_host) - validation_target_length + 1,
+            validation_stride,
+        ):
+            window_start = target - validation_target_offset
+            val_subs.append(val_host[window_start : window_start + min_len])
+        return train_subs, val_subs
+    return None
+
+
+def _requirements_for_forecast_model(
+    config: ForecastModelConfig,
+    *,
+    size_k: int,
+    seasonality_m: int,
+    context_len: int,
+) -> DartsModelSeriesRequirements:
+    """Return native or protocol-specific train geometry for one model family."""
+    if config.mode == "trained":
+        return get_model_series_requirements(config.model_cls, config.kwargs, size_k)
+    if config.mode == "local":
+        return DartsModelSeriesRequirements(
+            min_train_series_length=max(10, 2 * seasonality_m),
+            prediction_context_length=10,
+            validation_target_offset=None,
+            validation_target_length=0,
+        )
+    return DartsModelSeriesRequirements(
+        min_train_series_length=context_len + size_k,
+        prediction_context_length=context_len,
+        validation_target_offset=None,
+        validation_target_length=0,
+    )
+
+
+def _fit_forecast_model(
+    config: ForecastModelConfig,
+    train_scaled: list[TimeSeries],
+    val_scaled: list[TimeSeries],
+    *,
+    size_k: int,
+):
+    """Fit a trained/global model or register a local/zero-shot model."""
+    if config.mode == "local":
+        model = config.model_cls(**config.kwargs)
+        model.fit(train_scaled[-1], verbose=False)
+        return model
+    return fit_darts_model(
+        config.model_cls,
+        train_scaled,
+        val_scaled,
+        size_k,
+        config.kwargs,
+    )
 
 
 def backtest_forecast(
@@ -128,52 +242,94 @@ def backtest_forecast(
     holdout_start: pd.Timestamp,
     seasonality_m: int = 24,
     freq: str = "h",
+    mase_insample: pd.Series | None = None,
+    validation_len: int = 48,
+    validation_stride: int | None = None,
+    forecast_stride: int | None = None,
+    context_len: int = 72,
+    model_config: ForecastModelConfig | None = None,
 ) -> dict:
     """Train ``model_name`` on ``train_series`` and backtest over the holdout.
 
     ``train_series`` may contain gaps (raw arm): it is split into gap-free
-    subseries for training. ``eval_series`` is the contiguous observed block
-    (context + holdout) shared by both arms. Returns RMSE/MAE/MASE plus metadata.
+    subseries for training. Trained global models use the causal validation split
+    from :func:`split_train_val_subseries`; local statistical and zero-shot
+    foundation models use the latest eligible block without validation.
+    ``eval_series`` is the
+    contiguous observed block
+    (context + holdout) shared by both arms. Returns RMSE/MAE/MASE, the model
+    ``train_seconds`` (wall time of the ``fit`` only) and ``inference_seconds``
+    (wall time of ``historical_forecasts`` over the holdout), plus metadata.
+    Validation origins are explicit minimal windows separated by
+    ``validation_stride``; test origins use ``forecast_stride`` and may overlap.
+
+    ``mase_insample`` overrides the in-sample history behind the MASE
+    seasonal-naive denominator (defaults to ``train_series``). When comparing
+    preprocessing arms, pass the shared RAW training series for every arm:
+    cleaning/imputation smooth the history and shrink its naive error, so
+    per-arm denominators would inflate the preprocessed arms' MASE.
     """
+    if model_config is None:
+        model_config = resolve_forecasting_model_configs(
+            [model_name],
+            seasonality_m=seasonality_m,
+            context_length=context_len,
+        )[model_name]
+
     result = {
         "model": model_name,
+        "model_mode": model_config.mode,
         "rmse": float("nan"),
         "mae": float("nan"),
         "mase": float("nan"),
+        "train_seconds": float("nan"),
+        "inference_seconds": float("nan"),
         "n_eval": 0,
+        "n_forecasts": 0,
+        "n_unique_targets": 0,
+        "origin_mae_mean": float("nan"),
+        "origin_mae_std": float("nan"),
+        "origin_rmse_mean": float("nan"),
+        "origin_rmse_std": float("nan"),
     }
 
-    configs = build_model_configs()
-    if model_name not in configs:
-        raise ValueError(f"Modelo de forecasting desconocido: {model_name}")
-    model_cls, model_kwargs = configs[model_name]
-    input_chunk = int(model_kwargs.get("input_chunk_length", model_kwargs.get("lags", 72)) or 72)
-    min_len = input_chunk + size_k
+    requirements = _requirements_for_forecast_model(
+        model_config,
+        size_k=size_k,
+        seasonality_m=seasonality_m,
+        context_len=context_len,
+    )
+    input_chunk = requirements.prediction_context_length
+    min_len = requirements.min_train_series_length
+    validation_stride = size_k if validation_stride is None else validation_stride
+    forecast_stride = size_k if forecast_stride is None else forecast_stride
+    if min(validation_stride, forecast_stride) <= 0:
+        raise ValueError("Los strides de validacion y forecast deben ser positivos")
 
     train_s = ensure_datetime_series(train_series, freq=freq, name=str(train_series.name or "series"))
     train_ts = TimeSeries.from_series(train_s, freq=freq)
-    subseries = sorted(
-        (ss for ss in extract_subseries(train_ts, min_gap_size=1) if len(ss) >= min_len),
-        key=len,
-        reverse=True,
+    split = split_train_val_subseries(
+        train_ts,
+        input_chunk=input_chunk,
+        size_k=size_k,
+        validation_len=validation_len,
+        validation_stride=validation_stride,
+        requirements=requirements,
     )
-    if not subseries:
-        logging.warning("[%s] sin subseries entrenables (min_len=%d)", model_name, min_len)
+    if split is None:
+        logging.warning("[%s] sin bloque entrenable (min_len=%d)", model_name, min_len)
         return result
-
-    # Carve a disjoint validation block from the longest subseries so the Darts
-    # EarlyStopping callback (monitors val_loss) has data; skip if too short.
-    longest = subseries[0]
-    val_block = max(size_k, min(48, len(longest) // 5))
-    if len(longest) < min_len + val_block + size_k:
-        logging.warning("[%s] subserie insuficiente para split train/val", model_name)
-        return result
-    train_subs = [longest[:-val_block], *subseries[1:]]
-    val_subs = [longest[-(input_chunk + val_block):]]
+    train_subs, val_subs = split
+    if model_config.mode != "trained":
+        train_subs = [train_subs[-1]]
 
     scaler = Scaler(global_fit=True, scaler=StandardScaler())
     train_scaled = scaler.fit_transform([ss.astype(np.float32) for ss in train_subs])
-    val_scaled = scaler.transform([ss.astype(np.float32) for ss in val_subs])
+    val_scaled = (
+        scaler.transform([ss.astype(np.float32) for ss in val_subs])
+        if val_subs
+        else []
+    )
 
     eval_s = ensure_datetime_series(eval_series, freq=freq, name=str(eval_series.name or "series"))
     eval_ts = TimeSeries.from_series(eval_s, freq=freq).astype(np.float32)
@@ -181,45 +337,94 @@ def backtest_forecast(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = fit_darts_model(model_cls, train_scaled, val_scaled, size_k, model_kwargs)
+        fit_start = time.perf_counter()
+        model = _fit_forecast_model(
+            model_config,
+            train_scaled,
+            val_scaled,
+            size_k=size_k,
+        )
+        result["train_seconds"] = time.perf_counter() - fit_start
         try:
+            inference_start = time.perf_counter()
             forecasts = model.historical_forecasts(
                 series=eval_scaled,
                 start=holdout_start,
                 forecast_horizon=size_k,
-                stride=size_k,
+                stride=forecast_stride,
                 retrain=False,
                 last_points_only=False,
                 verbose=False,
             )
+            result["inference_seconds"] = time.perf_counter() - inference_start
         except Exception as exc:  # pragma: no cover - model/series specific
             logging.warning("[%s] historical_forecasts fallo: %s", model_name, exc)
             return result
 
     if not forecasts:
         return result
-    pred_scaled = concatenate(forecasts) if isinstance(forecasts, list) else forecasts
-    pred_ts = scaler.inverse_transform(pred_scaled)
+    forecast_list = forecasts if isinstance(forecasts, list) else [forecasts]
+    predictions = [scaler.inverse_transform(forecast) for forecast in forecast_list]
 
-    # Align predictions and observed actuals on their common timestamps.
-    actual = eval_ts.slice_intersect(pred_ts)
-    pred = pred_ts.slice_intersect(actual)
-    if len(actual) == 0:
+    insample = (
+        train_s
+        if mase_insample is None
+        else ensure_datetime_series(mase_insample, freq=freq, name=str(mase_insample.name or "series"))
+    )
+    actual_values: list[np.ndarray] = []
+    predicted_values: list[np.ndarray] = []
+    origin_mae: list[float] = []
+    origin_rmse: list[float] = []
+    origin_mase: list[float] = []
+    origin_lengths: list[int] = []
+    target_times: set[pd.Timestamp] = set()
+    for prediction in predictions:
+        actual = eval_ts.slice_intersect(prediction)
+        pred = prediction.slice_intersect(actual)
+        if len(actual) == 0:
+            continue
+        actual_array = actual.to_series().to_numpy(dtype=float)
+        predicted_array = pred.to_series().to_numpy(dtype=float)
+        errors = actual_array - predicted_array
+        actual_values.append(actual_array)
+        predicted_values.append(predicted_array)
+        origin_mae.append(float(np.mean(np.abs(errors))))
+        origin_rmse.append(float(np.sqrt(np.mean(np.square(errors)))))
+        origin_mase.append(
+            compute_mase(
+                actual,
+                pred,
+                insample,
+                seasonality_m=seasonality_m,
+            )
+        )
+        origin_lengths.append(len(actual_array))
+        target_times.update(pd.DatetimeIndex(actual.time_index))
+
+    if not actual_values:
         return result
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        result["rmse"] = float(rmse(actual, pred))
-        result["mae"] = float(mae(actual, pred))
-        result["mase"] = _compute_backtest_mase(
-            actual,
-            pred,
-            train_s,
-            seasonality_m=seasonality_m,
-            freq=freq,
+    actual_array = np.concatenate(actual_values)
+    predicted_array = np.concatenate(predicted_values)
+    errors = actual_array - predicted_array
+    result["mae"] = float(np.mean(np.abs(errors)))
+    result["rmse"] = float(np.sqrt(np.mean(np.square(errors))))
+    finite_mase = np.isfinite(origin_mase)
+    if np.any(finite_mase):
+        result["mase"] = float(
+            np.average(
+                np.asarray(origin_mase)[finite_mase],
+                weights=np.asarray(origin_lengths)[finite_mase],
+            )
         )
-    result["n_eval"] = int(len(actual))
+    result["n_eval"] = int(len(errors))
+    result["n_forecasts"] = len(origin_mae)
+    result["n_unique_targets"] = len(target_times)
+    result["origin_mae_mean"] = float(np.mean(origin_mae))
+    result["origin_mae_std"] = float(np.std(origin_mae))
+    result["origin_rmse_mean"] = float(np.mean(origin_rmse))
+    result["origin_rmse_std"] = float(np.std(origin_rmse))
     return result
 
 
-__all__ = ["select_holdout_window", "backtest_forecast"]
+__all__ = ["select_holdout_window", "backtest_forecast", "split_train_val_subseries"]

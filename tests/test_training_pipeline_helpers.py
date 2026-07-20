@@ -411,7 +411,7 @@ def test_fit_darts_model_trains_linear_regression_without_stride_typeerror() -> 
     model = fit_darts_model(
         LinearRegressionModel,
         series_train=[ts],
-        series_val=None,
+        series_val=[ts],
         size_k=2,
         model_kwargs={"lags": 3},
     )
@@ -452,10 +452,13 @@ def test_fit_darts_model_drops_lr_scheduler_when_validation_is_missing(
     assert "val_series" not in calls["fit"]
 
 
-def test_fit_darts_model_resume_mode_loads_checkpoint_and_disables_force_reset(
+def test_fit_darts_model_resume_mode_loads_full_checkpoint_before_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("airquality.modeling.training.build_base_training_kwargs", lambda: {})
+    monkeypatch.setattr(
+        "airquality.modeling.training.build_base_training_kwargs",
+        lambda: {"n_epochs": 12, "force_reset": True},
+    )
     monkeypatch.setattr("airquality.modeling.training.configure_warnings", lambda quiet: None)
 
     calls: dict[str, object] = {}
@@ -468,17 +471,15 @@ def test_fit_darts_model_resume_mode_loads_checkpoint_and_disables_force_reset(
             model_name: str,
             force_reset: bool,
             work_dir: str,
+            n_epochs: int,
         ) -> None:
-            calls["init"] = {
-                "output_chunk_length": output_chunk_length,
-                "save_checkpoints": save_checkpoints,
-                "model_name": model_name,
-                "force_reset": force_reset,
-                "work_dir": work_dir,
-            }
+            del output_chunk_length, save_checkpoints, model_name, force_reset, work_dir, n_epochs
+            raise AssertionError("resume must not construct a fresh model")
 
-        def load_weights_from_checkpoint(self, **kwargs: object) -> None:
+        @classmethod
+        def load_from_checkpoint(cls, **kwargs: object) -> "DummyModel":
             calls["load"] = kwargs
+            return object.__new__(cls)
 
         def fit(self, **kwargs: object) -> None:
             calls["fit"] = kwargs
@@ -498,8 +499,8 @@ def test_fit_darts_model_resume_mode_loads_checkpoint_and_disables_force_reset(
         resume_mode="best",
     )
 
-    assert calls["init"]["force_reset"] is False
     assert calls["load"] == {"best": True, "model_name": "demo", "work_dir": "/tmp/work"}
+    assert calls["fit"]["epochs"] == 12
 
 
 def test_train_global_methods_smoke_saves_models_and_exports_curves(

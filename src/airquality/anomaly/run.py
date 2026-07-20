@@ -14,7 +14,7 @@ import json
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 
 from .benchmark import AnomalyBenchmarkConfig, run_benchmark
-from .ensemble import DEFAULT_ENSEMBLE_METHOD, DEFAULT_TOP_K
+from .ensemble import DEFAULT_TOP_K
 from .metrics import DEFAULT_MAX_DETECTION_RATE, DEFAULT_THRESHOLD_K
 
 
@@ -31,7 +31,6 @@ def build_config_from_args(args: argparse.Namespace) -> AnomalyBenchmarkConfig:
         pollutant=args.pollutant,
         raw_base_dir=args.raw_base_dir,
         models=args.models if args.models else _csv_default(cfg_get_str("anomaly", "models", "all")),
-        ensemble_method=args.ensemble_method,
         device=args.device,
         seed=args.seed,
         threshold_k=args.threshold_k,
@@ -59,7 +58,6 @@ def main() -> None:
         default=cfg_get_str("anomaly", "raw_base_dir", "data/raw/datos_estaciones_5m"),
     )
     parser.add_argument("--models", nargs="*", default=None, help="Model names, or 'all' (default from config)")
-    parser.add_argument("--ensemble-method", default=cfg_get_str("anomaly", "ensemble_method", DEFAULT_ENSEMBLE_METHOD))
     parser.add_argument("--device", default=cfg_get_str("anomaly", "device", "cpu"))
     parser.add_argument("--seed", type=int, default=cfg_get_int("anomaly", "seed", 13))
     parser.add_argument(

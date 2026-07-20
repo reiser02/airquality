@@ -223,36 +223,26 @@ def test_rank_top_k_k_larger_than_input_returns_all():
     assert rank_top_k({"a": 0.1, "b": 0.2}, k=5) == ["b", "a"]
 
 
-@pytest.mark.parametrize("method", ["AVG", "MAX", "AOM"])
-def test_consensus_shape_and_range(method: str):
+def test_consensus_shape_and_range():
     scores = [np.array([0.0, 5.0, 1.0, 9.0]), np.array([2.0, 2.0, 8.0, 1.0])]
-    fused = consensus(scores, method=method, seed=1)
+    fused = consensus(scores)
     assert fused.shape == (4,)
     assert fused.min() >= 0.0 and fused.max() <= 1.0 + 1e-6
 
 
-def test_consensus_weighted_avg_biases_toward_higher_weight():
-    score_a = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
-    score_b = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
-    fused = consensus([score_a, score_b], method="AVG", weights=[0.9, 0.1])
-    assert fused[:2].mean() < fused[2:].mean()
+def test_vote_consensus_requires_strict_majority():
+    score_a = np.array([9.0, 0.0, 0.0, 0.0])
+    score_b = np.array([8.0, 0.0, 0.0, 0.0])
+    score_c = np.array([0.0, 0.0, 7.0, 0.0])
 
+    fused = consensus([score_a, score_b, score_c])
 
-def test_consensus_rejects_unknown_method():
-    with pytest.raises(ValueError):
-        consensus([np.array([1.0, 2.0])], method="median")
+    assert fused.astype(bool).tolist() == [True, False, False, False]
 
 
 def test_consensus_empty_list_raises():
     with pytest.raises(ValueError):
         consensus([])
-
-
-def test_consensus_accepts_lowercase_method():
-    fused = consensus([np.array([0.0, 1.0, 2.0])], method="avg")
-    assert fused.shape == (3,)
-
-
 # --- detection-rate filter -------------------------------------------------
 
 
@@ -464,9 +454,9 @@ def test_recompute_ensemble_matches_saved_run(tmp_path, monkeypatch):
     )
     run_benchmark(config)
 
-    out = recompute_ensemble(tmp_path, method="AVG", threshold_k=3.5)
+    out = recompute_ensemble(tmp_path, threshold_k=3.5)
 
-    assert "Ensemble(method=AVG,k=3.5)" in out
+    assert "Ensemble(method=VOTE,k=3.5)" in out
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())
@@ -549,9 +539,9 @@ def test_recompute_ensemble_synthetic_run(tmp_path, monkeypatch):
     )
     run_benchmark(config)
 
-    out = recompute_ensemble(tmp_path, method="AVG", top_k=3)
+    out = recompute_ensemble(tmp_path, top_k=3)
 
-    assert "Ensemble(method=AVG,top_k=3)" in out
+    assert "Ensemble(method=VOTE,top_k=3)" in out
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())
