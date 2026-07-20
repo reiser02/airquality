@@ -9,12 +9,13 @@ import pytest
 from darts import TimeSeries
 
 from airquality.imputation.benchmark import (
-    _compute_gap_mase,
     _compute_metrics_on_mask,
     _gap_windows_to_mask_index,
     _normalize_series_collection,
+    _predict_mask_for_model_series,
     execute_complete_pipeline,
 )
+from airquality.metrics import compute_mase
 from airquality.imputation.imputers import (
     DartsGlobalGapImputer,
     _build_clean_left_context,
@@ -26,6 +27,70 @@ from airquality.modeling.training import build_benchmark_dataset_bundle
 def _series(values: list[float | None], *, name: str = "S", start: str = "2024-01-01") -> pd.Series:
     idx = pd.date_range(start, periods=len(values), freq="h")
     return pd.Series(values, index=idx, name=name, dtype=float)
+
+
+def test_predict_mask_timing_is_per_hole_mean() -> None:
+    # Two holes in one series; a model that reports its own train/impute timers.
+    idx = pd.date_range("2024-01-01", periods=6, freq="h")
+    series = pd.Series(range(6), index=idx, dtype=float, name="S")
+    gap_windows = [idx[1:2], idx[3:5]]  # two separate holes
+
+    class TimedModel:
+        model_name = "Timed"
+        # Totals across both holes; the benchmark should divide by 2 (n_holes).
+        _last_train_seconds = 4.0
+        _last_impute_seconds = 1.0
+
+        def impute_gaps(self, *, series_name, all_series_map, gap_windows, test_index,
+                        scaler, freq, config_workers=None):
+            mask = _gap_windows_to_mask_index(gap_windows)
+            return pd.Series(0.0, index=mask, dtype=float, name=series_name), []
+
+    _, _, timing = _predict_mask_for_model_series(
+        model=TimedModel(),
+        series_name="S",
+        test_index=idx,
+        all_series_map={"S": series},
+        gap_windows=gap_windows,
+        scaler=None,
+        freq="h",
+        config_workers={},
+    )
+
+    assert timing["train_seconds"] == pytest.approx(2.0)  # 4.0 / 2 holes
+    assert timing["impute_seconds"] == pytest.approx(0.5)  # 1.0 / 2 holes
+
+
+def test_predict_mask_timing_pretrained_uses_train_seconds_attr() -> None:
+    # No per-gap fit (train timer 0) -> train comes from the one-time attribute.
+    idx = pd.date_range("2024-01-01", periods=4, freq="h")
+    series = pd.Series(range(4), index=idx, dtype=float, name="S")
+    gap_windows = [idx[1:2]]
+
+    class PretrainedModel:
+        model_name = "Pre"
+        _last_train_seconds = 0.0
+        _last_impute_seconds = 0.6
+        train_seconds = 9.0  # one-time load (e.g. TSPulse)
+
+        def impute_gaps(self, *, series_name, all_series_map, gap_windows, test_index,
+                        scaler, freq, config_workers=None):
+            mask = _gap_windows_to_mask_index(gap_windows)
+            return pd.Series(0.0, index=mask, dtype=float, name=series_name), []
+
+    _, _, timing = _predict_mask_for_model_series(
+        model=PretrainedModel(),
+        series_name="S",
+        test_index=idx,
+        all_series_map={"S": series},
+        gap_windows=gap_windows,
+        scaler=None,
+        freq="h",
+        config_workers={},
+    )
+
+    assert timing["train_seconds"] == pytest.approx(9.0)  # the one-time attr, not divided
+    assert timing["impute_seconds"] == pytest.approx(0.6)
 
 
 def test_normalize_series_collection_accepts_sequence_of_series_and_frames() -> None:
@@ -144,12 +209,11 @@ def test_compute_gap_mase_returns_nan_without_warning_for_all_nan_predictions() 
     pred_gap = _series([None, None], name="S")
     insample = _series([0.0, 1.0, 2.0, 3.0], name="S", start="2023-12-31 20:00:00")
 
-    out = _compute_gap_mase(
-        actual_gap=actual_gap,
-        pred_gap=pred_gap,
+    out = compute_mase(
+        actual=actual_gap,
+        pred=pred_gap,
         insample=insample,
         seasonality_m=1,
-        freq="h",
     )
 
     assert math.isnan(out)
@@ -268,10 +332,13 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         random_seed=123,
     )
 
-    assert list(results_df.columns) == ["Modelo", "Serie", "Gap_Size", "MAE", "RMSE", "MASE"]
+    assert list(results_df.columns) == [
+        "Modelo", "Serie", "Gap_Size", "Train_Seconds", "Impute_Seconds", "MAE", "RMSE", "MASE",
+    ]
     assert results_df.loc[0, "Modelo"] == "Stub"
     assert results_df.loc[0, "Serie"] == "S"
     assert results_df.loc[0, "Gap_Size"] == 2
+    assert results_df.loc[0, "Impute_Seconds"] >= 0.0
     assert results_df.loc[0, "MAE"] == pytest.approx(20.0)
     assert results_df.loc[0, "RMSE"] == pytest.approx(((20.0**2 + 20.0**2) / 2) ** 0.5)
     assert results_df.loc[0, "MASE"] == pytest.approx(2.0)

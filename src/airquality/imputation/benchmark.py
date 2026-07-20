@@ -10,10 +10,10 @@ import numpy as np  # Numeric operations for masks, metrics, and random sampling
 import pandas as pd  # Time-indexed series/dataframe processing.
 
 from darts import TimeSeries  # Darts time series container used across the module.
-from darts.metrics import mase as darts_mase
 from airquality.data.io import to_pd_series
 from airquality.data.series import ensure_datetime_series
 from airquality.modeling.training_config import BenchmarkDatasetBundle
+from airquality.metrics import compute_mase
 
 
 DEFAULT_CONFIG_WORKERS = {
@@ -249,66 +249,6 @@ def _prepare_pipeline_series_maps(
         all_series_map,
         bundle_scalers,
     )
-
-
-def _compute_gap_mase(
-    actual_gap: pd.Series,
-    pred_gap: pd.Series,
-    insample: pd.Series,
-    seasonality_m: int,
-    freq: str,
-) -> float:
-    """Compute MASE for a single gap using Darts mase function."""
-    if len(actual_gap) == 0 or len(pred_gap) == 0 or len(insample) == 0:
-        return float("nan")
-    try:
-        aligned_idx = actual_gap.index.intersection(pred_gap.index)
-        if len(aligned_idx) == 0:
-            return float("nan")
-
-        actual_clean = actual_gap.reindex(aligned_idx).astype(float)
-        pred_clean = pred_gap.reindex(aligned_idx).astype(float)
-        valid = np.isfinite(actual_clean.to_numpy(dtype=float)) & np.isfinite(
-            pred_clean.to_numpy(dtype=float)
-        )
-        if not np.any(valid):
-            return float("nan")
-
-        actual_clean = actual_clean.iloc[valid]
-        pred_clean = pred_clean.iloc[valid]
-
-        insample_clean = insample.copy()
-        if insample_clean.isna().any():
-            insample_clean = (
-                insample_clean.interpolate(method="time", limit_direction="both")
-                .ffill()
-                .bfill()
-            )
-        if not np.isfinite(insample_clean.to_numpy(dtype=float)).any():
-            return float("nan")
-
-        actual_ts = TimeSeries.from_series(actual_clean, freq=freq)
-        pred_ts = TimeSeries.from_series(pred_clean, freq=freq)
-        insample_ts = TimeSeries.from_series(insample_clean, freq=freq)
-        val = darts_mase(
-            actual_series=actual_ts,
-            pred_series=pred_ts,
-            insample=insample_ts,
-            m=int(seasonality_m),
-            intersect=True,
-        )
-        if isinstance(val, (list, np.ndarray)):
-            val = np.nanmean(val)
-        val = float(val)
-        return val if np.isfinite(val) else float("nan")
-    except Exception as exc:
-        # NaN keeps the benchmark running, but the cause must stay visible:
-        # alignment/frequency bugs would otherwise masquerade as missing context.
-        logging.warning(
-            "MASE no computable para el hueco %s-%s: %s",
-            actual_gap.index.min(), actual_gap.index.max(), exc,
-        )
-        return float("nan")
 
 
 def _build_gap_index(
@@ -584,15 +524,29 @@ def _predict_mask_for_model_series(
     scaler: Any | None,
     freq: str,
     config_workers: Mapping[str, Any],
-) -> tuple[pd.Series, list[GapContextFailure]]:
+) -> tuple[pd.Series, list[GapContextFailure], dict[str, float]]:
     """Impute one series with one `GapImputer` over the pooled mask timestamps.
 
     Every model exposes the same `impute_gaps` contract and returns predictions in
     the original scale; scaling/inverse-scaling is internal to each imputer.
+
+    Each imputer runs its own two timers during the call — ``_last_train_seconds``
+    (fitting, non-zero only for per-gap fitters like Prophet) and
+    ``_last_impute_seconds`` (prediction/fill) — so we just read them here (no
+    external timing, no subtraction). Returns a ``timing`` dict with **per-hole
+    means** for this series/gap size (never sums over the holes):
+
+    - ``impute_seconds``: prediction time / number of holes.
+    - ``train_seconds``: for per-gap fitters, the fit time / number of holes; else
+      the model's one-time train cost (TSPulse load, 0 for interpolation, NaN for
+      pretrained Darts whose training time is recorded by `train_global_methods`).
+
+    Empty masks report NaN timings.
     """
     mask_index = _gap_windows_to_mask_index(gap_windows)
+    nan_timing = {"impute_seconds": float("nan"), "train_seconds": float("nan")}
     if len(mask_index) == 0:
-        return pd.Series(index=mask_index, dtype=float, name=series_name), []
+        return pd.Series(index=mask_index, dtype=float, name=series_name), [], nan_timing
 
     pred_mask, failures = model.impute_gaps(
         series_name=series_name,
@@ -603,7 +557,21 @@ def _predict_mask_for_model_series(
         freq=freq,
         config_workers=config_workers,
     )
-    return pred_mask.reindex(mask_index).astype(float), failures
+
+    n_holes = sum(1 for gap_idx in gap_windows if len(gap_idx) > 0)
+    train_total = float(getattr(model, "_last_train_seconds", 0.0) or 0.0)
+    impute_total = float(getattr(model, "_last_impute_seconds", 0.0) or 0.0)
+
+    impute_mean = impute_total / n_holes if n_holes else float("nan")
+    if train_total > 0.0:
+        train_row = train_total / n_holes  # per-hole fit mean (Prophet)
+    else:
+        # No per-gap fit: TSPulse reports its one-time load, interpolation 0,
+        # Darts leaves it absent -> NaN (its training time is in the train CSV).
+        train_row = float(getattr(model, "train_seconds", float("nan")))
+
+    timing = {"impute_seconds": impute_mean, "train_seconds": train_row}
+    return pred_mask.reindex(mask_index).astype(float), failures, timing
 
 
 def _build_metric_row(
@@ -617,14 +585,22 @@ def _build_metric_row(
     metric_list: Sequence[str],
     seasonality_m: int,
     freq: str,
+    train_seconds: float = float("nan"),
+    impute_seconds: float = float("nan"),
 ) -> dict[str, Any]:
-    """Build one benchmark result row for a model, series, and gap size."""
+    """Build one benchmark result row for a model, series, and gap size.
+
+    ``train_seconds`` / ``impute_seconds`` are the per-hole mean timings for this
+    (model, series, gap size); the graphs average them across series.
+    """
     # Compute MAE/RMSE on the pooled mask timestamps
     mae_rmse_metrics = [m for m in metric_list if m in ("mae", "rmse")]
     row: dict[str, Any] = {
         "Modelo": str(model_name),
         "Serie": str(series_name),
         "Gap_Size": int(gap_size),
+        "Train_Seconds": float(train_seconds),
+        "Impute_Seconds": float(impute_seconds),
     }
 
     if mae_rmse_metrics:
@@ -656,12 +632,11 @@ def _build_metric_row(
 
             insample = full_series.loc[full_series.index < gap_start].copy()
 
-            gap_mase = _compute_gap_mase(
-                actual_gap=actual_gap,
-                pred_gap=pred_gap,
+            gap_mase = compute_mase(
+                actual=actual_gap,
+                pred=pred_gap,
                 insample=insample,
                 seasonality_m=seasonality_m,
-                freq=freq,
             )
 
             if np.isfinite(gap_mase):
@@ -728,7 +703,7 @@ def _execute_gap_size_pipeline(
         for series_name, ts_test_unscaled in test_map_unscaled.items():
             gap_windows = gaps_per_series[series_name]
 
-            pred_mask, series_failures = _predict_mask_for_model_series(
+            pred_mask, series_failures, timing = _predict_mask_for_model_series(
                 model=model,
                 series_name=series_name,
                 test_index=ts_test_unscaled.index,
@@ -753,6 +728,8 @@ def _execute_gap_size_pipeline(
                     metric_list=metric_list,
                     seasonality_m=seasonality_m,
                     freq=freq,
+                    train_seconds=timing["train_seconds"],
+                    impute_seconds=timing["impute_seconds"],
                 )
             )
 
@@ -857,8 +834,16 @@ def execute_complete_pipeline(
             )
 
     results_df = pd.DataFrame(rows)
+
+    # Timing is per row (per-hole means built in `_predict_mask_for_model_series`):
+    # `Impute_Seconds` for every model, `Train_Seconds` for the models trained at
+    # benchmark time (Prophet's per-hole fit, TSPulse's one-time load, 0 for
+    # interpolation). Pretrained Darts leave `Train_Seconds` NaN — their training
+    # time comes from `train_global_methods`' CSV, merged in only at plot time.
     metric_columns = [m.upper() for m in metric_list]
-    ordered_cols = ["Modelo", "Serie", "Gap_Size", *metric_columns]
+    ordered_cols = [
+        "Modelo", "Serie", "Gap_Size", "Train_Seconds", "Impute_Seconds", *metric_columns,
+    ]
     for col in ordered_cols:
         if col not in results_df.columns:
             results_df[col] = float("nan")

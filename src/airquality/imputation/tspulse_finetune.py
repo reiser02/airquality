@@ -15,7 +15,7 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from airquality.data.io import resolve_device, to_pd_series
-from airquality.data.loaders import load_dataset_paths, load_to_df
+from airquality.data.loaders import load_to_df
 from airquality.data.segments import get_longest_segment
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 
@@ -101,14 +101,23 @@ def build_series_name(csv_path: Path, value_col: str) -> str:
     return f"{parent}__{stem}__{val}"
 
 
-def discover_csv_files() -> list[Path]:
-    """Discover the input files that match the configured dataset filters."""
-    by_keyword = sorted(Path(p).resolve() for p in load_dataset_paths())
-    files = [p for p in by_keyword if p.is_file()]
+def discover_csv_files(
+    data_root: Path,
+    *,
+    key_word: str,
+    file_extension: str,
+) -> list[Path]:
+    """Discover matching input files below the requested dataset root."""
+    extension = file_extension.removeprefix(".")
+    files = sorted(
+        path.resolve()
+        for path in data_root.rglob(f"*{key_word}*.{extension}")
+        if path.is_file()
+    )
 
     if not files:
         raise FileNotFoundError(
-            "No se encontraron CSV. Revisa la configuracion de load_dataset_paths."
+            f"No se encontraron archivos bajo {data_root}."
         )
     return files
 
@@ -215,11 +224,7 @@ def split_long_train_valid(
     valid_fraction: float,
     context_length: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split long dataframe into train/valid per-series.
-
-    Valid starts `context_length` points before the split boundary so each
-    validation window has left context, mirroring TSFM split behavior.
-    """
+    """Split long dataframe into disjoint train/valid targets per series."""
     if not (0.0 < valid_fraction < 1.0):
         raise ValueError("valid_fraction must be in (0, 1)")
 
@@ -236,8 +241,7 @@ def split_long_train_valid(
         split_idx = max(1, min(split_idx, n - 1))
 
         g_train = g.iloc[:split_idx, :].copy()
-        valid_start = max(0, split_idx - int(context_length))
-        g_valid = g.iloc[valid_start:, :].copy()
+        g_valid = g.iloc[split_idx:, :].copy()
 
         train_parts.append(g_train)
         valid_parts.append(g_valid)
@@ -257,8 +261,8 @@ def build_train_valid_datasets(
     tsp: TimeSeriesPreprocessor,
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
-) -> tuple[ForecastDFDataset, ForecastDFDataset]:
-    """Build TSFM train and valid datasets directly from long dataframes."""
+) -> tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    """Build disjoint TSFM datasets containing only fully observed targets."""
     tsp.train(train_df)
     train_df_prep = tsp.preprocess(train_df)
     valid_df_prep = tsp.preprocess(valid_df)
@@ -274,12 +278,24 @@ def build_train_valid_datasets(
         "static_categorical_columns": tsp.static_categorical_columns,
         "context_length": tsp.context_length,
         "prediction_length": tsp.prediction_length,
-        "stride": 1,
-        "enable_padding": True,
+        "stride": tsp.context_length,
+        "enable_padding": False,
     }
 
     train_dataset = ForecastDFDataset(train_df_prep, **common_kwargs)
     valid_dataset = ForecastDFDataset(valid_df_prep, **common_kwargs)
+
+    # ponytail: synthetic masking has no separate loss mask for natural gaps.
+    def fully_observed(dataset: ForecastDFDataset) -> torch.utils.data.Subset:
+        indices = [
+            i
+            for i in range(len(dataset))
+            if bool(dataset[i]["past_observed_mask"].all())
+        ]
+        return torch.utils.data.Subset(dataset, indices)
+
+    train_dataset = fully_observed(train_dataset)
+    valid_dataset = fully_observed(valid_dataset)
 
     if len(train_dataset) == 0:
         raise RuntimeError(
@@ -386,8 +402,10 @@ def _load_training_series_and_split(
     data_root: Path,
 ) -> tuple[list[pd.DataFrame], pd.DataFrame, pd.DataFrame, int, pd.DataFrame, pd.DataFrame]:
     """Load raw series, hold out the evaluation block, and build train/valid tables."""
-    del data_root
     csv_files = discover_csv_files(
+        data_root,
+        key_word=args.key_word,
+        file_extension=args.file_extension,
     )
 
     series_dfs = load_series_list(
@@ -698,10 +716,10 @@ def _build_parser_defaults() -> dict[str, object]:
         "key_word": cfg_get_str("data", "key_word", "NO2"),
         "file_extension": cfg_get_str("data", "file_extension", "csv"),
         "timestamp_column": cfg_get_str("data", "timestamp_column", "fecha"),
-        "target_column_index": cfg_get_int("data", "target_column_index", 0),
+        "target_column_index": cfg_get_int("tspulse", "target_column_index", 0),
         "freq": cfg_get_str("data", "freq", "h"),
-        "min_non_nan_ratio": cfg_get_float("data", "min_non_nan_ratio", 0.15),
-        "min_series_points": cfg_get_int("data", "min_series_points", 600),
+        "min_non_nan_ratio": cfg_get_float("tspulse", "min_non_nan_ratio", 0.15),
+        "min_series_points": cfg_get_int("tspulse", "min_series_points", 600),
         "id_column": cfg_get_str("tspulse", "id_column", "series_id"),
         "tspulse_target_column": cfg_get_str("tspulse", "tspulse_target_column", "value"),
         "model_id": cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"),

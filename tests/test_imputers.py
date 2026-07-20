@@ -130,7 +130,7 @@ def test_tspulse_gap_imputer_uses_model_reconstruction_at_mask(
     from airquality.imputation import imputers as imputers_mod
 
     reconstruction_value = 123.0
-    captured: dict[str, pd.DataFrame] = {}
+    captured: dict[str, object] = {"calls": 0}
 
     class StubPreprocessor:
         num_input_channels = 1
@@ -146,6 +146,7 @@ def test_tspulse_gap_imputer_uses_model_reconstruction_at_mask(
             pass
 
         def __call__(self, prepared: pd.DataFrame) -> pd.DataFrame:
+            captured["calls"] = int(captured["calls"]) + 1
             captured["prepared"] = prepared.copy()
             value = prepared["value"]
             return pd.DataFrame(
@@ -160,30 +161,69 @@ def test_tspulse_gap_imputer_uses_model_reconstruction_at_mask(
     monkeypatch.setattr(imputers_mod, "TimeSeriesPreprocessor", StubPreprocessor)
     monkeypatch.setattr(imputers_mod, "TimeSeriesImputationPipeline", StubPipeline)
 
-    index = pd.date_range("2024-01-01", periods=72, freq="h")
+    index = pd.date_range("2024-01-01", periods=1300, freq="h")
     truth = pd.Series(
-        10.0 + 3.0 * np.sin(np.arange(72) * 2 * np.pi / 24), index=index, name="S"
+        10.0 + 3.0 * np.sin(np.arange(len(index)) * 2 * np.pi / 24),
+        index=index,
+        name="S",
     )
-    gap = pd.DatetimeIndex(index[[60, 61, 62]])
+    old_gap = pd.DatetimeIndex(index[[600, 601, 602]])
+    recent_gap = pd.DatetimeIndex(index[[1200, 1201, 1202]])
+    mask = old_gap.append(recent_gap)
 
     imputer = imputers_mod.TSPulseGapImputer(
-        context_length=64, device="cpu", model=object()
+        context_length=512, device="cpu", model=object()
     )
     pred, failures = imputer.impute_gaps(
         series_name="S",
         all_series_map={"S": truth},
-        gap_windows=[gap],
-        test_index=index[48:],
+        gap_windows=[old_gap, recent_gap],
+        test_index=index[512:],
         freq="h",
     )
 
     assert failures == []
-    # The frame handed to the pipeline keeps NaN exactly at the mask.
-    prepared = captured["prepared"].set_index("timestamp")["value"]
-    assert prepared.loc[gap].isna().all()
-    assert prepared.drop(gap).notna().all()
-    # And the prediction at the mask is the model reconstruction, not a pre-fill.
-    assert pred.to_numpy() == pytest.approx([reconstruction_value] * 3)
+    assert captured["calls"] == 1  # pooled masks use one sliding-pipeline call
+    prepared = captured["prepared"]
+    assert isinstance(prepared, pd.DataFrame)
+    prepared_values = prepared.set_index("timestamp")["value"]
+    assert len(prepared_values) > imputer.context_length
+    assert prepared_values.index[0] == index[89]  # 511 points before the old gap
+    assert prepared_values.index[-1] == index[-1]
+    assert prepared_values.loc[mask].isna().all()
+    pd.testing.assert_series_equal(
+        prepared_values.drop(mask), truth.reindex(prepared_values.index).drop(mask),
+        check_names=False,
+    )
+    # Both old and recent gaps come from reconstruction, not observed truth.
+    assert list(pred.index) == list(mask)
+    assert pred.to_numpy() == pytest.approx([reconstruction_value] * len(mask))
+
+
+def test_tspulse_gap_imputer_rejects_uncovered_masks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from airquality.imputation import imputers as imputers_mod
+
+    index = pd.date_range("2024-01-01", periods=20, freq="h")
+    mask = pd.DatetimeIndex(index[[5, 15]])
+    imputer = imputers_mod.TSPulseGapImputer(
+        context_length=8, device="cpu", model=object()
+    )
+    monkeypatch.setattr(
+        imputer,
+        "_impute_full_series",
+        lambda **_: pd.Series(1.0, index=mask[-1:]),
+    )
+
+    with pytest.raises(RuntimeError, match="no values.*mask"):
+        imputer.impute_gaps(
+            series_name="S",
+            all_series_map={"S": pd.Series(range(20), index=index, dtype=float)},
+            gap_windows=[mask],
+            test_index=index,
+            freq="h",
+        )
 
 
 @pytest.mark.skipif(not PROPHET_AVAILABLE, reason="darts Prophet unavailable")

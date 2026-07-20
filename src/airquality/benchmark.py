@@ -10,11 +10,10 @@ from typing import Any
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from airquality.config import cfg_get_int
 from airquality.imputation.run_benchmark import (
-    run_imputation_benchmark_parallel,
     run_imputation_benchmark_parallel_montecarlo,
 )
+from airquality.paths import create_run_dir
 
 
 # Base palette mirrored from `airquality.anomaly.presentation` (same "base color"
@@ -205,20 +204,11 @@ def _sanitize_filename(text: str) -> str:
 
 
 def _build_output_dir() -> Path:
-    """Create the timestamped output directory for one Monte Carlo run.
-
-    The timestamp has 1-second resolution, so a numeric suffix disambiguates
-    runs started within the same second instead of crashing on ``mkdir``.
-    """
+    """Create the timestamped output directory for one Monte Carlo run."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = _repo_root() / "reports" / "benchmark"
-    output_dir = base_dir / f"montecarlo_{stamp}"
-    suffix = 1
-    while output_dir.exists():
-        output_dir = base_dir / f"montecarlo_{stamp}_{suffix}"
-        suffix += 1
-    output_dir.mkdir(parents=True, exist_ok=False)
-    return output_dir
+    return create_run_dir(
+        _repo_root() / "reports" / "benchmark", f"montecarlo_{stamp}"
+    )
 
 
 def _to_pd_series(obj: Any) -> pd.Series:
@@ -338,7 +328,7 @@ def run_benchmark_from_config() -> dict[str, Any]:
     """Run the configured Monte Carlo benchmark and persist CSV/image artifacts."""
     output_dir = _build_output_dir()
 
-    results_mc_df, summary_mc_df, ranking_by_seed_df = (
+    results_mc_df, summary_mc_df, ranking_by_seed_df, plot_store = (
         run_imputation_benchmark_parallel_montecarlo()
     )
     results_mc_df.to_csv(output_dir / "results_mc.csv", index=False)
@@ -347,8 +337,6 @@ def run_benchmark_from_config() -> dict[str, Any]:
 
     metric_gap_plot_path = _save_metric_gap_plot(results_mc_df, output_dir=output_dir)
 
-    plot_seed = cfg_get_int("benchmark", "random_seed", 42)
-    _, _, plot_store = run_imputation_benchmark_parallel(random_seed=plot_seed)
     plot_manifest_df = _save_plot_images(plot_store, output_dir=output_dir)
 
     return {

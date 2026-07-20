@@ -91,6 +91,22 @@ def test_summarize_results_by_model_groups_and_sorts() -> None:
     assert list(out["Modelo"]) == ["B", "A"]
 
 
+def test_summarize_results_by_model_averages_impute_seconds() -> None:
+    df = pd.DataFrame(
+        {
+            "Modelo": ["A", "A", "B"],
+            "MASE": [1.1, 2.1, 0.3],
+            "Impute_Seconds": [2.0, 4.0, 1.0],
+        }
+    )
+
+    out = summarize_results_by_model(df)
+
+    # Ordering still by error (B best); timing is averaged, never a sort key.
+    assert list(out["Modelo"]) == ["B", "A"]
+    assert out.set_index("Modelo").loc["A", "Impute_Seconds"] == pytest.approx(3.0)
+
+
 def test_resolve_requested_models_deduplicates_darts_and_detects_tspulse() -> None:
     darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
         ["TiDE", "TiDE", " TCN ", TSPULSE_ORIGINAL_MODEL_NAME]

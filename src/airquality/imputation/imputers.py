@@ -16,6 +16,7 @@ Scaling rule (no flags): whoever scales, inverse-scales.
 from __future__ import annotations
 
 import os  # Read optional Hugging Face token from environment variables.
+import time  # Wall-clock timing of weight loading / per-gap fitting.
 import warnings  # Suppress optional runtime warnings during model prediction.
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -291,6 +292,10 @@ def build_tspulse_context_frame(
 ) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
     """Build TSPulse-ready context frame from all_series_map + mask.
 
+    The frame starts one complete model window before the earliest requested
+    mask and extends through the end of the test/mask range. The official
+    pipeline then slides over frames longer than ``context_length``.
+
     The synthetic-gap timestamps (``mask_index``) are kept as NaN: the official
     `TimeSeriesImputationPipeline` only substitutes the model reconstruction
     where the input frame has NaN, so pre-filling them would silence the model
@@ -298,12 +303,36 @@ def build_tspulse_context_frame(
     outside the mask (real historical holes / padding) are pre-filled with time
     interpolation.
     """
+    context_length = int(context_length)
+    if context_length < 1:
+        raise ValueError("context_length must be at least 1 for TSPulse")
+
+    mask_index = pd.DatetimeIndex(mask_index).drop_duplicates().sort_values()
+    test_index_out = pd.DatetimeIndex(test_index)
+    if len(test_index_out) == 0 and len(mask_index) == 0:
+        raise ValueError("TSPulse requires a non-empty test or mask index")
+
     full = all_series_map[series_name].copy()
     if len(mask_index) > 0:
         full.loc[full.index.intersection(mask_index)] = np.nan
 
-    end_ts = pd.Timestamp(test_index.max())
-    context_index = pd.date_range(end=end_ts, periods=int(context_length), freq=freq)
+    if len(mask_index) > 0:
+        start_ts = pd.Timestamp(mask_index.min()) - (context_length - 1) * to_offset(freq)
+        end_ts = pd.Timestamp(mask_index.max())
+        if len(test_index_out) > 0:
+            end_ts = max(end_ts, pd.Timestamp(test_index_out.max()))
+        context_index = pd.date_range(start=start_ts, end=end_ts, freq=freq)
+    else:
+        context_index = pd.date_range(
+            end=pd.Timestamp(test_index_out.max()), periods=context_length, freq=freq
+        )
+
+    uncovered = mask_index.difference(context_index)
+    if len(uncovered) > 0:
+        raise ValueError(
+            "TSPulse context frame does not cover requested mask timestamps: "
+            f"{list(uncovered[:3])}"
+        )
     context_values = full.reindex(context_index)
 
     # Fill only the real (non-mask) missing points; the mask must stay NaN so
@@ -327,7 +356,7 @@ def build_tspulse_context_frame(
             target_column: context_values.to_numpy(dtype=float),
         }
     )
-    return frame, pd.DatetimeIndex(test_index)
+    return frame, test_index_out
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +377,12 @@ class _DartsContextImputer:
         """Wrap one underlying model instance under a benchmark display name."""
         self._model = model
         self.model_name = str(model_name)
+        #: Two timers filled during each ``impute_gaps`` call: time spent fitting
+        #: (non-zero only for per-gap fitters like Prophet) and time spent
+        #: predicting. The benchmark reads both and turns them into per-hole
+        #: means — no external timing, no subtraction.
+        self._last_train_seconds: float = 0.0
+        self._last_impute_seconds: float = 0.0
 
     @property
     def model(self) -> Any:
@@ -386,6 +421,9 @@ class _DartsContextImputer:
     ) -> tuple[pd.Series, list[GapContextFailure]]:
         """Impute each gap using only clean left context, then inverse-scale."""
         del test_index  # Darts adapters derive context from `all_series_map`.
+        # Reset both per-call timers; `_predict_block` fills them in per gap.
+        self._last_train_seconds = 0.0
+        self._last_impute_seconds = 0.0
         use_scaled = self._uses_external_scaler and scaler is not None
         context_window = self._context_window()
         min_context = self._min_context()
@@ -519,7 +557,9 @@ class DartsGlobalGapImputer(_DartsContextImputer):
             last_type_error: TypeError | None = None
             for extra_kwargs in predict_attempts:
                 try:
+                    predict_start = time.perf_counter()
                     pred_ts = self._model.predict(**predict_base_kwargs, **extra_kwargs)
+                    self._last_impute_seconds += time.perf_counter() - predict_start
                     self._predict_extra_kwargs = extra_kwargs
                     break
                 except TypeError as exc:
@@ -587,8 +627,15 @@ class ProphetGapImputer(_DartsContextImputer):
         model = DartsProphet(**self._prophet_kwargs)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            # One timer around the fit (train), another around the predict
+            # (impute); both accumulate across this series' gaps and the
+            # benchmark turns them into per-hole means.
+            fit_start = time.perf_counter()
             model.fit(context_ts)
+            self._last_train_seconds += time.perf_counter() - fit_start
+            predict_start = time.perf_counter()
             pred_ts = model.predict(n=int(n))
+            self._last_impute_seconds += time.perf_counter() - predict_start
         return pred_ts.to_series().astype(float)
 
 
@@ -611,6 +658,11 @@ class InterpolationGapImputer:
         """Store the display name and the climatology seasonality (24 = hourly)."""
         self.model_name = str(model_name)
         self._seasonality = int(seasonality)
+        #: Interpolation has no training phase (zero preparation cost); its impute
+        #: timer is filled per call for the benchmark.
+        self.train_seconds: float = 0.0
+        self._last_train_seconds: float = 0.0
+        self._last_impute_seconds: float = 0.0
 
     def _fill(self, series: pd.Series, *, freq: str) -> pd.Series:
         """Return a fully-filled copy of ``series`` (no NaN) on the regular grid."""
@@ -649,7 +701,10 @@ class InterpolationGapImputer:
         # back (leakage), like `LinearGapImputer` re-masks too.
         series = all_series_map[series_name].copy()
         series.loc[series.index.intersection(mask_index)] = np.nan
+        self._last_train_seconds = 0.0
+        impute_start = time.perf_counter()
         filled = self._fill(series, freq=freq)
+        self._last_impute_seconds = time.perf_counter() - impute_start
         return filled.reindex(mask_index).astype(float), []
 
 
@@ -668,6 +723,11 @@ class LinearGapImputer:
     def __init__(self, *, model_name: str = "LinearInterp") -> None:
         """Store the display name used in benchmark results."""
         self.model_name = str(model_name)
+        #: Linear interpolation has no training phase (zero preparation cost); its
+        #: impute timer is filled per call for the benchmark.
+        self.train_seconds: float = 0.0
+        self._last_train_seconds: float = 0.0
+        self._last_impute_seconds: float = 0.0
 
     def _fill(self, series: pd.Series, *, freq: str) -> pd.Series:
         """Return a fully-filled copy of ``series`` (no NaN) using linear interp."""
@@ -698,7 +758,10 @@ class LinearGapImputer:
         # just read the ground truth back (leakage), like TSPulse re-masks too.
         series = all_series_map[series_name].copy()
         series.loc[series.index.intersection(mask_index)] = np.nan
+        self._last_train_seconds = 0.0
+        impute_start = time.perf_counter()
         filled = self._fill(series, freq=freq)
+        self._last_impute_seconds = time.perf_counter() - impute_start
         return filled.reindex(mask_index).astype(float), []
 
 
@@ -745,6 +808,13 @@ class TSPulseGapImputer:
         self.hf_token = hf_token if hf_token is not None else os.getenv("HF_TOKEN")
         self.local_files_only = bool(local_files_only)
         self.model_name = str(model_name)
+        #: Wall time of loading the pretrained weights (`from_pretrained`), set on
+        #: the first `_ensure_model`. Stays 0.0 when a model is injected directly
+        #: (already in memory); the offline finetuning cost is tracked separately.
+        #: This is the one-time "train" cost the benchmark reports for TSPulse.
+        self.train_seconds: float = float("nan") if model is None else 0.0
+        self._last_train_seconds: float = 0.0
+        self._last_impute_seconds: float = 0.0
 
     def _ensure_model(self, num_input_channels: int) -> Any:
         """Load TSPulse model lazily on first use."""
@@ -766,7 +836,9 @@ class TSPulseGapImputer:
         if self.model_path is None:
             load_kwargs["revision"] = self.revision
 
+        load_start = time.perf_counter()
         self.model = TSPulseForReconstruction.from_pretrained(source, **load_kwargs)
+        self.train_seconds = time.perf_counter() - load_start
         return self.model
 
     def _impute_full_series(
@@ -817,11 +889,24 @@ class TSPulseGapImputer:
 
         out = pipe(prepared)
         idx = pd.DatetimeIndex(out["timestamp"])
+        uncovered = mask_index.difference(idx)
+        if len(uncovered) > 0:
+            raise RuntimeError(
+                "TSPulse pipeline did not return requested mask timestamps: "
+                f"{list(uncovered[:3])}"
+            )
         value_col = "value_imputed" if "value_imputed" in out.columns else "value"
         imputed = pd.Series(
             out[value_col].to_numpy(dtype=float), index=idx, name=series_name
         )
-        return imputed.reindex(test_index_out)
+        missing = imputed.reindex(mask_index)
+        if missing.isna().any():
+            uncovered = missing.index[missing.isna()]
+            raise RuntimeError(
+                "TSPulse pipeline left requested mask timestamps unimputed: "
+                f"{list(uncovered[:3])}"
+            )
+        return imputed.reindex(test_index_out.union(mask_index, sort=False))
 
     def impute_gaps(
         self,
@@ -840,6 +925,11 @@ class TSPulseGapImputer:
         if len(mask_index) == 0:
             return pd.Series(index=mask_index, dtype=float, name=series_name), []
 
+        # TSPulse trains nothing here (zero-shot); its one-time weight load is the
+        # `train_seconds` reported by the benchmark. On the very first series this
+        # impute timer also covers that lazy load (`_ensure_model` runs inside).
+        self._last_train_seconds = 0.0
+        impute_start = time.perf_counter()
         imputed = self._impute_full_series(
             series_name=series_name,
             all_series_map=all_series_map,
@@ -847,7 +937,15 @@ class TSPulseGapImputer:
             test_index=test_index,
             freq=freq,
         )
-        return imputed.reindex(mask_index).astype(float), []
+        self._last_impute_seconds = time.perf_counter() - impute_start
+        pred = imputed.reindex(mask_index).astype(float)
+        if pred.isna().any():
+            uncovered = pred.index[pred.isna()]
+            raise RuntimeError(
+                "TSPulse produced no values for requested mask timestamps: "
+                f"{list(uncovered[:3])}"
+            )
+        return pred, []
 
 
 __all__ = [
