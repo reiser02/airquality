@@ -12,6 +12,10 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.egg-info/
+build/
+dist/
+*.whl
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

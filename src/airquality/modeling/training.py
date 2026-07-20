@@ -6,6 +6,7 @@ import gc
 import time
 import inspect
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,6 +21,7 @@ from darts.dataprocessing.transformers import Scaler
 from darts.models import (
     RNNModel,
     LinearRegressionModel,
+    TCNModel,
 )
 from darts.utils.missing_values import extract_subseries
 
@@ -29,6 +31,16 @@ from airquality.modeling.training_config import (
     build_base_training_kwargs,
     build_model_configs,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DartsModelSeriesRequirements:
+    """Native Darts target geometry for fitting and prediction."""
+
+    min_train_series_length: int
+    prediction_context_length: int
+    validation_target_offset: int | None
+    validation_target_length: int
 
 
 def build_scaled_train_val_series(
@@ -487,6 +499,76 @@ def _filter_model_init_kwargs(
     return {k: v for k, v in kwargs.items() if k in accepted_names}
 
 
+def _apply_output_chunk_horizon(
+    model_cls: type,
+    kwargs: dict[str, Any],
+    size_k: int,
+) -> dict[str, Any]:
+    """Apply the same output-chunk rule used by fitting and geometry probes."""
+    if (
+        "output_chunk_length" not in kwargs
+        and model_cls is not LinearRegressionModel
+        and model_cls is not RNNModel
+    ):
+        kwargs["output_chunk_length"] = size_k
+    return kwargs
+
+
+def get_model_series_requirements(
+    model_cls: type,
+    model_kwargs: dict[str, Any],
+    size_k: int,
+) -> DartsModelSeriesRequirements:
+    """Read native fit and prediction lengths from a configured Darts probe.
+
+    TCN and RNN train on shifted target datasets. Their validation labels start
+    earlier in the native window than labels for ordinary sequential models.
+    """
+    probe_kwargs = _apply_output_chunk_horizon(
+        model_cls,
+        deepcopy(model_kwargs),
+        size_k,
+    )
+    # A probe must never reset or overwrite a real checkpoint directory.
+    for key in ("force_reset", "model_name", "save_checkpoints", "work_dir"):
+        probe_kwargs.pop(key, None)
+    probe = model_cls(**_filter_model_init_kwargs(model_cls, probe_kwargs))
+
+    min_train_length = int(probe.min_train_series_length)
+    extreme_lags = probe.extreme_lags
+    min_target_lag = extreme_lags[0]
+    prediction_context = max(0, -int(min_target_lag or 0))
+
+    if isinstance(probe, LinearRegressionModel):
+        return DartsModelSeriesRequirements(
+            min_train_series_length=min_train_length,
+            prediction_context_length=prediction_context,
+            validation_target_offset=None,
+            validation_target_length=0,
+        )
+
+    if isinstance(probe, RNNModel):
+        validation_target_length = int(probe.training_length)
+    elif isinstance(probe, TCNModel):
+        validation_target_length = int(probe.input_chunk_length)
+    else:
+        output_shift = int(extreme_lags[-1] or 0)
+        validation_target_length = int(extreme_lags[1]) - output_shift + 1
+
+    validation_target_offset = min_train_length - validation_target_length
+    if validation_target_offset < 0 or validation_target_length <= 0:
+        raise ValueError(
+            f"Geometria Darts invalida para {model_cls.__name__}: "
+            f"min_train={min_train_length}, targets={validation_target_length}."
+        )
+    return DartsModelSeriesRequirements(
+        min_train_series_length=min_train_length,
+        prediction_context_length=prediction_context,
+        validation_target_offset=validation_target_offset,
+        validation_target_length=validation_target_length,
+    )
+
+
 def fit_darts_model(
     model_cls: type,
     series_train: list[TimeSeries],
@@ -519,6 +601,7 @@ def fit_darts_model(
     else:
         kwargs = deepcopy(build_base_training_kwargs())
         kwargs.update(model_kwargs)
+        kwargs = _apply_output_chunk_horizon(model_cls, kwargs, size_k)
         kwargs = _filter_model_init_kwargs(model_cls, kwargs)
 
         if not series_val:
@@ -534,23 +617,13 @@ def fit_darts_model(
             raise ValueError(
                 "`resume_mode` requiere `model_name` fijo en `model_kwargs` para localizar checkpoints."
             )
-        kwargs["force_reset"] = False
-
-    # output_chunk_length no aplica a algunos modelos; se pone condicionalmente.
-    if (
-        "output_chunk_length" not in kwargs
-        and model_cls is not LinearRegressionModel
-        and model_cls is not RNNModel
-    ):
-        kwargs["output_chunk_length"] = size_k
-
-    model = model_cls(**kwargs)
-
-    if resume_mode is not None:
-        if not hasattr(model, "load_weights_from_checkpoint"):
+        if not hasattr(model_cls, "load_from_checkpoint"):
             raise ValueError(
                 f"`resume_mode` no está soportado para el modelo '{model_cls.__name__}'."
             )
+        total_epochs = int(kwargs.get("n_epochs", 0))
+        if total_epochs <= 0:
+            raise ValueError("`resume_mode` requiere `n_epochs` total positivo.")
 
         load_kwargs: dict[str, Any] = {
             "best": resume_mode == "best",
@@ -560,16 +633,19 @@ def fit_darts_model(
             load_kwargs["work_dir"] = kwargs["work_dir"]
 
         try:
-            model.load_weights_from_checkpoint(**load_kwargs)
+            model = model_cls.load_from_checkpoint(**load_kwargs)
             print(
                 f"Reanudando {model_cls.__name__} desde checkpoint "
-                f"({resume_mode}) con model_name='{kwargs['model_name']}'"
+                f"({resume_mode}) hasta {total_epochs} epocas totales "
+                f"con model_name='{kwargs['model_name']}'"
             )
         except Exception as exc:
             raise FileNotFoundError(
                 "No se pudo cargar checkpoint para reanudar. Verifica `model_name`, "
                 "`work_dir` y que existan checkpoints previos."
             ) from exc
+    else:
+        model = model_cls(**kwargs)
 
     fit_kwargs: dict[str, Any] = {
         "series": series_train,
@@ -581,6 +657,9 @@ def fit_darts_model(
     # que no lo acepta (TypeError).
     if "stride" in inspect.signature(model_cls.fit).parameters:
         fit_kwargs["stride"] = 2
+    if resume_mode is not None:
+        # Lightning interprets max_epochs against the restored epoch counter.
+        fit_kwargs["epochs"] = total_epochs
     if series_val and model_cls is not LinearRegressionModel:
         fit_kwargs["val_series"] = series_val
         fit_kwargs["dataloader_kwargs"] = {"num_workers": 2}

@@ -11,7 +11,7 @@ production (real time, no ground truth):
    ``max_detection_rate`` (default 7%): target anomalies are sensor faults
    (spikes, calibration drift, cutouts), which are rare — a higher rate means
    the detector flags normal variation.
-4. Fuse the surviving detectors' normalized scores into a consensus ensemble
+4. Combine the surviving detectors by strict-majority vote
    (:func:`.ensemble.consensus`) and report its detection rate too.
 
 **``synthetic``** — supervised evaluation against injected anomalies. The
@@ -20,9 +20,10 @@ is injected **directly into the real series** — the old STL synthetic base was
 removed after ``docs/estudio_inyeccion_stl_2026-07-03.md`` showed it distorts
 per-model metrics. Each station is injected TWICE with independent seeds — a
 *selection* injection (``seed``) and a held-out *evaluation* injection
-(``eval_seed``). The ensemble ranks/weights the top-k detectors on the
-selection injection's VUS-PR and is scored on the evaluation one, keeping its
-metric unbiased. Reported metrics: auroc/aupr/vus_pr/vus_roc/affiliation_f1.
+(``eval_seed``). The ensemble ranks the top-k detectors on the selection
+injection's VUS-PR and combines their masks by strict-majority vote on the
+held-out evaluation injection. Reported metrics:
+auroc/aupr/vus_pr/vus_roc/affiliation_f1.
 
 Both modes share the loading (raw 5-minute data → hourly means → longest
 contiguous observed run per station, no ``dropna()`` gluing), the detector
@@ -53,9 +54,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datef
 from airquality.data.loaders import load_raw_5m
 from airquality.data.preprocessing import preprocess
 from airquality.data.segments import contiguous_observed_segments
+from airquality.paths import create_run_dir
 
 from .anomalies import inject_synthetic_anomalies
-from .ensemble import DEFAULT_ENSEMBLE_METHOD, DEFAULT_TOP_K, consensus, rank_top_k
+from .ensemble import DEFAULT_TOP_K, consensus, rank_top_k
 from .metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
@@ -184,7 +186,6 @@ class AnomalyBenchmarkConfig:
     pollutant: str = "NO2"
     raw_base_dir: str = "data/raw/datos_estaciones_5m"
     models: list[str] | None = None
-    ensemble_method: str = DEFAULT_ENSEMBLE_METHOD
     device: str = "cpu"
     seed: int = 13
     # unlabeled mode:
@@ -506,8 +507,8 @@ def _build_unlabeled_ensemble(
     ensemble_results = []
     for index, case in enumerate(cases):
         score_arrays = [detector_results[name]["per_case"][index]["scores"] for name in kept_models]
-        fused = consensus(score_arrays, config.ensemble_method, config.seed)
-        mask = detect_mask(fused, config.threshold_k)
+        fused = consensus(score_arrays, threshold_k=config.threshold_k)
+        mask = fused.astype(bool)
 
         timings = [detector_results[name]["per_case"][index]["timing"] for name in kept_models]
         ensemble_results.append(
@@ -516,12 +517,12 @@ def _build_unlabeled_ensemble(
                 "series_length": int(case.values.shape[0]),
                 "metrics": {"detection_rate": detection_rate(mask)},
                 "n_flagged": int(mask.sum()),
-                "threshold": float(mad_threshold(np.asarray(fused, dtype=np.float64), config.threshold_k)),
+                "threshold": 0.5,
                 "timing": {
                     "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
                     "inference_seconds": float(sum(timing["inference_seconds"] for timing in timings)),
                 },
-                "training_summary": {"selected_models": kept_models, "method": config.ensemble_method},
+                "training_summary": {"selected_models": kept_models, "method": "VOTE"},
             }
         )
     return ensemble_results
@@ -540,8 +541,7 @@ def _build_synthetic_ensemble(
         select_by_model = {name: result["per_case"][index]["vus_pr_select"] for name, result in detector_results.items()}
         top_models = rank_top_k(select_by_model, config.ensemble_top_k)
         score_arrays = [detector_results[name]["per_case"][index]["scores"] for name in top_models]
-        weights = [select_by_model[name] for name in top_models]
-        fused = consensus(score_arrays, config.ensemble_method, config.seed, weights=weights)
+        fused = consensus(score_arrays, threshold_k=config.threshold_k)
         metrics = compute_metrics(case.labels, fused, vus_sliding_window(case.labels))
 
         timings = [detector_results[name]["per_case"][index]["timing"] for name in top_models]
@@ -554,7 +554,7 @@ def _build_synthetic_ensemble(
                     "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
                     "inference_seconds": float(sum(timing["inference_seconds"] for timing in timings)),
                 },
-                "training_summary": {"selected_models": top_models, "method": config.ensemble_method},
+                "training_summary": {"selected_models": top_models, "method": "VOTE"},
             }
         )
     return ensemble_results
@@ -582,11 +582,12 @@ def _resolve_output_dir(config: AnomalyBenchmarkConfig) -> Path:
     """Create and return the run's output directory (timestamped by default)."""
     if config.output_dir is not None:
         output_dir = Path(config.output_dir)
-    else:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path("reports") / "anomaly" / f"{config.pollutant}_{stamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return create_run_dir(
+        Path("reports") / "anomaly", f"{config.pollutant}_{stamp}"
+    )
 
 
 def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, object]:
@@ -707,7 +708,6 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
 
 def recompute_ensemble(
     run_dir: str | Path,
-    method: str = DEFAULT_ENSEMBLE_METHOD,
     top_k: int = DEFAULT_TOP_K,
     threshold_k: float = DEFAULT_THRESHOLD_K,
     max_detection_rate: float | None = None,
@@ -718,11 +718,11 @@ def recompute_ensemble(
     ensemble according to the run's mode:
 
     - ``synthetic``: rank/weight the top-``top_k`` detectors by their saved
-      selection VUS-PR, fuse with ``method``, score against the saved labels;
+      selection VUS-PR, combine by majority vote, score against saved labels;
       returns macro VUS-PR per detector + new ensemble.
     - ``unlabeled``: re-apply the detection-rate filter (``max_detection_rate``
-      defaults to the saved value), fuse the survivors with ``method``,
-      re-threshold with ``threshold_k``; returns macro detection rates.
+      defaults to the saved value), combine survivors by majority vote; returns
+      macro detection rates.
     """
     run_dir = Path(run_dir)
     with (run_dir / "results.json").open() as fh:
@@ -741,14 +741,13 @@ def recompute_ensemble(
             }
             top_models = rank_top_k(select_by_model, top_k)
             score_arrays = [scores_npz[f"{name}__case{i}"] for name in top_models]
-            weights = [select_by_model[name] for name in top_models]
-            fused = consensus(score_arrays, method=method, weights=weights)
+            fused = consensus(score_arrays, threshold_k=threshold_k)
             labels = scores_npz[f"__labels__case{i}"]
             metrics = compute_metrics(labels, fused, vus_sliding_window(labels))
             ensemble_vus_pr_list.append(metrics["vus_pr"])
 
         out: dict[str, float] = {name: saved["models"][name]["macro_metrics"]["vus_pr"] for name in model_names}
-        out[f"Ensemble(method={method},top_k={top_k})"] = float(np.mean(ensemble_vus_pr_list))
+        out[f"Ensemble(method=VOTE,top_k={top_k})"] = float(np.mean(ensemble_vus_pr_list))
         return out
 
     if max_detection_rate is None:
@@ -768,7 +767,10 @@ def recompute_ensemble(
     if kept:
         ensemble_rates = []
         for i in range(n_cases):
-            fused = consensus([scores_npz[f"{name}__case{i}"] for name in kept], method=method)
-            ensemble_rates.append(detection_rate(detect_mask(fused, threshold_k)))
-        out[f"Ensemble(method={method},k={threshold_k})"] = float(np.mean(ensemble_rates))
+            fused = consensus(
+                [scores_npz[f"{name}__case{i}"] for name in kept],
+                threshold_k=threshold_k,
+            )
+            ensemble_rates.append(detection_rate(fused.astype(bool)))
+        out[f"Ensemble(method=VOTE,k={threshold_k})"] = float(np.mean(ensemble_rates))
     return out

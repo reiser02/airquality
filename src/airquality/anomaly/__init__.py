@@ -30,7 +30,7 @@ from .benchmark import (
     run_benchmark,
     split_by_detection_rate,
 )
-from .ensemble import DEFAULT_ENSEMBLE_METHOD, ENSEMBLE_METHODS, consensus, rank_top_k
+from .ensemble import consensus, rank_top_k
 from .metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
@@ -45,10 +45,8 @@ from .registry import MODEL_REGISTRY, resolve_model_names
 __all__ = [
     "AnomalyCase",
     "AnomalyBenchmarkConfig",
-    "DEFAULT_ENSEMBLE_METHOD",
     "DEFAULT_MAX_DETECTION_RATE",
     "DEFAULT_THRESHOLD_K",
-    "ENSEMBLE_METHODS",
     "INJECTION_VARIANT",
     "MODEL_REGISTRY",
     "MODES",
