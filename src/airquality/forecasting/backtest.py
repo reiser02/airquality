@@ -1,10 +1,8 @@
-"""Multi-step forecasting backtest on a held-out tail window.
+"""Multi-step forecasting backtest on a fixed held-out tail window.
 
 Used to compare forecasting error between a *raw* hourly series and its
-*preprocessed* (anomaly-removed + imputed) version. To keep the comparison fair
-both arms forecast over the **same** contiguous, observed holdout window and are
-scored against the **same** observed values; only the training data (and thus the
-learned weights) differ.
+*preprocessed* (anomaly-removed + imputed) version. Every arm forecasts over the
+same fixed, contiguous holdout selected by the pipeline's common support.
 
 The forecast input (context + holdout) is a contiguous observed block of the raw
 series, so neither arm needs its gaps imputed *for inference* -- the preprocessing
@@ -61,23 +59,22 @@ def select_holdout_window(
     context_len: int,
     train_min_len: int,
     validation_len: int = 48,
-    test_alignment: int = 48,
     freq: str = "h",
     host_min_len: int | None = None,
 ) -> dict | None:
-    """Reserve the latest viable observed block for context plus variable test.
+    """Reserve the latest viable observed block for context plus fixed test.
 
-    A candidate test block must provide at least ``context_len + holdout``
-    points. Its test tail is expanded to the largest multiple of
-    ``test_alignment`` that fits after the context. The whole candidate block is
-    excluded from training, including any short prefix left by alignment.
+    A candidate run must provide ``context_len`` observed context points followed
+    by exactly ``holdout`` observed targets. All timestamps before the first
+    target remain available to train/validation, including an earlier prefix of
+    the same run and the inference context.
 
-    A distinct, strictly earlier block must be long enough for
-    ``host_min_len`` when supplied, otherwise for ``train_min_len`` training
-    points plus ``validation_len`` held-out targets.
-    Returns ``None`` when no pair of blocks satisfies both requirements.
+    The history strictly before the first target must contain a block long enough
+    for ``host_min_len`` when supplied, otherwise for ``train_min_len`` training
+    points plus ``validation_len`` held-out targets. Returns ``None`` when no run
+    satisfies both requirements.
     """
-    if min(holdout, context_len, train_min_len, validation_len, test_alignment) <= 0:
+    if min(holdout, context_len, train_min_len, validation_len) <= 0:
         raise ValueError("Las longitudes de train, validacion y test deben ser positivas")
     if host_min_len is not None and host_min_len <= 0:
         raise ValueError("host_min_len debe ser positivo")
@@ -86,27 +83,28 @@ def select_holdout_window(
     runs = _observed_runs(s)
     host_len = host_min_len or train_min_len + validation_len
     index = pd.DatetimeIndex(s.index)
-    for i in range(len(runs) - 1, -1, -1):
-        start, end = runs[i]
-        available_test = end - start - context_len
-        test_len = (available_test // test_alignment) * test_alignment
-        if test_len < holdout:
-            continue
-        if not any(host_end - host_start >= host_len for host_start, host_end in runs[:i]):
+    for start, end in reversed(runs):
+        if end - start < context_len + holdout:
             continue
 
-        holdout_start_pos = end - test_len
+        holdout_start_pos = end - holdout
         eval_start = holdout_start_pos - context_len
+        train_runs = _observed_runs(s.iloc[:holdout_start_pos])
+        if not any(host_end - host_start >= host_len for host_start, host_end in train_runs):
+            continue
+
         return {
-            "train_index": index[:start],
-            "test_block_index": index[start:end],
-            "test_block_start": index[start],
+            "train_index": index[:holdout_start_pos],
+            "train_end": index[holdout_start_pos - 1],
+            "test_block_index": index[eval_start:end],
+            "test_block_start": index[eval_start],
+            "source_run_start": index[start],
             "eval_index": index[eval_start:end],
             "context_index": index[eval_start:holdout_start_pos],
             "holdout_index": index[holdout_start_pos:end],
             "holdout_start": index[holdout_start_pos],
             "holdout_end": index[end - 1],
-            "test_hours": test_len,
+            "test_hours": holdout,
         }
     return None
 
@@ -268,6 +266,7 @@ def backtest_forecast(
     preprocessing arms, pass the shared RAW training series for every arm:
     cleaning/imputation smooth the history and shrink its naive error, so
     per-arm denominators would inflate the preprocessed arms' MASE.
+
     """
     if model_config is None:
         model_config = resolve_forecasting_model_configs(
@@ -286,6 +285,7 @@ def backtest_forecast(
         "inference_seconds": float("nan"),
         "n_eval": 0,
         "n_forecasts": 0,
+        "n_expected_forecasts": 0,
         "n_unique_targets": 0,
         "origin_mae_mean": float("nan"),
         "origin_mae_std": float("nan"),
@@ -332,6 +332,13 @@ def backtest_forecast(
     )
 
     eval_s = ensure_datetime_series(eval_series, freq=freq, name=str(eval_series.name or "series"))
+    try:
+        holdout_pos = int(eval_s.index.get_loc(holdout_start))
+    except KeyError as exc:
+        raise ValueError("holdout_start debe pertenecer a eval_series") from exc
+    expected_positions = list(range(holdout_pos, len(eval_s) - size_k + 1, forecast_stride))
+    expected_starts = pd.DatetimeIndex(eval_s.index[expected_positions])
+    result["n_expected_forecasts"] = len(expected_starts)
     eval_ts = TimeSeries.from_series(eval_s, freq=freq).astype(np.float32)
     eval_scaled = scaler.transform(eval_ts)
 
@@ -364,6 +371,23 @@ def backtest_forecast(
     if not forecasts:
         return result
     forecast_list = forecasts if isinstance(forecasts, list) else [forecasts]
+    actual_starts = pd.DatetimeIndex(forecast.start_time() for forecast in forecast_list)
+    exact_windows = len(forecast_list) == len(expected_positions) and actual_starts.equals(
+        expected_starts
+    )
+    if exact_windows:
+        exact_windows = all(
+            pd.DatetimeIndex(forecast.time_index).equals(
+                pd.DatetimeIndex(eval_s.index[position : position + size_k])
+            )
+            for forecast, position in zip(forecast_list, expected_positions, strict=True)
+        )
+    if not exact_windows:
+        logging.warning(
+            "[%s] Darts devolvio ventanas distintas al plan explicito de test",
+            model_name,
+        )
+        return result
     predictions = [scaler.inverse_transform(forecast) for forecast in forecast_list]
 
     insample = (

@@ -132,7 +132,7 @@ def test_effective_config_and_key_exclude_runtime_device(tmp_path):
 # Pipeline resume: second run recomputes nothing
 # --------------------------------------------------------------------------- #
 def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
-    def fake_loader(*, freq, name_from_path=True, target_column_index=None):
+    def fake_loader(**_kwargs):
         s = _seasonal_series(n=900, name="ST0", seed=0)
         s.iloc[200] = 130.0
         s.iloc[300:330] = np.nan
@@ -144,16 +144,17 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
         ("forecasting", "strategies"): ("unlabeled",),
     }
     int_map = {
-        ("forecasting", "holdout"): 40,
+        ("forecasting", "holdout"): 96,
         ("forecasting", "context_len"): 72,
         ("forecasting", "min_series_points"): 300,
     }
     str_map = {
         ("forecasting", "imputation"): "impute",
+        ("forecasting", "imputation_model"): "interp",
         ("forecasting", "cache_dir"): str(tmp_path / "cache"),
     }
 
-    monkeypatch.setattr(cp, "load_and_normalize_series", fake_loader)
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(cp, "cfg_get_csv_list", lambda s, o, d, *, cfg=None: csv_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_int", lambda s, o, d, cfg=None: int_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_str", lambda s, o, d, cfg=None: str_map.get((s, o), d))
@@ -190,3 +191,4 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     assert calls["detect"] == 0
     pd.testing.assert_frame_equal(first["results_df"], second["results_df"])
     pd.testing.assert_frame_equal(first["detection_df"], second["detection_df"])
+    pd.testing.assert_frame_equal(first["selection_df"], second["selection_df"])

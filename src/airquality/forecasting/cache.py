@@ -39,7 +39,11 @@ import pandas as pd
 #: v5: rolling validation/test origins use explicit per-regime strides. v6:
 #: keys include effective config, artifact content, and transform behavior. v7:
 #: forecasting-only local/foundation model definitions and Darts 0.46 support.
-CACHE_VERSION = 7
+#: v8: full-series detection and fixed holdout selected from common masks.
+#: v9: each detector is fitted once on all block-local windows of a station.
+#: v10: injected rankings and detector eligibility are resolved per block. v11:
+#: detector coverage is finite-score-aware and failed backtests are not persisted.
+CACHE_VERSION = 11
 
 
 def series_fingerprint(series: pd.Series) -> str:
