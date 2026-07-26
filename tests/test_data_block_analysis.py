@@ -5,8 +5,10 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import airquality.data.block_analysis as block_analysis
 from airquality.data.block_analysis import (
     _worst_case_requirements,
+    analyze_raw_blocks,
     classify_blocks,
     observed_blocks,
     run_analysis,
@@ -73,6 +75,11 @@ def test_observed_blocks_and_validation_chronology() -> None:
     assert total["long_used_blocks"] == 1
     assert total["long_validation_forecasts"] == 3
     assert total["long_unused_eligible_blocks"] == 1
+    note = block_analysis._requirement_note(series_summary)
+    assert note == (
+        "Peor caso entre 2 modelos configurados: short 128 h (NLinear/TiDE); "
+        "long 216 h (NLinear/TiDE)."
+    )
 
 
 def test_contiguous_observed_segments_splits_missing_hour() -> None:
@@ -84,6 +91,7 @@ def test_contiguous_observed_segments_splits_missing_hour() -> None:
     segments = contiguous_observed_segments(series, min_len=2)
 
     assert [segment.tolist() for segment in segments] == [[1.0, 2.0], [3.0, 4.0]]
+    assert observed_blocks(series)["hours"].tolist() == [2, 2]
 
 
 def test_worst_case_requirements_use_native_model_geometry() -> None:
@@ -106,6 +114,46 @@ def test_worst_case_requirements_use_native_model_geometry() -> None:
     }
     assert requirements["long"]["host_minimum_hours"] == 216
     assert requirements["long"]["limiting_models"] == "TCN"
+
+
+def test_analysis_retains_same_run_prefix_before_fixed_holdout(
+    tmp_path, monkeypatch
+) -> None:
+    index = pd.date_range("2024-01-01", periods=500, freq="h")
+    hourly = pd.DataFrame({"NO2": range(500)}, index=index, dtype=float)
+    monkeypatch.setattr(
+        block_analysis,
+        "load_raw_5m",
+        lambda *_args, **_kwargs: [("ST0", hourly)],
+    )
+    monkeypatch.setattr(
+        block_analysis,
+        "preprocess",
+        lambda *_args, **_kwargs: ([hourly], {}),
+    )
+
+    blocks, series, excluded = analyze_raw_blocks(
+        tmp_path,
+        ("NO2",),
+        context=72,
+        short_horizon=8,
+        long_horizon=48,
+        short_stride=4,
+        long_stride=24,
+        short_validation_len=48,
+        long_validation_len=96,
+        holdout=192,
+        min_run=1,
+        min_useful=1,
+        forecast_models=("NLinear", "TiDE"),
+        seasonality_m=24,
+    )
+
+    assert excluded.empty
+    assert series.iloc[0]["test_hours"] == 192
+    assert series.iloc[0]["prior_observed_hours"] == 308
+    assert blocks["hours"].sum() == 308
+    assert series.iloc[0]["source_run_start"] == index[0]
 
 
 def test_analysis_rejects_validation_shorter_than_horizon(tmp_path) -> None:
