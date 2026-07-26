@@ -226,6 +226,77 @@ def test_tspulse_gap_imputer_rejects_uncovered_masks(
         )
 
 
+def test_tspulse_gap_imputer_does_not_count_lazy_load_as_imputation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from airquality.imputation import imputers as imputers_mod
+
+    index = pd.date_range("2024-01-01", periods=3, freq="h")
+    gap = pd.DatetimeIndex(index[1:2])
+    imputer = imputers_mod.TSPulseGapImputer(context_length=2, device="cpu")
+
+    def fake_impute(**_: object) -> pd.Series:
+        if imputer.model is None:
+            imputer.model = object()
+            imputer.train_seconds = 3.0
+        return pd.Series(1.0, index=gap)
+
+    class Clock:
+        values = iter((0.0, 10.0, 20.0, 24.0))
+
+        @classmethod
+        def perf_counter(cls) -> float:
+            return next(cls.values)
+
+    monkeypatch.setattr(imputer, "_impute_full_series", fake_impute)
+    monkeypatch.setattr(imputers_mod, "time", Clock)
+
+    kwargs = {
+        "series_name": "S",
+        "all_series_map": {"S": pd.Series(range(3), index=index, dtype=float)},
+        "gap_windows": [gap],
+        "test_index": index,
+        "freq": "h",
+    }
+    imputer.impute_gaps(**kwargs)
+    assert imputer.train_seconds == pytest.approx(3.0)
+    assert imputer._last_impute_seconds == pytest.approx(7.0)
+
+    imputer.impute_gaps(**kwargs)
+    assert imputer._last_impute_seconds == pytest.approx(4.0)
+
+
+def test_tspulse_model_setup_time_includes_device_transfer(monkeypatch) -> None:
+    from airquality.imputation import imputers as imputers_mod
+
+    class Model:
+        def __init__(self) -> None:
+            self.device = None
+            self.evaluating = False
+
+        def to(self, device):
+            self.device = device
+            return self
+
+        def eval(self):
+            self.evaluating = True
+            return self
+
+    model = Model()
+    monkeypatch.setattr(imputers_mod, "TSFM_PUBLIC_AVAILABLE", True)
+    monkeypatch.setattr(
+        imputers_mod.TSPulseForReconstruction,
+        "from_pretrained",
+        lambda *args, **kwargs: model,
+    )
+    imputer = imputers_mod.TSPulseGapImputer(context_length=2, device="cpu")
+
+    assert imputer._ensure_model(1) is model
+    assert model.device == "cpu"
+    assert model.evaluating
+    assert imputer.train_seconds >= 0.0
+
+
 @pytest.mark.skipif(not PROPHET_AVAILABLE, reason="darts Prophet unavailable")
 def test_prophet_gap_imputer_fills_gap_with_finite_values() -> None:
     imputer = ProphetGapImputer(model_name="Prophet")

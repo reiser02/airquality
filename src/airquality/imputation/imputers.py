@@ -808,10 +808,9 @@ class TSPulseGapImputer:
         self.hf_token = hf_token if hf_token is not None else os.getenv("HF_TOKEN")
         self.local_files_only = bool(local_files_only)
         self.model_name = str(model_name)
-        #: Wall time of loading the pretrained weights (`from_pretrained`), set on
-        #: the first `_ensure_model`. Stays 0.0 when a model is injected directly
-        #: (already in memory); the offline finetuning cost is tracked separately.
-        #: This is the one-time "train" cost the benchmark reports for TSPulse.
+        #: Wall time of loading the pretrained weights and moving them to the
+        #: runtime device, set on the first `_ensure_model`. Stays 0.0 when a model
+        #: is injected directly; offline finetuning cost is tracked separately.
         self.train_seconds: float = float("nan") if model is None else 0.0
         self._last_train_seconds: float = 0.0
         self._last_impute_seconds: float = 0.0
@@ -837,7 +836,9 @@ class TSPulseGapImputer:
             load_kwargs["revision"] = self.revision
 
         load_start = time.perf_counter()
-        self.model = TSPulseForReconstruction.from_pretrained(source, **load_kwargs)
+        self.model = TSPulseForReconstruction.from_pretrained(
+            source, **load_kwargs
+        ).to(self.device).eval()
         self.train_seconds = time.perf_counter() - load_start
         return self.model
 
@@ -926,9 +927,9 @@ class TSPulseGapImputer:
             return pd.Series(index=mask_index, dtype=float, name=series_name), []
 
         # TSPulse trains nothing here (zero-shot); its one-time weight load is the
-        # `train_seconds` reported by the benchmark. On the very first series this
-        # impute timer also covers that lazy load (`_ensure_model` runs inside).
+        # `train_seconds` reported by the benchmark, not part of imputation time.
         self._last_train_seconds = 0.0
+        load_pending = self.model is None
         impute_start = time.perf_counter()
         imputed = self._impute_full_series(
             series_name=series_name,
@@ -937,7 +938,9 @@ class TSPulseGapImputer:
             test_index=test_index,
             freq=freq,
         )
-        self._last_impute_seconds = time.perf_counter() - impute_start
+        elapsed = time.perf_counter() - impute_start
+        load_seconds = self.train_seconds if load_pending else 0.0
+        self._last_impute_seconds = max(0.0, elapsed - load_seconds)
         pred = imputed.reindex(mask_index).astype(float)
         if pred.isna().any():
             uncovered = pred.index[pred.isna()]
