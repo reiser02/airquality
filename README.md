@@ -130,22 +130,136 @@ per-model architecture parameters.
 
 ## Expected Data Layout
 
-The default configuration expects processed hourly CSV data under:
+Training and imputation use processed hourly CSV data under:
 
 ```text
 data/processed/Datos-post-COUTA/*/
 ```
 
 with filenames or paths matching the configured pollutant keyword, currently `NO2`.
+Anomaly detection, forecasting, and the block reports instead read raw 5-minute
+stations under `data/raw/datos_estaciones_5m/` and apply the shared hourly
+preprocessing.
 
 Key assumptions in the loaders:
 
 - only `.csv` and `.json` are supported
 - many loaders silently skip unsupported files or invalid shapes
 - the default timestamp column is `fecha`
-- training and benchmark flows expect each loaded series to become a single-column time series
+- each workflow expects a loaded station to become a single-column time series
 
 ## Main Workflows
+
+### Generate data-block reports
+
+Three diagnostics can be generated under `reports/data_blocks/`. They all read
+the raw 5-minute station files, apply the shared hourly preprocessing, and
+preserve gaps instead of concatenating observations across missing timestamps.
+Use `--output-dir` with any command to select a fixed destination.
+
+#### Available forecasting blocks
+
+```bash
+uv run python -m airquality.data.block_analysis
+```
+
+This is the fast, model-free pre-study for NO2 and CO. It reserves the fixed
+holdout, measures contiguous observed blocks before it, and reports whether
+each block can support the configured short/long forecasting and validation
+geometry. It does not run anomaly detectors or forecasting models, so the
+reported support is an upper bound for detector-aware runs.
+
+The default output is `reports/data_blocks/YYYYMMDD_HHMMSS/` and contains:
+
+- `summary.csv`: aggregate block counts, usable hours, and retention by pollutant
+- `series_summary.csv`: holdout, validation, and retained-support details per station and pollutant
+- `blocks.csv`: start, end, length, eligibility, and usage of every contiguous block
+- `excluded_series.csv`: series that could not provide the required holdout or training history
+- `retention_overview.png`, `block_length_distribution.png`, `retained_hours_by_series.png`, and `usable_blocks_by_series.png`
+
+Useful options include `--pollutants`, `--context`, short/long horizon, stride,
+and validation lengths, `--holdout`, and `--forecast-models`. Defaults are read
+from the forecasting configuration where applicable.
+
+#### Support recovered by bridging short gaps
+
+```bash
+uv run python -m airquality.data.gap_bridge_analysis
+```
+
+This report estimates how much usable support would be gained by joining
+observed runs across short gaps. By default it analyzes NO2, requires a final
+component of at least 80 hourly points, and bridges gaps of at most 5 hours.
+It distinguishes newly eligible components from extensions of blocks that were
+already eligible.
+
+The default output is `reports/data_blocks/gap_bridge_YYYYMMDD_HHMMSS/` and contains:
+
+- `components.csv`: composition, observed/imputed points, age, and recovery type for each joined component
+- `summary.csv`: aggregate baseline support, recovered real points, imputation cost, and usable gain
+- `gap_bridge_overview.png`: support gain, recovery type, and recency overview
+
+Use `--pollutant`, `--minimum`, and `--max-gap` to change the analysis.
+
+#### Blocks after anomaly detection
+
+```bash
+uv run python -m airquality.data.detected_block_analysis
+```
+
+This is the detector-aware NO2 audit. It compares raw blocks with every
+registered detector, the rate-filtered `unlabeled` consensus, and the
+injection-ranked `inject-vote` strategy. Unlike the other two reports, this
+command fits and scores detectors and can therefore take substantially longer.
+Detection results are cached in `reports/data_blocks/detection_cache/` by default.
+
+The default output is `reports/data_blocks/detected_NO2_YYYYMMDD_HHMMSS/` and contains:
+
+- `summary.csv` and `series_summary.csv`: aggregate and per-station impact of each detector/strategy
+- `blocks.csv` and `block_distribution.csv`: resulting blocks and their length distribution
+- `detector_coverage.csv`: coverage, detection rates, unlabeled filtering, and unscored segments
+- `selection.csv`: detector ranking and selection used by `inject-vote` for each block
+- `manifest.json`: effective parameters and detector list
+- `README.md`: protocol and principal results for that run
+- `retention_overview.png`, `block_length_distribution.png`, `block_impact_by_detector.png`, and `detection_rate_distribution.png`
+
+Use `--cache-dir` to change the detection cache or `--output-dir` to select the
+report directory.
+
+### Generate the imputation-support report
+
+This audit measures how many train-eligible hourly points are recovered by each
+configured anomaly-detection strategy after imputation. It uses the shared
+holdout and the strictest configured training-length requirement, but does not
+run forecasting models.
+
+First generate the persisted data from the `[forecasting]` configuration:
+
+```bash
+uv run python -m airquality.forecasting.imputation_support_analysis
+```
+
+The command reuses the forecasting detection/imputation cache and writes
+`training_support.csv` under a new timestamped directory:
+
+```text
+reports/forecasting_support/YYYYMMDD_HHMMSS/
+```
+
+Then render the figures from that CSV without rerunning detection or imputation:
+
+```bash
+uv run python -m airquality.forecasting.plot_imputation_support_analysis \
+  reports/forecasting_support/YYYYMMDD_HHMMSS
+```
+
+Omit the directory to render the newest run. The report contains:
+
+- `training_support.csv`: per-series and per-strategy support counts and ages
+- `support_composition.png`: aggregate support before and after imputation
+- `support_gain_by_series.png`: additional usable training days per series
+- `support_age.png`: median age of filled hours by strategy
+- `support_age_timeline.png`: the same age metric positioned relative to the holdout
 
 ### Train the configured forecasting models
 

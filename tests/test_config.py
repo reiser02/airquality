@@ -41,5 +41,10 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     ]
     assert cfg.getboolean("imputation", "strict_artifacts") is True
     assert cfg.getint("imputation", "max_workers") == 1
+    assert cfg.getint("anomaly", "min_series_points") == 8
+    assert cfg.get("forecasting", "imputation_model") == "TSPulse"
+    assert cfg.getint("forecasting", "max_imputation_gap") == 5
+    assert cfg.get("forecasting", "pollutant") == "NO2"
+    assert cfg.get("forecasting", "raw_base_dir") == "data/raw/datos_estaciones_5m"
     assert not cfg.has_option("benchmark", "model_names")
     assert cfg.has_option("tspulse", "finetuned_model_path")
