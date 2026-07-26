@@ -5,9 +5,10 @@ Run with::
     uv run python -m airquality.data.block_analysis
 
 The command preprocesses the raw 5-minute NO2/CO files, reserves one complete
-observed block for a variable test of at least 192 hours, and audits rolling
-short/long validation requirements. It writes CSV tables plus figures under
-``reports/data_blocks/<timestamp>/`` without running detectors or models.
+observed block for an exact 192-hour test, and audits rolling short/long
+validation requirements. It writes CSV tables plus figures under
+``reports/data_blocks/<timestamp>/`` without running detectors or models, so its
+raw-support coverage is an upper bound for the detector-aware benchmark.
 """
 
 from __future__ import annotations
@@ -48,7 +49,11 @@ def observed_blocks(series: pd.Series) -> pd.DataFrame:
         return pd.DataFrame(columns=["start", "end", "hours"])
 
     frame = pd.DataFrame({"timestamp": series.index, "observed": observed.to_numpy()})
-    frame["block"] = (frame["observed"] & ~frame["observed"].shift(fill_value=False)).cumsum()
+    starts = (
+        ~frame["observed"].shift(fill_value=False)
+        | frame["timestamp"].diff().ne(pd.Timedelta(hours=1))
+    )
+    frame["block"] = (frame["observed"] & starts).cumsum()
     return (
         frame.loc[frame["observed"]]
         .groupby("block", sort=True)
@@ -169,7 +174,6 @@ def analyze_raw_blocks(
     short_validation_len: int,
     long_validation_len: int,
     holdout: int,
-    test_alignment: int,
     min_run: int,
     min_useful: int,
     forecast_models: tuple[str, ...],
@@ -180,12 +184,18 @@ def analyze_raw_blocks(
     horizons = {"short": short_horizon, "long": long_horizon}
     strides = {"short": short_stride, "long": long_stride}
     validation_hours = {"short": short_validation_len, "long": long_validation_len}
-    if any(
+    if holdout <= 0 or any(
         min(horizons[regime], strides[regime], validation_hours[regime]) <= 0
+        or strides[regime] > horizons[regime]
         or validation_hours[regime] < horizons[regime]
+        or (validation_hours[regime] - horizons[regime]) % strides[regime] != 0
+        or holdout < horizons[regime]
+        or (holdout - horizons[regime]) % strides[regime] != 0
         for regime in regimes
     ):
-        raise ValueError("Horizonte, stride y validacion de cada regimen deben ser validos")
+        raise ValueError(
+            "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
+        )
     requirements = _worst_case_requirements(
         forecast_models,
         context=context,
@@ -240,27 +250,27 @@ def analyze_raw_blocks(
                 train_min_len=max(regimes.values()),
                 validation_len=max(validation_hours.values()),
                 host_min_len=max(host_minimum_hours.values()),
-                test_alignment=test_alignment,
             )
             if window is None:
                 excluded_rows.append(
                     {"pollutant": pollutant, "station": station}
                     | details
-                    | {"exclusion_reason": "no_test_and_validation_host_pair"}
+                    | {"exclusion_reason": "no_fixed_test_or_training_host"}
                 )
                 continue
 
             train = series.loc[window["train_index"]]
             details |= {
                 "test_block_start": window["test_block_start"],
+                "source_run_start": window["source_run_start"],
                 "holdout_start": window["holdout_start"],
                 "holdout_end": window["holdout_end"],
                 "test_hours": window["test_hours"],
                 "prior_observed_hours": int(train.notna().sum()),
             }
-            training_blocks = full_blocks.loc[
-                full_blocks["end"].lt(window["test_block_start"])
-            ].reset_index(drop=True)
+            # The new split keeps every pre-target value, including the prefix
+            # and context from the run that hosts the fixed holdout.
+            training_blocks = observed_blocks(train)
             blocks = classify_blocks(
                 training_blocks,
                 regimes,
@@ -277,7 +287,9 @@ def analyze_raw_blocks(
                 "holdout_start": details["holdout_start"],
                 "holdout_end": details["holdout_end"],
                 "test_block_start": details["test_block_start"],
+                "source_run_start": details["source_run_start"],
                 "test_hours": details["test_hours"],
+                "prior_observed_hours": details["prior_observed_hours"],
                 "forecast_models": ", ".join(forecast_models),
                 "observed_hours": int(blocks["hours"].sum()),
                 "total_blocks": len(blocks),
@@ -395,8 +407,11 @@ def _requirement_note(table: pd.DataFrame) -> str:
         f"({row[f'{regime}_limiting_models']})"
         for regime in ("short", "long")
     ]
+    model_count = len(
+        [name for name in str(row["forecast_models"]).split(",") if name.strip()]
+    )
     return (
-        f"Peor caso entre modelos configurados ({row['forecast_models']}): "
+        f"Peor caso entre {model_count} modelos configurados: "
         + "; ".join(parts)
         + "."
     )
@@ -633,7 +648,6 @@ def run_analysis(
     short_validation_len: int = 48,
     long_validation_len: int = 96,
     holdout: int = 192,
-    test_alignment: int = 48,
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
     forecast_models: tuple[str, ...] | None = None,
@@ -649,6 +663,12 @@ def run_analysis(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "summary": output / "summary.csv",
+        "series": output / "series_summary.csv",
+        "blocks": output / "blocks.csv",
+        "excluded": output / "excluded_series.csv",
+    }
     blocks, series, excluded = analyze_raw_blocks(
         base_dir,
         pollutants,
@@ -660,22 +680,26 @@ def run_analysis(
         short_validation_len=short_validation_len,
         long_validation_len=long_validation_len,
         holdout=holdout,
-        test_alignment=test_alignment,
         min_run=min_run,
         min_useful=min_useful,
         forecast_models=forecast_models,
         seasonality_m=seasonality_m,
     )
     if blocks.empty:
-        raise RuntimeError("No eligible series produced training blocks")
+        pd.DataFrame(
+            columns=["pollutant", "series", "total_blocks", "observed_hours"]
+        ).to_csv(paths["summary"], index=False)
+        series.reindex(columns=["pollutant", "station"]).to_csv(
+            paths["series"], index=False
+        )
+        blocks.reindex(columns=["pollutant", "station", "start", "end", "hours"]).to_csv(
+            paths["blocks"], index=False
+        )
+        excluded.to_csv(paths["excluded"], index=False)
+        print(f"No hay series elegibles; diagnostico guardado en: {output}")
+        return paths
 
     summary = summarize_blocks(blocks, series)
-    paths = {
-        "summary": output / "summary.csv",
-        "series": output / "series_summary.csv",
-        "blocks": output / "blocks.csv",
-        "excluded": output / "excluded_series.csv",
-    }
     summary.to_csv(paths["summary"], index=False)
     series.to_csv(paths["series"], index=False)
     blocks.to_csv(paths["blocks"], index=False)
@@ -748,11 +772,6 @@ def main() -> None:
     parser.add_argument(
         "--holdout", type=int, default=cfg_get_int("forecasting", "holdout", 192)
     )
-    parser.add_argument(
-        "--test-alignment",
-        type=int,
-        default=cfg_get_int("forecasting", "test_alignment", 48),
-    )
     parser.add_argument("--min-run", type=int, default=MIN_RUN)
     parser.add_argument("--min-useful", type=int, default=MIN_USEFUL)
     parser.add_argument("--forecast-models", nargs="+", default=None)
@@ -778,7 +797,6 @@ def main() -> None:
         short_validation_len=args.short_validation_len,
         long_validation_len=args.long_validation_len,
         holdout=args.holdout,
-        test_alignment=args.test_alignment,
         min_run=args.min_run,
         min_useful=args.min_useful,
         forecast_models=(tuple(args.forecast_models) if args.forecast_models else None),
