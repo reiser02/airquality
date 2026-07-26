@@ -81,6 +81,21 @@ def rolling_windows_nd(values: np.ndarray, window_size: int, stride: int = 1) ->
     return np.stack(windows).astype(np.float32, copy=False)
 
 
+def pooled_windows_nd(
+    segments: list[np.ndarray], window_size: int, stride: int = 1
+) -> np.ndarray:
+    """Concatenate windows extracted within segments, never across boundaries."""
+    windows = [
+        rolling_windows_nd(segment, window_size, stride)
+        for segment in segments
+        if len(segment) >= window_size
+    ]
+    if not windows:
+        feature_count = segments[0].shape[1] if segments else 1
+        return np.empty((0, window_size, feature_count), dtype=np.float32)
+    return np.concatenate(windows, axis=0)
+
+
 def subsample_windows(windows: np.ndarray, max_windows: int, seed: int) -> np.ndarray:
     """Cap training-window count so per-epoch cost doesn't scale with series length."""
 
@@ -187,6 +202,7 @@ class BaseTimeSeriesAnomalyDetector:
         seed: int = 13,
     ) -> None:
         self.window_size = window_size
+        self.minimum_series_length = window_size
         self.stride = stride
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.seed = seed
@@ -197,14 +213,46 @@ class BaseTimeSeriesAnomalyDetector:
 
     def fit(self, train_values: np.ndarray) -> "BaseTimeSeriesAnomalyDetector":
         """Seed RNGs, fit the standardizer, and train on the normalized series."""
+        return self.fit_segments([train_values])
+
+    def fit_segments(
+        self, train_segments: list[np.ndarray]
+    ) -> "BaseTimeSeriesAnomalyDetector":
+        """Fit once from multiple segments without creating cross-gap windows."""
         set_random_seed(self.seed)
-        train_array = ensure_2d(train_values)
+        arrays = [
+            ensure_2d(values)
+            for values in train_segments
+            if len(values) >= self.minimum_series_length
+        ]
+        if not arrays:
+            raise ValueError(
+                f"Model requires at least {self.minimum_series_length} finite points in one segment"
+            )
+        train_array = np.concatenate(arrays, axis=0)
         self.scaler_ = fit_standardizer_nd(train_array)
         self.mean_ = np.asarray(self.scaler_.mean_, dtype=np.float32)
         self.std_ = np.asarray(self.scaler_.scale_, dtype=np.float32)
-        normalized_train = transform_standardize_nd(train_array, self.scaler_)
-        self._fit_normalized(normalized_train)
+        normalized_segments = [
+            transform_standardize_nd(array, self.scaler_) for array in arrays
+        ]
+        self._fit_normalized_segments(normalized_segments)
         return self
+
+    def score_segments(
+        self, segments: list[np.ndarray]
+    ) -> list[np.ndarray | None]:
+        """Score each segment independently with the shared fitted model."""
+        scores: list[np.ndarray | None] = []
+        for segment in segments:
+            if len(segment) < self.minimum_series_length:
+                scores.append(None)
+                continue
+            try:
+                scores.append(self.score(segment))
+            except Exception:
+                scores.append(None)
+        return scores
 
     def score(self, values: np.ndarray) -> np.ndarray:
         """Standardize with the fitted scaler and return per-timestep scores."""
@@ -237,6 +285,10 @@ class BaseTimeSeriesAnomalyDetector:
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Train on the standardized series; implemented by subclasses."""
         raise NotImplementedError
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Fit from normalized segments; non-windowed subclasses may pool points."""
+        self._fit_normalized(np.concatenate(segments, axis=0))
 
     def _score_normalized(self, values: np.ndarray) -> np.ndarray:
         """Score the standardized series; implemented by subclasses."""

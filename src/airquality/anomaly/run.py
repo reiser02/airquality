@@ -70,7 +70,7 @@ def main() -> None:
         "--max-detection-rate",
         type=float,
         default=cfg_get_float("anomaly", "max_detection_rate", DEFAULT_MAX_DETECTION_RATE),
-        help="[unlabeled] discard detectors whose macro detection rate exceeds this fraction",
+        help="[unlabeled] per-station detector-rate budget",
     )
     parser.add_argument(
         "--eval-seed",
@@ -84,7 +84,11 @@ def main() -> None:
         default=cfg_get_int("anomaly", "ensemble_top_k", DEFAULT_TOP_K),
         help="[synthetic] ensemble size (ranked by selection VUS-PR)",
     )
-    parser.add_argument("--min-series-points", type=int, default=cfg_get_int("anomaly", "min_series_points", 600))
+    parser.add_argument(
+        "--min-series-points",
+        type=int,
+        default=cfg_get_int("anomaly", "min_series_points", 8),
+    )
     parser.add_argument("--series-limit", type=int, default=None, help="Limit number of stations")
     parser.add_argument("--output-dir", default=None, help="Output dir (default: reports/anomaly/<pollutant>_<ts>)")
     args = parser.parse_args()
@@ -105,6 +109,7 @@ def main() -> None:
     if summary["mode"] == "unlabeled":
         payload["kept_models"] = summary["kept_models"]
         payload["discarded_models"] = summary["discarded_models"]
+        payload["selection_by_series"] = summary["selection_by_series"]
     print(json.dumps(payload, indent=2))
 
 

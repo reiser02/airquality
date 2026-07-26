@@ -12,6 +12,7 @@ from .common import (
     BaseTimeSeriesAnomalyDetector,
     log_epoch,
     resolve_training_stride,
+    pooled_windows_nd,
     rolling_windows_nd,
     subsample_windows,
 )
@@ -47,7 +48,7 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
 
     def __init__(
         self,
-        window_size: int = 100,
+        window_size: int = 65,
         horizon: int = 8,
         hidden_size: int = 64,
         num_layers: int = 2,
@@ -63,6 +64,7 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
     ) -> None:
         super().__init__(window_size=window_size, device=device, seed=seed)
         self.horizon = horizon
+        self.minimum_series_length = self.window_size + 2 * self.horizon - 1
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
@@ -82,16 +84,25 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Train the LSTM forecaster, then fit a Gaussian on its prediction errors."""
+        self._fit_normalized_segments([train_values])
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Train once on history/target windows pooled across station segments."""
         min_length = self.window_size + 2 * self.horizon - 1
-        if train_values.shape[0] < min_length:
+        eligible = [segment for segment in segments if len(segment) >= min_length]
+        if not eligible:
             raise ValueError(
-                f"Series length {train_values.shape[0]} is too short for window_size={self.window_size} "
-                f"and horizon={self.horizon}; need at least {min_length} points"
+                f"LSTMAD needs at least one segment with {min_length} points"
             )
-        input_dim = train_values.shape[1]
-        num_raw_windows = train_values.shape[0] - (self.window_size + self.horizon) + 1
+        input_dim = eligible[0].shape[1]
+        combined_length = self.window_size + self.horizon
+        num_raw_windows = sum(
+            len(segment) - combined_length + 1 for segment in eligible
+        )
         training_stride = self._resolve_training_stride(num_raw_windows)
-        combined = rolling_windows_nd(train_values, self.window_size + self.horizon, stride=training_stride)
+        combined = pooled_windows_nd(
+            eligible, combined_length, stride=training_stride
+        )
         combined = subsample_windows(combined, self.max_windows, self.seed)
         windows = combined[:, : self.window_size]
         targets = combined[:, self.window_size :]
@@ -136,8 +147,11 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
         self.net = net.eval()
         self.training_summary_ = {"loss": float(best_loss), "epochs_trained": epoch + 1}
 
-        train_errors, train_valid = self._error_vectors(train_values)
-        valid_errors = train_errors[train_valid].astype(np.float64)
+        valid_errors = []
+        for segment in eligible:
+            train_errors, train_valid = self._error_vectors(segment)
+            valid_errors.append(train_errors[train_valid].astype(np.float64))
+        valid_errors = np.concatenate(valid_errors, axis=0)
         self.error_mean_ = valid_errors.mean(axis=0)
         centered = valid_errors - self.error_mean_
         covariance = (centered.T @ centered) / max(1, len(valid_errors) - 1)
@@ -151,7 +165,7 @@ class LSTMAD(BaseTimeSeriesAnomalyDetector):
         errors, valid = self._error_vectors(values)
         centered = errors.astype(np.float64) - self.error_mean_
         distances = np.einsum("ij,jk,ik->i", centered, self.error_cov_inv_, centered)
-        return np.where(valid, distances, 0.0).astype(np.float32)
+        return np.where(valid, distances, np.nan).astype(np.float32)
 
     def _predict_windows(self, windows: np.ndarray) -> np.ndarray:
         """Run the trained LSTM over history windows in eval mode, batched."""

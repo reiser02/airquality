@@ -24,6 +24,7 @@ from .common import (
     log_epoch,
     resize_delta,
     resolve_training_stride,
+    pooled_windows_nd,
     rolling_windows_nd,
     subsample_windows,
 )
@@ -223,7 +224,7 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
 
     def __init__(
         self,
-        window_size: int = 100,
+        window_size: int = 80,
         stride: int = 1,
         batch_size: int = 64,
         num_epochs: int = 40,
@@ -268,9 +269,17 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Train the one-class TCN: fix the SVDD center, then optimize both losses."""
-        num_raw_windows = train_values.shape[0] - self.window_size + 1
+        self._fit_normalized_segments([train_values])
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Train once on windows pooled across all eligible station segments."""
+        num_raw_windows = sum(
+            max(0, len(segment) - self.window_size + 1) for segment in segments
+        )
+        if num_raw_windows <= 0:
+            raise ValueError("COUTA requires at least one complete training window")
         training_stride = self._resolve_training_stride(num_raw_windows)
-        windows = rolling_windows_nd(train_values, self.window_size, training_stride)
+        windows = pooled_windows_nd(segments, self.window_size, training_stride)
         windows = subsample_windows(windows, self.max_windows, self.seed)
         windows = windows[np.random.RandomState(42).permutation(len(windows))]
         split_index = len(windows) - int(self.train_val_pc * len(windows))
@@ -279,7 +288,7 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
         generator.fit(train_windows)
         dataset = torch.from_numpy(train_windows)
         self.net = COUTANet(
-            input_dim=train_values.shape[1],
+            input_dim=segments[0].shape[1],
             hidden_dims=self.hidden_dims,
             emb_dim=self.emb_dim,
             rep_hidden=self.rep_hidden,
@@ -293,25 +302,31 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
         criterion_oc = DSVDDUncLoss(self.c)
         criterion_ssl = nn.MSELoss(reduction="mean")
         optimizer = torch.optim.Adam(self.net.parameters(), lr=self.learning_rate)
-        neg_batch_size = max(1, int(self.neg_batch_ratio * self.batch_size))
         # One DataLoader for every epoch: each iteration draws a fresh shuffle
         # permutation from the torch RNG either way.
-        loader = DataLoader(dataset, batch_size=self.batch_size, drop_last=True, shuffle=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            drop_last=len(dataset) >= self.batch_size,
+            shuffle=True,
+        )
         for epoch in range(self.num_epochs):
             epoch_losses = []
             epoch_oc_losses = []
             epoch_ssl_losses = []
             for batch_index, x0 in enumerate(loader):
                 x0 = x0.float().to(self.device)
+                batch_size = x0.shape[0]
                 x0_output = self.net(x0)
                 rep_x0, rep_x0_dup, pred_x0 = x0_output
                 loss_oc = criterion_oc(rep_x0, rep_x0_dup)
 
-                neg_candidate_idx = np.random.RandomState(self.seed + epoch + batch_index).randint(0, self.batch_size, neg_batch_size)
+                neg_batch_size = max(1, int(self.neg_batch_ratio * batch_size))
+                neg_candidate_idx = np.random.RandomState(self.seed + epoch + batch_index).randint(0, batch_size, neg_batch_size)
                 x1, y1 = generator.generate_batch(x0[neg_candidate_idx], seed=self.seed + epoch + batch_index)
                 x1 = x1.to(self.device)
                 y1 = y1.to(self.device)
-                y0 = -torch.ones(self.batch_size, device=self.device)
+                y0 = -torch.ones(batch_size, device=self.device)
                 _, _, pred_x1 = self.net(x1)
                 ssl_targets = torch.cat([y0, y1], dim=0)
                 ssl_outputs = torch.cat([pred_x0.view(-1), pred_x1.view(-1)], dim=0)
@@ -336,7 +351,12 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
     def _set_center(self, dataset: Tensor, eps: float = 0.1) -> Tensor:
         if self.net is None:
             raise RuntimeError("Network is not initialized")
-        loader = DataLoader(dataset, batch_size=self.batch_size, drop_last=True, shuffle=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            drop_last=len(dataset) >= self.batch_size,
+            shuffle=True,
+        )
         representations = []
         self.net.eval()
         with torch.no_grad():
@@ -351,7 +371,9 @@ class COUTABase(BaseTimeSeriesAnomalyDetector):
     def _score_normalized(self, values: np.ndarray) -> np.ndarray:
         """Score each timestep by its window's distance to the SVDD center."""
         window_scores, _ = self._window_components_normalized(values)
-        prefix = np.zeros(values.shape[0] - window_scores.shape[0], dtype=np.float32)
+        prefix = np.full(
+            values.shape[0] - window_scores.shape[0], np.nan, dtype=np.float32
+        )
         return np.concatenate([prefix, window_scores.astype(np.float32)], axis=0)
 
     def _window_components_normalized(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -399,8 +421,18 @@ class COUTAGenIAS(COUTABase):
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Fit COUTA, then record train-score statistics to calibrate the SSL boost."""
-        super()._fit_normalized(train_values)
-        train_distances, train_pretext = self._window_components_normalized(train_values)
+        self._fit_normalized_segments([train_values])
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Fit pooled COUTA and calibrate from each segment's valid windows."""
+        super()._fit_normalized_segments(segments)
+        components = [
+            self._window_components_normalized(segment)
+            for segment in segments
+            if len(segment) >= self.window_size
+        ]
+        train_distances = np.concatenate([pair[0] for pair in components])
+        train_pretext = np.concatenate([pair[1] for pair in components])
         self.train_distance_std_ = float(max(train_distances.std(), 1e-6))
         self.train_pretext_mean_ = float(train_pretext.mean())
         self.train_pretext_std_ = float(max(train_pretext.std(), 1e-6))
@@ -410,7 +442,9 @@ class COUTAGenIAS(COUTABase):
         distances, pretext_scores = self._window_components_normalized(values)
         pretext_excess = np.maximum(pretext_scores - self.train_pretext_mean_, 0.0)
         pretext_boost = pretext_excess * (self.train_distance_std_ / self.train_pretext_std_)
-        prefix = np.zeros(values.shape[0] - distances.shape[0], dtype=np.float32)
+        prefix = np.full(
+            values.shape[0] - distances.shape[0], np.nan, dtype=np.float32
+        )
         distance_scores = np.concatenate([prefix, distances.astype(np.float32)], axis=0)
         tail_length = max(1, int(self.window_size * self.generator.max_cut_ratio * 0.5))
         pretext_tail_scores = aggregate_tail_scores(pretext_boost, values.shape[0], self.window_size, tail_length)

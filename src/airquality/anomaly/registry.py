@@ -11,6 +11,8 @@ from __future__ import annotations
 import inspect
 import warnings
 
+import numpy as np
+
 from .models import (
     CARLABase,
     CARLAGenIAS,
@@ -64,6 +66,35 @@ def filter_model_kwargs(model_cls: type, kwargs: dict[str, object]) -> dict[str,
         return dict(kwargs)
     valid = set(parameters) - {"self"}
     return {key: value for key, value in kwargs.items() if key in valid}
+
+
+def fit_model_segments(
+    model_cls: type,
+    segments: list[np.ndarray],
+    *,
+    seed: int,
+    model_kwargs: dict[str, object] | None = None,
+):
+    """Create one detector and fit it once on all segments of a station."""
+    model = model_cls(seed=seed, **(model_kwargs or {}))
+    model.fit_segments(segments)
+    return model
+
+
+def score_model_segments(
+    model, segments: list[np.ndarray]
+) -> list[np.ndarray | None]:
+    """Score station segments without refitting or crossing their boundaries."""
+    score_segments = getattr(model, "score_segments", None)
+    if score_segments is not None:
+        return list(score_segments(segments))
+    scores: list[np.ndarray | None] = []
+    for segment in segments:
+        try:
+            scores.append(np.asarray(model.score(segment), dtype=float))
+        except Exception:
+            scores.append(None)
+    return scores
 
 
 def resolve_model_names(model_names: list[str] | None) -> list[str]:

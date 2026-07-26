@@ -24,6 +24,7 @@ from .common import (
     log_epoch,
     resize_delta,
     resolve_training_stride,
+    pooled_windows_nd,
     rolling_windows_nd,
     subsample_windows,
 )
@@ -346,7 +347,8 @@ class PretextLoss(nn.Module):
         self.adjust_factor = adjust_factor
 
     def forward(self, features: Tensor, current_loss: float | None = None) -> Tensor:
-        features_org, features_pos, features_subseq = torch.split(features, self.batch_size, dim=0)
+        batch_size = features.shape[0] // 3
+        features_org, features_pos, features_subseq = torch.split(features, batch_size, dim=0)
         anchor = F.normalize(features_org, dim=-1)
         positive = F.normalize(features_pos, dim=-1)
         negative = F.normalize(features_subseq, dim=-1)
@@ -562,7 +564,7 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
 
     def __init__(
         self,
-        window_size: int = 200,
+        window_size: int = 80,
         stride: int = 1,
         batch_size: int = 64,
         pretext_epochs: int = 20,
@@ -612,20 +614,37 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         internally), trains the ResNet encoder against generator-corrupted
         windows, and finally picks the majority (normal) class per head.
         """
+        self._fit_normalized_segments([train_values])
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Train once on windows pooled across segments without crossing gaps."""
         if self.mean_ is None or self.std_ is None:
             raise RuntimeError("Model normalization statistics are unavailable")
-        raw_train_values = (train_values * self.std_) + self.mean_
-        num_raw_windows = raw_train_values.shape[0] - self.window_size + 1
+        raw_segments = [(segment * self.std_) + self.mean_ for segment in segments]
+        num_raw_windows = sum(
+            max(0, len(segment) - self.window_size + 1) for segment in raw_segments
+        )
+        if num_raw_windows <= 0:
+            raise ValueError("CARLA requires at least one complete training window")
         training_stride = self._resolve_training_stride(num_raw_windows)
-        raw_windows = rolling_windows_nd(raw_train_values, self.window_size, stride=training_stride)
+        raw_windows = pooled_windows_nd(
+            raw_segments, self.window_size, stride=training_stride
+        )
         raw_windows = subsample_windows(raw_windows, self.max_windows, self.seed)
         train_windows, val_windows = self._split_windows(raw_windows)
         generator = self._build_generator()
         generator.fit(train_windows)
-        backbone = ResNetRepresentation(in_channels=raw_train_values.shape[1], mid_channels=self.mid_channels)
+        backbone = ResNetRepresentation(
+            in_channels=raw_segments[0].shape[1], mid_channels=self.mid_channels
+        )
         self.pretext_model = ContrastiveModel(backbone, backbone.output_dim, features_dim=self.features_dim).to(self.device)
         pretext_dataset = PretextDataset(train_windows, generator, self.mean_, self.std_)
-        pretext_loader = DataLoader(pretext_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        pretext_loader = DataLoader(
+            pretext_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=len(pretext_dataset) >= self.batch_size,
+        )
         pretext_criterion = PretextLoss(self.batch_size, temperature=self.temperature)
         pretext_optimizer = torch.optim.Adam(self.pretext_model.parameters(), lr=self.learning_rate)
         previous_loss = None
@@ -654,7 +673,9 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
             )
 
         train_repo_dataset, nearest_indices, furthest_indices = self._build_train_repository_dataset(pretext_dataset)
-        classification_backbone = ResNetRepresentation(in_channels=raw_train_values.shape[1], mid_channels=self.mid_channels)
+        classification_backbone = ResNetRepresentation(
+            in_channels=raw_segments[0].shape[1], mid_channels=self.mid_channels
+        )
         classification_backbone.load_state_dict(self.pretext_model.backbone.state_dict())
         self.classification_model = ClusteringModel(
             classification_backbone,
@@ -663,7 +684,12 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
             nheads=self.num_heads,
         ).to(self.device)
         classification_dataset = NeighborDataset(train_repo_dataset.data.cpu().numpy(), nearest_indices, furthest_indices)
-        classification_loader = DataLoader(classification_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        classification_loader = DataLoader(
+            classification_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=len(classification_dataset) >= self.batch_size,
+        )
         classification_criterion = ClassificationLoss()
         classification_optimizer = torch.optim.Adam(self.classification_model.parameters(), lr=self.learning_rate)
         best_state = None

@@ -7,10 +7,8 @@ production (real time, no ground truth):
 2. Binarize each detector's scores with a robust threshold on their own
    distribution (:func:`.metrics.mad_threshold`, median + k * scaled MAD) and
    compute its **detection rate** (fraction of flagged points).
-3. **Discard** detectors whose macro detection rate exceeds
-   ``max_detection_rate`` (default 7%): target anomalies are sensor faults
-   (spikes, calibration drift, cutouts), which are rare — a higher rate means
-   the detector flags normal variation.
+3. For each station, **discard** detectors whose detection rate over its scored
+   segments exceeds ``max_detection_rate`` (default 7%).
 4. Combine the surviving detectors by strict-majority vote
    (:func:`.ensemble.consensus`) and report its detection rate too.
 
@@ -25,8 +23,8 @@ injection's VUS-PR and combines their masks by strict-majority vote on the
 held-out evaluation injection. Reported metrics:
 auroc/aupr/vus_pr/vus_roc/affiliation_f1.
 
-Both modes share the loading (raw 5-minute data → hourly means → longest
-contiguous observed run per station, no ``dropna()`` gluing), the detector
+Both modes share the loading (raw 5-minute data → hourly means → all eligible
+contiguous observed runs per station, no ``dropna()`` gluing), the detector
 fan-out, and the persistence: ``results.json`` (+ ``scores.npz``); plots come
 from the separate ``plot_benchmark_results`` script.
 
@@ -70,8 +68,10 @@ from .metrics import (
 from .registry import (
     MODEL_REGISTRY,
     filter_model_kwargs as _filter_model_kwargs,
+    fit_model_segments,
     resolve_model_class,
     resolve_model_names,
+    score_model_segments,
 )
 
 ENSEMBLE_NAME = "Ensemble"
@@ -82,6 +82,10 @@ SYNTHETIC_METRIC_KEYS = ["auroc", "aupr", "vus_pr", "vus_roc", "affiliation_f1"]
 # Synthetic mode injects a single variant: a per-segment mix of the anomaly
 # shapes, applied directly to the real series (see :mod:`.anomalies`).
 INJECTION_VARIANT = "combined"
+MIN_SEGMENT_POINTS = 8
+# Combined injection includes a 16..48-point drift. Shorter series make the
+# synthetic labels dominate the signal and do not provide a meaningful ranking.
+MIN_SYNTHETIC_SEGMENT_POINTS = 300
 
 # Detectors that benefit from a GPU (windowed deep models). Everything else is
 # CPU-only. Mirrors genias's ``GPU_MODEL_NAMES``.
@@ -176,6 +180,7 @@ class AnomalyCase:
     labels: np.ndarray | None = None
     values_select: np.ndarray | None = None
     labels_select: np.ndarray | None = None
+    segment_lengths: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -194,7 +199,7 @@ class AnomalyBenchmarkConfig:
     # synthetic mode:
     eval_seed: int = 101    # held-out evaluation-injection seed (must differ from seed)
     ensemble_top_k: int = DEFAULT_TOP_K
-    min_series_points: int = 600
+    min_series_points: int = MIN_SEGMENT_POINTS
     series_limit: int | None = None
     output_dir: str | None = None
 
@@ -202,8 +207,9 @@ class AnomalyBenchmarkConfig:
 def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
     """Load + preprocess every station; in ``synthetic`` mode inject twice.
 
-    Every mode keeps the station's longest contiguous real run (no ``dropna()``
-    gluing: it would break the daily phase windowed detectors assume).
+    Every mode keeps all sufficiently long contiguous real runs. Arrays are
+    concatenated only for storage; detector fitting and scoring split them back
+    at ``segment_lengths`` so gaps are never crossed.
     """
     mode = normalize_mode(config.mode)
     stations = load_raw_5m(config.pollutant, config.raw_base_dir)
@@ -215,53 +221,110 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
     for station, frame in stations:
         processed, _ = preprocess([frame], config.pollutant)
         hourly = processed[0]
-        segments = contiguous_observed_segments(hourly.iloc[:, 0])
-        values = (
-            max(segments, key=len).to_numpy(dtype=np.float32)
-            if segments
-            else np.empty(0, dtype=np.float32)
+        minimum = max(
+            MIN_SEGMENT_POINTS,
+            int(config.min_series_points),
+            MIN_SYNTHETIC_SEGMENT_POINTS if mode == "synthetic" else 0,
         )
-        if values.shape[0] < config.min_series_points:
+        segments = contiguous_observed_segments(hourly.iloc[:, 0], min_len=minimum)
+        if not segments:
             logging.info(
-                "  skip %s  (longest contiguous run %d points < %d)",
-                station, values.shape[0], config.min_series_points,
+                "  skip %s  (no contiguous run with at least %d points)",
+                station,
+                minimum,
             )
             continue
+        segment_values = [segment.to_numpy(dtype=np.float32) for segment in segments]
+        segment_lengths = tuple(len(values) for values in segment_values)
+        values = np.concatenate(segment_values)
         if mode == "synthetic":
-            sel_values, sel_labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, config.seed)
-            eval_values, eval_labels = inject_synthetic_anomalies(values, INJECTION_VARIANT, config.eval_seed)
+            selected = [
+                inject_synthetic_anomalies(
+                    segment, INJECTION_VARIANT, config.seed + position
+                )
+                for position, segment in enumerate(segment_values)
+            ]
+            evaluated = [
+                inject_synthetic_anomalies(
+                    segment, INJECTION_VARIANT, config.eval_seed + position
+                )
+                for position, segment in enumerate(segment_values)
+            ]
             cases.append(
                 AnomalyCase(
                     name=station,
-                    values=eval_values,
-                    labels=eval_labels,
-                    values_select=sel_values,
-                    labels_select=sel_labels,
+                    values=np.concatenate([pair[0] for pair in evaluated]),
+                    labels=np.concatenate([pair[1] for pair in evaluated]),
+                    values_select=np.concatenate([pair[0] for pair in selected]),
+                    labels_select=np.concatenate([pair[1] for pair in selected]),
+                    segment_lengths=segment_lengths,
                 )
             )
         else:
-            cases.append(AnomalyCase(name=station, values=values))
+            cases.append(
+                AnomalyCase(
+                    name=station,
+                    values=values,
+                    segment_lengths=segment_lengths,
+                )
+            )
     logging.info("Built %d evaluation cases.", len(cases))
     return cases
+
+
+def _case_segment_lengths(case: AnomalyCase) -> tuple[int, ...]:
+    lengths = case.segment_lengths or (len(case.values),)
+    if any(length <= 0 for length in lengths) or sum(lengths) != len(case.values):
+        raise ValueError(f"Invalid segment lengths for {case.name}: {lengths}")
+    return tuple(int(length) for length in lengths)
+
+
+def _split_segments(values: np.ndarray, lengths: tuple[int, ...]) -> list[np.ndarray]:
+    if sum(lengths) != len(values):
+        raise ValueError("Segment lengths do not match array length")
+    boundaries = np.cumsum((0, *lengths))
+    return [values[boundaries[i] : boundaries[i + 1]] for i in range(len(lengths))]
+
+
+def _weighted_metrics(
+    metrics: list[dict[str, float]], lengths: tuple[int, ...]
+) -> dict[str, float]:
+    total = sum(lengths)
+    if not metrics or total <= 0:
+        return {}
+    return {
+        key: float(
+            sum(metric[key] * length for metric, length in zip(metrics, lengths, strict=True))
+            / total
+        )
+        for key in metrics[0]
+    }
+
+
+def _finite_mean(values: list[float]) -> float:
+    """Mean over finite values, or NaN when no value is available."""
+    finite = [value for value in values if np.isfinite(value)]
+    return float(np.mean(finite)) if finite else float("nan")
 
 
 def _fit_score_timed(
     model_cls: type,
     model_kwargs: dict[str, object],
-    values: np.ndarray,
+    segments: list[np.ndarray],
     seed: int,
     device: str,
-) -> tuple[object, np.ndarray, float, float]:
-    """Fit + score one fresh detector instance; return (model, scores, fit_s, inf_s)."""
-    model = model_cls(seed=seed, **model_kwargs)
+) -> tuple[object, list[np.ndarray | None], float, float]:
+    """Fit one detector on all station segments, then score each segment."""
     synchronize_device(device)
     fit_started = time.perf_counter()
-    model.fit(values)
+    model = fit_model_segments(
+        model_cls, segments, seed=seed, model_kwargs=model_kwargs
+    )
     synchronize_device(device)
     fit_seconds = time.perf_counter() - fit_started
 
     inference_started = time.perf_counter()
-    scores = np.asarray(model.score(values), dtype=np.float64)
+    scores = score_model_segments(model, segments)
     synchronize_device(device)
     inference_seconds = time.perf_counter() - inference_started
     return model, scores, fit_seconds, inference_seconds
@@ -274,20 +337,75 @@ def _score_case_unlabeled(
     config: AnomalyBenchmarkConfig,
     device: str,
 ) -> dict[str, object]:
-    """Unlabeled mode: one fit/score on the real series + MAD-threshold detection rate."""
-    model, scores, fit_seconds, inference_seconds = _fit_score_timed(
-        model_cls, model_kwargs, case.values, config.seed, device
-    )
-    mask = detect_mask(scores, config.threshold_k)
+    """Fit once on a station, then score and MAD-threshold each segment."""
+    lengths = _case_segment_lengths(case)
+    segments = _split_segments(case.values, lengths)
+    score_parts: list[np.ndarray] = []
+    thresholds: list[float | None] = []
+    scored_segments: list[bool] = []
+    failures: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = []
+    n_flagged = 0
+    scored_points = 0
+    fit_seconds = 0.0
+    inference_seconds = 0.0
+
+    try:
+        model, segment_scores, fit_seconds, inference_seconds = _fit_score_timed(
+            model_cls, model_kwargs, segments, config.seed, device
+        )
+        summaries.append(getattr(model, "training_summary_", {}))
+    except Exception as exc:
+        segment_scores = [None] * len(segments)
+        fit_seconds = 0.0
+        inference_seconds = 0.0
+        failures.append({"type": type(exc).__name__, "message": str(exc)})
+
+    for segment_index, (segment, scores) in enumerate(
+        zip(segments, segment_scores, strict=True)
+    ):
+        try:
+            if scores is None:
+                raise RuntimeError("detector could not score this segment")
+            scores = np.asarray(scores, dtype=np.float64)
+            if scores.shape != segment.shape:
+                raise ValueError(f"expected scores {segment.shape}, received {scores.shape}")
+            finite = np.isfinite(scores)
+            if not finite.any():
+                raise ValueError("detector produced no finite scores")
+            mask = detect_mask(scores, config.threshold_k)
+            score_parts.append(np.asarray(scores, dtype=np.float32))
+            thresholds.append(float(mad_threshold(scores, config.threshold_k)))
+            scored_segments.append(True)
+            n_flagged += int(mask.sum())
+            scored_points += int(finite.sum())
+        except Exception as exc:
+            score_parts.append(np.full(len(segment), np.nan, dtype=np.float32))
+            thresholds.append(None)
+            scored_segments.append(False)
+            failures.append(
+                {
+                    "segment_index": segment_index,
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+
     return {
         "series_name": case.name,
         "series_length": int(case.values.shape[0]),
-        "metrics": {"detection_rate": detection_rate(mask)},
-        "n_flagged": int(mask.sum()),
-        "threshold": float(mad_threshold(scores, config.threshold_k)),
+        "segment_lengths": list(lengths),
+        "metrics": {
+            "detection_rate": n_flagged / scored_points if scored_points else float("nan")
+        },
+        "n_flagged": n_flagged,
+        "scored_points": scored_points,
+        "scored_segments": scored_segments,
+        "thresholds": thresholds,
+        "failures": failures,
         "timing": {"fit_seconds": float(fit_seconds), "inference_seconds": float(inference_seconds)},
-        "training_summary": getattr(model, "training_summary_", {}),
-        "scores": np.asarray(scores, dtype=np.float32),
+        "training_summary": {"segments": summaries},
+        "scores": np.concatenate(score_parts),
     }
 
 
@@ -298,31 +416,100 @@ def _score_case_synthetic(
     config: AnomalyBenchmarkConfig,
     device: str,
 ) -> dict[str, object]:
-    """Synthetic mode: selection injection for ranking, held-out injection for metrics."""
-    # Selection injection: its VUS-PR is only a ranking/weighting signal for
-    # the ensemble; it is never the number we report or evaluate on.
-    select_model = model_cls(seed=config.seed, **model_kwargs)
-    select_model.fit(case.values_select)
-    select_scores = np.asarray(select_model.score(case.values_select), dtype=np.float64)
-    # The VUS window comes from the labels (median anomaly length, original VUS
-    # convention), never from the detector: every model must be scored with the
-    # same tolerance for their VUS values to be comparable.
-    select_window = vus_sliding_window(case.labels_select)
-    vus_pr_select = compute_metrics(case.labels_select, select_scores, select_window)["vus_pr"]
+    """Fit selection and held-out models once each across station segments."""
+    if case.values_select is None or case.labels_select is None or case.labels is None:
+        raise ValueError("Synthetic case is missing injected values or labels")
+    lengths = _case_segment_lengths(case)
+    selected = _split_segments(case.values_select, lengths)
+    selected_labels = _split_segments(case.labels_select, lengths)
+    evaluated = _split_segments(case.values, lengths)
+    evaluated_labels = _split_segments(case.labels, lengths)
+    score_parts: list[np.ndarray] = []
+    segment_metrics: list[dict[str, float]] = []
+    selection_vus: list[float] = []
+    failures: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = []
+    fit_seconds = 0.0
+    inference_seconds = 0.0
 
-    # Held-out evaluation injection: every reported metric/score comes from here.
-    model, scores, fit_seconds, inference_seconds = _fit_score_timed(
-        model_cls, model_kwargs, case.values, config.seed, device
-    )
-    metrics = compute_metrics(case.labels, scores, vus_sliding_window(case.labels))
+    try:
+        select_model = fit_model_segments(
+            model_cls, selected, seed=config.seed, model_kwargs=model_kwargs
+        )
+        selected_scores = score_model_segments(select_model, selected)
+    except Exception:
+        selected_scores = [None] * len(selected)
+
+    try:
+        model, evaluated_scores, fit_seconds, inference_seconds = _fit_score_timed(
+            model_cls, model_kwargs, evaluated, config.seed, device
+        )
+        summaries.append(getattr(model, "training_summary_", {}))
+    except Exception as exc:
+        evaluated_scores = [None] * len(evaluated)
+        fit_seconds = 0.0
+        inference_seconds = 0.0
+        failures.append({"type": type(exc).__name__, "message": str(exc)})
+
+    for segment_index, (
+        select_values,
+        select_labels,
+        select_scores,
+        values,
+        labels,
+        scores,
+    ) in enumerate(
+        zip(
+            selected,
+            selected_labels,
+            selected_scores,
+            evaluated,
+            evaluated_labels,
+            evaluated_scores,
+            strict=True,
+        )
+    ):
+        if select_scores is None or np.asarray(select_scores).shape != select_values.shape:
+            select_scores = np.zeros(select_values.shape, dtype=np.float64)
+        else:
+            select_scores = np.asarray(select_scores, dtype=np.float64)
+        selection_vus.append(
+            compute_metrics(
+                select_labels, select_scores, vus_sliding_window(select_labels)
+            )["vus_pr"]
+        )
+
+        try:
+            if scores is None:
+                raise RuntimeError("detector could not score this segment")
+            scores = np.asarray(scores, dtype=np.float64)
+            if scores.shape != values.shape:
+                raise ValueError("evaluation score length mismatch")
+        except Exception as exc:
+            scores = np.zeros(values.shape, dtype=np.float64)
+            failures.append(
+                {
+                    "segment_index": segment_index,
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+        score_parts.append(np.asarray(scores, dtype=np.float32))
+        segment_metrics.append(
+            compute_metrics(labels, scores, vus_sliding_window(labels))
+        )
+
+    metrics = _weighted_metrics(segment_metrics, lengths)
     return {
         "series_name": case.name,
         "series_length": int(case.values.shape[0]),
+        "segment_lengths": list(lengths),
         "metrics": metrics,
-        "vus_pr_select": float(vus_pr_select),
+        "vus_pr_select": float(np.mean(selection_vus)),
         "timing": {"fit_seconds": float(fit_seconds), "inference_seconds": float(inference_seconds)},
-        "training_summary": getattr(model, "training_summary_", {}),
-        "scores": np.asarray(scores, dtype=np.float32),
+        "training_summary": {"segments": summaries},
+        "failures": failures,
+        "scores": np.concatenate(score_parts),
     }
 
 
@@ -330,7 +517,10 @@ def _case_log_snippet(entry: dict[str, object]) -> str:
     """One-line progress summary for a per-case entry, adapted to the mode."""
     metrics = entry["metrics"]
     if "detection_rate" in metrics:
-        return f"rate={100.0 * metrics['detection_rate']:.2f}% ({entry['n_flagged']}/{entry['series_length']})"
+        return (
+            f"rate={100.0 * metrics['detection_rate']:.2f}% "
+            f"({entry['n_flagged']}/{entry['scored_points']})"
+        )
     return f"vus_sel={entry['vus_pr_select']:.3f} vus_eval={metrics['vus_pr']:.3f}"
 
 
@@ -364,7 +554,7 @@ def _run_detector(
             timing["fit_seconds"] + timing["inference_seconds"],
         )
     headline_key = "vus_pr" if mode == "synthetic" else "detection_rate"
-    macro = float(np.mean([entry["metrics"][headline_key] for entry in per_case])) if per_case else float("nan")
+    macro = _finite_mean([entry["metrics"][headline_key] for entry in per_case])
     logging.info(
         "    [%s] DONE   %d cases in %.1fs  macro_%s=%.3f",
         model_name,
@@ -476,14 +666,14 @@ def macro_detection_rate(result: dict[str, object]) -> float:
     per_case = result["per_case"]
     if not per_case:
         return float("nan")
-    return float(np.mean([entry["metrics"]["detection_rate"] for entry in per_case]))
+    return _finite_mean([entry["metrics"]["detection_rate"] for entry in per_case])
 
 
 def split_by_detection_rate(
     detector_results: dict[str, dict[str, object]],
     max_detection_rate: float,
 ) -> tuple[list[str], list[str]]:
-    """Split detectors into ``(kept, discarded)`` by the detection-rate budget.
+    """Legacy global split retained for historical artifact/tests compatibility.
 
     A detector is discarded when its macro detection rate exceeds
     ``max_detection_rate``: sensor faults are rare, so flagging more than the
@@ -497,32 +687,99 @@ def split_by_detection_rate(
     return sorted(kept), sorted(discarded)
 
 
+def _selection_by_series(
+    cases: list[AnomalyCase],
+    detector_results: dict[str, dict[str, object]],
+    max_detection_rate: float,
+) -> dict[str, dict[str, list[str]]]:
+    """Classify detectors independently for each station."""
+    selection: dict[str, dict[str, list[str]]] = {}
+    for case_index, case in enumerate(cases):
+        kept: list[str] = []
+        discarded: list[str] = []
+        unavailable: list[str] = []
+        for name, result in detector_results.items():
+            entry = result["per_case"][case_index]
+            if int(entry.get("scored_points", 0)) <= 0:
+                unavailable.append(name)
+            elif float(entry["metrics"]["detection_rate"]) > max_detection_rate:
+                discarded.append(name)
+            else:
+                kept.append(name)
+        selection[case.name] = {
+            "kept_models": sorted(kept),
+            "discarded_models": sorted(discarded),
+            "unavailable_models": sorted(unavailable),
+        }
+    return selection
+
+
 def _build_unlabeled_ensemble(
     config: AnomalyBenchmarkConfig,
     cases: list[AnomalyCase],
     detector_results: dict[str, dict[str, object]],
-    kept_models: list[str],
+    selection_by_series: dict[str, dict[str, list[str]]],
 ) -> list[dict[str, object]]:
-    """Per case: fuse the SURVIVING detectors' scores and re-threshold the consensus."""
+    """Fuse each station's survivors independently, segment by segment."""
     ensemble_results = []
     for index, case in enumerate(cases):
-        score_arrays = [detector_results[name]["per_case"][index]["scores"] for name in kept_models]
-        fused = consensus(score_arrays, threshold_k=config.threshold_k)
-        mask = fused.astype(bool)
+        kept_models = selection_by_series[case.name]["kept_models"]
+        lengths = _case_segment_lengths(case)
+        scores_by_model = {
+            name: _split_segments(
+                detector_results[name]["per_case"][index]["scores"], lengths
+            )
+            for name in kept_models
+        }
+        mask_parts: list[np.ndarray] = []
+        voted_points = 0
+        for segment_index, length in enumerate(lengths):
+            score_arrays = [
+                scores_by_model[name][segment_index]
+                for name in kept_models
+                if detector_results[name]["per_case"][index]["scored_segments"][
+                    segment_index
+                ]
+            ]
+            if score_arrays:
+                finite = np.stack([np.isfinite(scores) for scores in score_arrays])
+                votes = np.stack(
+                    [detect_mask(scores, config.threshold_k) for scores in score_arrays]
+                )
+                available = finite.sum(axis=0)
+                supported = available > 0
+                flagged = supported & (votes.sum(axis=0) > available / 2.0)
+                voted_points += int(supported.sum())
+            else:
+                flagged = np.zeros(length, dtype=bool)
+            mask_parts.append(flagged)
+        mask = np.concatenate(mask_parts)
 
-        timings = [detector_results[name]["per_case"][index]["timing"] for name in kept_models]
+        timings = [
+            detector_results[name]["per_case"][index]["timing"]
+            for name in kept_models
+        ]
         ensemble_results.append(
             {
                 "series_name": case.name,
                 "series_length": int(case.values.shape[0]),
-                "metrics": {"detection_rate": detection_rate(mask)},
+                "segment_lengths": list(lengths),
+                "metrics": {
+                    "detection_rate": (
+                        int(mask.sum()) / voted_points
+                        if voted_points
+                        else float("nan")
+                    )
+                },
                 "n_flagged": int(mask.sum()),
+                "voted_points": voted_points,
                 "threshold": 0.5,
                 "timing": {
                     "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
                     "inference_seconds": float(sum(timing["inference_seconds"] for timing in timings)),
                 },
                 "training_summary": {"selected_models": kept_models, "method": "VOTE"},
+                "scores": mask.astype(np.float32),
             }
         )
     return ensemble_results
@@ -540,15 +797,31 @@ def _build_synthetic_ensemble(
         # are never used to pick or weight detectors) -> unbiased ensemble metric.
         select_by_model = {name: result["per_case"][index]["vus_pr_select"] for name, result in detector_results.items()}
         top_models = rank_top_k(select_by_model, config.ensemble_top_k)
-        score_arrays = [detector_results[name]["per_case"][index]["scores"] for name in top_models]
-        fused = consensus(score_arrays, threshold_k=config.threshold_k)
-        metrics = compute_metrics(case.labels, fused, vus_sliding_window(case.labels))
+        lengths = _case_segment_lengths(case)
+        labels_by_segment = _split_segments(case.labels, lengths)
+        scores_by_model = {
+            name: _split_segments(
+                detector_results[name]["per_case"][index]["scores"], lengths
+            )
+            for name in top_models
+        }
+        segment_metrics = []
+        for segment_index, labels in enumerate(labels_by_segment):
+            fused = consensus(
+                [scores_by_model[name][segment_index] for name in top_models],
+                threshold_k=config.threshold_k,
+            )
+            segment_metrics.append(
+                compute_metrics(labels, fused, vus_sliding_window(labels))
+            )
+        metrics = _weighted_metrics(segment_metrics, lengths)
 
         timings = [detector_results[name]["per_case"][index]["timing"] for name in top_models]
         ensemble_results.append(
             {
                 "series_name": case.name,
                 "series_length": int(case.values.shape[0]),
+                "segment_lengths": list(lengths),
                 "metrics": metrics,
                 "timing": {
                     "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
@@ -569,7 +842,8 @@ def _summarize(series_results: list[dict[str, object]]) -> dict[str, object]:
     clean = [{key: entry[key] for key in entry if key != "scores"} for entry in series_results]
     metric_keys = list(clean[0]["metrics"]) if clean else []
     macro_metrics = {
-        metric: float(np.mean([entry["metrics"][metric] for entry in clean])) for metric in metric_keys
+        metric: _finite_mean([entry["metrics"][metric] for entry in clean])
+        for metric in metric_keys
     }
     timing = {
         "mean_fit_seconds": float(np.mean([entry["timing"]["fit_seconds"] for entry in clean])),
@@ -638,27 +912,44 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
         logging.info("  ✓ Ensemble  VUS-PR=%.3f", model_summaries[ENSEMBLE_NAME]["macro_metrics"]["vus_pr"])
         ordered_names.append(ENSEMBLE_NAME)
         kept_models, discarded_models = list(model_names), []
+        selection_by_series = None
     else:
-        kept_models, discarded_models = split_by_detection_rate(detector_results, config.max_detection_rate)
-        for name in discarded_models:
-            logging.info(
-                "  ✗ %s DISCARDED  macro_detection_rate=%.2f%% > %.2f%%",
-                name,
-                100.0 * macro_detection_rate(detector_results[name]),
-                100.0 * config.max_detection_rate,
-            )
+        selection_by_series = _selection_by_series(
+            cases, detector_results, config.max_detection_rate
+        )
+        kept_models = sorted(
+            {
+                name
+                for selection in selection_by_series.values()
+                for name in selection["kept_models"]
+            }
+        )
+        discarded_models = sorted(set(model_names) - set(kept_models))
         for name, result in detector_results.items():
-            model_summaries[name] = {**_summarize(result["per_case"]), "discarded": name in discarded_models}
+            counts = {
+                state: sum(
+                    name in selection[f"{state}_models"]
+                    for selection in selection_by_series.values()
+                )
+                for state in ("kept", "discarded", "unavailable")
+            }
+            model_summaries[name] = {
+                **_summarize(result["per_case"]),
+                "discarded": counts["kept"] == 0,
+                "selection_counts": counts,
+            }
         if kept_models:
-            logging.info("Building ensemble from %d surviving detector(s)…", len(kept_models))
-            ensemble_results = _build_unlabeled_ensemble(config, cases, detector_results, kept_models)
+            logging.info("Building per-series ensembles from locally surviving detectors…")
+            ensemble_results = _build_unlabeled_ensemble(
+                config, cases, detector_results, selection_by_series
+            )
             model_summaries[ENSEMBLE_NAME] = {**_summarize(ensemble_results), "discarded": False}
             macro_rate = model_summaries[ENSEMBLE_NAME]["macro_metrics"]["detection_rate"]
             logging.info("  ✓ Ensemble  detection_rate=%.2f%%", 100.0 * macro_rate)
             ordered_names.append(ENSEMBLE_NAME)
         else:
             logging.warning(
-                "Every detector exceeded max_detection_rate=%.2f%%; no ensemble built.",
+                "No series has a detector under max_detection_rate=%.2f%%; no ensemble built.",
                 100.0 * config.max_detection_rate,
             )
 
@@ -693,6 +984,9 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
         "model_names": ordered_names,
         "kept_models": kept_models,
         "discarded_models": discarded_models,
+        "selection_scope": "series" if mode == "unlabeled" else "synthetic_top_k",
+        "selection_by_series": selection_by_series,
+        "schema_version": 2,
         "series_names": sorted({case.name for case in cases}),
         **plot_names,
         "timestamp": time.time(),
@@ -732,6 +1026,120 @@ def recompute_ensemble(
     model_names = [n for n in saved["model_names"] if n != ENSEMBLE_NAME]
     n_cases = len(saved["models"][model_names[0]]["series_results"])
     mode = normalize_mode(saved.get("mode", saved.get("config", {}).get("mode", "unlabeled")))
+    schema_version = int(saved.get("schema_version", 1))
+
+    if schema_version >= 2:
+        if mode == "synthetic":
+            ensemble_vus_pr_list = []
+            for i in range(n_cases):
+                select_by_model = {
+                    name: saved["models"][name]["series_results"][i][
+                        "vus_pr_select"
+                    ]
+                    for name in model_names
+                }
+                top_models = rank_top_k(select_by_model, top_k)
+                lengths = tuple(
+                    saved["models"][model_names[0]]["series_results"][i][
+                        "segment_lengths"
+                    ]
+                )
+                labels_by_segment = _split_segments(
+                    scores_npz[f"__labels__case{i}"], lengths
+                )
+                scores_by_model = {
+                    name: _split_segments(scores_npz[f"{name}__case{i}"], lengths)
+                    for name in top_models
+                }
+                segment_metrics = []
+                for segment_index, labels in enumerate(labels_by_segment):
+                    fused = consensus(
+                        [
+                            scores_by_model[name][segment_index]
+                            for name in top_models
+                        ],
+                        threshold_k=threshold_k,
+                    )
+                    segment_metrics.append(
+                        compute_metrics(labels, fused, vus_sliding_window(labels))
+                    )
+                ensemble_vus_pr_list.append(
+                    _weighted_metrics(segment_metrics, lengths)["vus_pr"]
+                )
+            out = {
+                name: saved["models"][name]["macro_metrics"]["vus_pr"]
+                for name in model_names
+            }
+            out[f"Ensemble(method=VOTE,top_k={top_k})"] = float(
+                np.mean(ensemble_vus_pr_list)
+            )
+            return out
+
+        if max_detection_rate is None:
+            max_detection_rate = float(saved["config"]["max_detection_rate"])
+        model_rates: dict[str, list[float]] = {name: [] for name in model_names}
+        ensemble_rates = []
+        has_survivor = False
+        for i in range(n_cases):
+            first_entry = saved["models"][model_names[0]]["series_results"][i]
+            lengths = tuple(first_entry["segment_lengths"])
+            kept_for_series = []
+            scores_by_model = {}
+            availability_by_model = {}
+            for name in model_names:
+                entry = saved["models"][name]["series_results"][i]
+                segments = _split_segments(scores_npz[f"{name}__case{i}"], lengths)
+                availability = list(entry["scored_segments"])
+                scored_points = sum(
+                    length
+                    for length, available in zip(lengths, availability, strict=True)
+                    if available
+                )
+                flagged = sum(
+                    int(detect_mask(scores, threshold_k).sum())
+                    for scores, available in zip(segments, availability, strict=True)
+                    if available
+                )
+                rate = flagged / scored_points if scored_points else float("nan")
+                if scored_points:
+                    model_rates[name].append(rate)
+                if scored_points and rate <= max_detection_rate:
+                    kept_for_series.append(name)
+                scores_by_model[name] = segments
+                availability_by_model[name] = availability
+
+            has_survivor |= bool(kept_for_series)
+
+            flagged_total = 0
+            voted_total = 0
+            for segment_index, length in enumerate(lengths):
+                arrays = [
+                    scores_by_model[name][segment_index]
+                    for name in kept_for_series
+                    if availability_by_model[name][segment_index]
+                ]
+                if arrays:
+                    finite = np.stack([np.isfinite(scores) for scores in arrays])
+                    votes = np.stack(
+                        [detect_mask(scores, threshold_k) for scores in arrays]
+                    )
+                    available = finite.sum(axis=0)
+                    supported = available > 0
+                    flagged_total += int(
+                        (supported & (votes.sum(axis=0) > available / 2.0)).sum()
+                    )
+                    voted_total += int(supported.sum())
+            if voted_total:
+                ensemble_rates.append(flagged_total / voted_total)
+
+        out = {
+            name: _finite_mean(rates) for name, rates in model_rates.items()
+        }
+        if has_survivor:
+            out[f"Ensemble(method=VOTE,k={threshold_k})"] = float(
+                _finite_mean(ensemble_rates)
+            )
+        return out
 
     if mode == "synthetic":
         ensemble_vus_pr_list = []
