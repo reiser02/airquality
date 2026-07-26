@@ -5,9 +5,9 @@ the benchmark plots, wired into an end-to-end benchmark (load → preprocess →
 detect → ensemble → results.json) with two evaluation modes:
 
 - ``unlabeled`` (default, matches production): no ground truth — scores are
-  binarized with a median + k·MAD threshold and detectors whose detection rate
-  exceeds ``max_detection_rate`` (default 7%) are discarded; survivors form the
-  consensus ensemble.
+  binarized per segment with a median + k·MAD threshold and detectors whose
+  per-station detection rate exceeds ``max_detection_rate`` (default 7%) are
+  discarded locally; each station's survivors form its consensus ensemble.
 - ``synthetic``: anomalies (:data:`~airquality.anomaly.benchmark.INJECTION_VARIANT`,
   ``combined`` shapes) are injected directly into the real series — no STL
   synthetic base — and detectors are scored with the supervised metric set

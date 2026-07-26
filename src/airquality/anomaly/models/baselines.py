@@ -28,16 +28,38 @@ class BaseGlobalAnomalyDetector:
         seed: int = 13,
     ) -> None:
         self.window_size = window_size
+        self.minimum_series_length = 1
         self.device = device
         self.seed = seed
         self.training_summary_: dict[str, Any] = {}
 
     def fit(self, train_values: np.ndarray) -> "BaseGlobalAnomalyDetector":
         """Seed RNGs, coerce input to 2D, and fit the concrete detector."""
+        return self.fit_segments([train_values])
+
+    def fit_segments(
+        self, train_segments: list[np.ndarray]
+    ) -> "BaseGlobalAnomalyDetector":
+        """Fit once on pooled points from all non-empty station segments."""
         set_random_seed(self.seed)
-        train_array = ensure_2d(train_values)
+        arrays = [ensure_2d(values) for values in train_segments if len(values) > 0]
+        if not arrays:
+            raise ValueError("At least one non-empty training segment is required")
+        train_array = np.concatenate(arrays, axis=0)
         self._fit_array(train_array)
         return self
+
+    def score_segments(
+        self, segments: list[np.ndarray]
+    ) -> list[np.ndarray | None]:
+        """Score each segment independently with the shared fitted model."""
+        scores: list[np.ndarray | None] = []
+        for segment in segments:
+            try:
+                scores.append(self.score(segment))
+            except Exception:
+                scores.append(None)
+        return scores
 
     def score(self, values: np.ndarray) -> np.ndarray:
         """Return one anomaly score per timestep (higher = more anomalous)."""
@@ -206,6 +228,14 @@ class LOFDetector(BaseGlobalAnomalyDetector):
         if self.fit_values_ is not None and self.fit_scores_ is not None and np.array_equal(values, self.fit_values_):
             return self.fit_scores_
         raise RuntimeError("LOF can only score the fitted series")
+
+    def score_segments(self, segments: list[np.ndarray]) -> list[np.ndarray | None]:
+        """Split cached in-sample LOF scores back onto original segments."""
+        lengths = [len(segment) for segment in segments]
+        pooled = np.concatenate([ensure_2d(segment) for segment in segments], axis=0)
+        scores = self.score(pooled)
+        boundaries = np.cumsum((0, *lengths))
+        return [scores[boundaries[i] : boundaries[i + 1]] for i in range(len(lengths))]
 
 
 class HampelDetector(BaseGlobalAnomalyDetector):

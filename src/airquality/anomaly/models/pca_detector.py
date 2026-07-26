@@ -10,7 +10,7 @@ from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.preprocessing import StandardScaler
 
 from ..windowing import aggregate_window_scores
-from .common import BaseTimeSeriesAnomalyDetector, rolling_windows_nd
+from .common import BaseTimeSeriesAnomalyDetector, pooled_windows_nd, rolling_windows_nd
 
 
 class PCADetector(BaseTimeSeriesAnomalyDetector):
@@ -29,7 +29,7 @@ class PCADetector(BaseTimeSeriesAnomalyDetector):
     def __init__(
         self,
         *args: Any,
-        window_size: int = 100,
+        window_size: int = 80,
         n_components: int | float | None = None,
         n_selected_components: int | None = None,
         whiten: bool = False,
@@ -38,6 +38,7 @@ class PCADetector(BaseTimeSeriesAnomalyDetector):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, window_size=window_size, **kwargs)
+        self.minimum_series_length = window_size + 1
         self.n_components = n_components
         self.n_selected_components = n_selected_components
         self.whiten = whiten
@@ -50,9 +51,15 @@ class PCADetector(BaseTimeSeriesAnomalyDetector):
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Fit PCA on standardized windows and keep the smallest-variance components."""
-        if train_values.shape[1] != 1:
+        self._fit_normalized_segments([train_values])
+
+    def _fit_normalized_segments(self, segments: list[np.ndarray]) -> None:
+        """Fit PCA on windows pooled across segments without crossing gaps."""
+        if segments[0].shape[1] != 1:
             raise ValueError("PCADetector currently supports only univariate series")
-        windows = rolling_windows_nd(train_values, self.window_size, stride=1)[:, :, 0]
+        windows = pooled_windows_nd(segments, self.window_size, stride=1)[:, :, 0]
+        if len(windows) < 2:
+            raise ValueError("PCADetector requires at least two training windows")
 
         self.window_scaler_ = StandardScaler().fit(windows)
         standardized = self.window_scaler_.transform(windows)
@@ -70,7 +77,9 @@ class PCADetector(BaseTimeSeriesAnomalyDetector):
         weights = self.model_.explained_variance_ratio_ if self.weighted else np.ones(n_components, dtype=np.float64)
 
         self.selected_components_ = self.model_.components_[-n_selected:, :]
-        self.selected_weights_ = weights[-n_selected:]
+        self.selected_weights_ = np.maximum(
+            weights[-n_selected:], np.finfo(np.float64).eps
+        )
         self.training_summary_ = {
             "window_size": self.window_size,
             "n_components": int(n_components),

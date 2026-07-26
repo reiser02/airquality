@@ -158,8 +158,13 @@ def _training_time_order_value(summary: dict[str, object]) -> float:
 
 
 def _display_name(model_name: str, summary: dict[str, object]) -> str:
-    """Tag models discarded by the detection-rate filter in axis labels."""
-    return f"{model_name} (descartado)" if summary.get("discarded") else model_name
+    """Tag models by their per-series detection-rate selection status."""
+    counts = summary.get("selection_counts", {})
+    if summary.get("discarded"):
+        return f"{model_name} (sin selecciones)"
+    if isinstance(counts, dict) and int(counts.get("discarded", 0)) > 0:
+        return f"{model_name} (mixto)"
+    return model_name
 
 
 def _percent_formatter() -> FuncFormatter:
@@ -173,15 +178,14 @@ def save_detection_rate_distribution_plot(
 ) -> None:
     """Render the per-model detection-rate distribution (violin + box + points).
 
-    A vertical line marks the ``max_detection_rate`` budget; models past it are
-    tagged as discarded in their axis label.
+    A vertical line marks the per-series ``max_detection_rate`` budget.
     """
     model_names = sorted(model_summaries, key=lambda model_name: _detection_rate_order_value(model_summaries[model_name]))
     figure, axis = plt.subplots(figsize=(12.5, 7.0), facecolor=FIGURE_FACE)
     add_plot_header(
         figure,
         "Detection Rate Across Series",
-        f"Fraccion de puntos marcados por serie; los detectores con media > {100.0 * max_detection_rate:g}% se descartan",
+        f"Fraccion por serie; cada detector se descarta localmente si supera {100.0 * max_detection_rate:g}%",
     )
     style_axis(axis)
     distributions = [_series_detection_rates(model_summaries[model_name]) for model_name in model_names]

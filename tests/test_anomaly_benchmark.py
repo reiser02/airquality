@@ -116,6 +116,11 @@ def test_compute_metrics_no_anomalies_returns_zero_dict():
     assert all(value == 0.0 for value in metrics.values())
 
 
+def test_compute_metrics_all_anomalous_returns_zero_dict():
+    metrics = compute_metrics(np.ones(8, dtype=np.int64), np.linspace(0, 1, 8), window_size=2)
+    assert all(value == 0.0 for value in metrics.values())
+
+
 def test_compute_metrics_empty_returns_zero_dict():
     metrics = compute_metrics(np.array([], dtype=np.int64), np.array([]), window_size=2)
     assert all(value == 0.0 for value in metrics.values())
@@ -205,6 +210,11 @@ def test_normalize_scores_constant_array_returns_zeros():
 def test_normalize_scores_scales_to_unit_range():
     out = normalize_scores(np.array([0.0, 5.0, 10.0]))
     assert out.tolist() == pytest.approx([0.0, 0.5, 1.0])
+
+
+def test_normalize_scores_treats_nonfinite_values_as_no_detection():
+    out = normalize_scores(np.array([np.nan, 2.0, 4.0, np.inf]))
+    assert out.tolist() == pytest.approx([0.0, 0.0, 1.0, 0.0])
 
 
 # --- ensemble ------------------------------------------------------------
@@ -368,7 +378,7 @@ def test_build_cases_skips_short_series(monkeypatch):
 
 
 def test_build_cases_synthetic_injects_two_independent_seeds(monkeypatch):
-    stations = [("Good", _hourly_5m_frame(30))]
+    stations = [("Good", _hourly_5m_frame(320))]
     monkeypatch.setattr(benchmark_module, "load_raw_5m", lambda pollutant, base_dir: stations)
 
     config = AnomalyBenchmarkConfig(mode="synthetic", min_series_points=6)
@@ -378,6 +388,193 @@ def test_build_cases_synthetic_injects_two_independent_seeds(monkeypatch):
     assert case.labels.sum() >= 1 and case.labels_select.sum() >= 1
     # Selection and evaluation injections are independent (different seeds).
     assert not np.array_equal(case.values, case.values_select)
+
+
+def test_build_cases_keeps_all_observed_segments(monkeypatch):
+    frame = _hourly_5m_frame(30)
+    gap_start = frame.index.min() + np.timedelta64(10, "h")
+    gap_end = gap_start + np.timedelta64(5, "h")
+    frame = frame.loc[(frame.index < gap_start) | (frame.index >= gap_end)]
+    monkeypatch.setattr(
+        benchmark_module,
+        "load_raw_5m",
+        lambda pollutant, base_dir: [("Station", frame)],
+    )
+
+    (case,) = benchmark_module.build_cases(
+        AnomalyBenchmarkConfig(min_series_points=8)
+    )
+
+    assert case.segment_lengths == (10, 15)
+    assert len(case.values) == 25
+
+
+def test_unlabeled_scores_and_thresholds_each_segment_independently(monkeypatch):
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(30, dtype=np.float32),
+        segment_lengths=(10, 20),
+    )
+
+    fit_calls = 0
+
+    def fake_fit_score(_cls, _kwargs, segments, _seed, _device):
+        nonlocal fit_calls
+        fit_calls += 1
+        scores = []
+        for segment in segments:
+            part = np.zeros(len(segment), dtype=float)
+            part[-1] = 10.0
+            scores.append(part)
+        model = type("Model", (), {"training_summary_": {}})()
+        return model, scores, 0.0, 0.0
+
+    monkeypatch.setattr(benchmark_module, "_fit_score_timed", fake_fit_score)
+
+    result = benchmark_module._score_case_unlabeled(
+        object, {}, case, AnomalyBenchmarkConfig(), "cpu"
+    )
+
+    assert result["n_flagged"] == 2
+    assert result["metrics"]["detection_rate"] == pytest.approx(2 / 30)
+    assert result["scored_segments"] == [True, True]
+    assert result["thresholds"] == [0.0, 0.0]
+    assert fit_calls == 1
+
+
+def test_unlabeled_counts_only_finite_score_coverage(monkeypatch):
+    case = AnomalyCase("Station", np.zeros(10, dtype=np.float32))
+
+    def fake_fit_score(*_args):
+        model = type("Model", (), {"training_summary_": {}})()
+        return model, [np.array([np.nan] * 5 + [0.0, 0.0, 0.0, 0.0, 10.0])], 0.0, 0.0
+
+    monkeypatch.setattr(benchmark_module, "_fit_score_timed", fake_fit_score)
+
+    result = benchmark_module._score_case_unlabeled(
+        object, {}, case, AnomalyBenchmarkConfig(), "cpu"
+    )
+
+    assert result["scored_points"] == 5
+    assert result["n_flagged"] == 1
+    assert result["metrics"]["detection_rate"] == pytest.approx(0.2)
+
+
+def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
+    case = AnomalyCase("Station", np.zeros(6), segment_lengths=(6,))
+    scores = np.array([np.nan, np.nan, 0.0, 0.0, 0.0, 10.0])
+    detector_results = {
+        "model": {
+            "per_case": [
+                {
+                    "scores": scores,
+                    "scored_segments": [True],
+                    "timing": {"fit_seconds": 0.0, "inference_seconds": 0.0},
+                }
+            ]
+        }
+    }
+    selection = {
+        "Station": {
+            "kept_models": ["model"],
+            "discarded_models": [],
+            "unavailable_models": [],
+        }
+    }
+
+    (result,) = benchmark_module._build_unlabeled_ensemble(
+        AnomalyBenchmarkConfig(), [case], detector_results, selection
+    )
+
+    assert result["voted_points"] == 4
+    assert result["n_flagged"] == 1
+    assert result["metrics"]["detection_rate"] == pytest.approx(0.25)
+
+
+def test_unlabeled_selection_is_independent_per_series():
+    cases = [
+        AnomalyCase("A", np.zeros(10)),
+        AnomalyCase("B", np.zeros(10)),
+    ]
+    detector_results = {
+        "left": {
+            "per_case": [
+                {"scored_points": 10, "metrics": {"detection_rate": 0.01}},
+                {"scored_points": 10, "metrics": {"detection_rate": 0.20}},
+            ]
+        },
+        "right": {
+            "per_case": [
+                {"scored_points": 10, "metrics": {"detection_rate": 0.20}},
+                {"scored_points": 10, "metrics": {"detection_rate": 0.01}},
+            ]
+        },
+        "missing": {
+            "per_case": [
+                {"scored_points": 0, "metrics": {"detection_rate": 0.0}},
+                {"scored_points": 0, "metrics": {"detection_rate": 0.0}},
+            ]
+        },
+    }
+
+    selection = benchmark_module._selection_by_series(cases, detector_results, 0.07)
+
+    assert selection["A"] == {
+        "kept_models": ["left"],
+        "discarded_models": ["right"],
+        "unavailable_models": ["missing"],
+    }
+    assert selection["B"] == {
+        "kept_models": ["right"],
+        "discarded_models": ["left"],
+        "unavailable_models": ["missing"],
+    }
+
+
+def test_unlabeled_matches_forecasting_consensus_per_series():
+    import pandas as pd
+
+    from airquality.data.segments import contiguous_observed_segments
+    from airquality.forecasting.detection import ConsensusDetection, SeriesDetectionContext
+
+    index = pd.date_range("2024-01-01", periods=240, freq="h")
+    values = 20.0 + np.sin(np.arange(240) / 6.0)
+    series = pd.Series(values, index=index, name="Station")
+    series.iloc[100:105] = np.nan
+    series.iloc[50] = 80.0
+    segments = contiguous_observed_segments(series, min_len=8)
+    case = AnomalyCase(
+        "Station",
+        np.concatenate([segment.to_numpy(dtype=np.float32) for segment in segments]),
+        segment_lengths=tuple(map(len, segments)),
+    )
+    names = ["ModifiedZScore", "IQR", "Hampel_w24"]
+    config = AnomalyBenchmarkConfig(models=names)
+    detector_results = {}
+    for name in names:
+        model_cls = resolve_model_class(name)
+        detector_results[name] = {
+            "per_case": [
+                benchmark_module._score_case_unlabeled(
+                    model_cls, {}, case, config, "cpu"
+                )
+            ]
+        }
+    selection = benchmark_module._selection_by_series(
+        [case], detector_results, config.max_detection_rate
+    )
+    (benchmark_result,) = benchmark_module._build_unlabeled_ensemble(
+        config, [case], detector_results, selection
+    )
+
+    context = SeriesDetectionContext(series, detectors=names, device="cpu")
+    forecasting_result = ConsensusDetection().detect(context)
+    forecasting_mask = np.concatenate(
+        [forecasting_result.mask.loc[segment.index].to_numpy() for segment in segments]
+    )
+
+    assert selection["Station"]["kept_models"] == forecasting_result.detectors
+    assert np.array_equal(benchmark_result["scores"].astype(bool), forecasting_mask)
 
 
 def _real_cases() -> list[AnomalyCase]:
@@ -401,6 +598,8 @@ def test_run_benchmark_end_to_end(tmp_path, monkeypatch):
     }
     # Spikes are 3/700 points; the baseline detectors stay within the 7% budget.
     assert summary["kept_models"], "expected at least one surviving detector"
+    assert summary["selection_scope"] == "series"
+    assert set(summary["selection_by_series"]) == {"StationA", "StationB"}
     assert summary["model_names"][-1] == "Ensemble"
     for name in summary["model_names"]:
         rate = summary["models"][name]["macro_metrics"]["detection_rate"]
@@ -460,6 +659,30 @@ def test_recompute_ensemble_matches_saved_run(tmp_path, monkeypatch):
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())
+
+
+def test_recompute_ensemble_matches_multisegment_run(tmp_path, monkeypatch):
+    first = _spiky_series(120, spike_positions=(30,))
+    second = _spiky_series(180, spike_positions=(40, 120))
+    case = AnomalyCase(
+        name="Station",
+        values=np.concatenate([first, second]),
+        segment_lengths=(len(first), len(second)),
+    )
+    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: [case])
+    summary = run_benchmark(
+        AnomalyBenchmarkConfig(
+            models=["ModifiedZScore", "IQR"],
+            device="cpu",
+            output_dir=str(tmp_path),
+        )
+    )
+
+    out = recompute_ensemble(tmp_path)
+
+    assert out["Ensemble(method=VOTE,k=3.5)"] == pytest.approx(
+        summary["models"]["Ensemble"]["macro_metrics"]["detection_rate"]
+    )
 
 
 # --- synthetic mode end-to-end ---------------------------------------------

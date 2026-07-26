@@ -36,12 +36,18 @@ DEFAULT_MAX_DETECTION_RATE = 0.07
 
 
 def normalize_scores(scores: np.ndarray) -> np.ndarray:
-    """Min-max normalize ``scores`` to ``[0, 1]`` (all zeros when constant)."""
-    minimum = float(np.min(scores))
-    maximum = float(np.max(scores))
+    """Min-max normalize finite ``scores``; non-finite values map to zero."""
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = np.isfinite(scores)
+    if not finite.any():
+        return np.zeros_like(scores, dtype=np.float64)
+    minimum = float(np.min(scores[finite]))
+    maximum = float(np.max(scores[finite]))
     if maximum <= minimum:
         return np.zeros_like(scores, dtype=np.float64)
-    return (scores - minimum) / (maximum - minimum)
+    normalized = np.zeros_like(scores, dtype=np.float64)
+    normalized[finite] = (scores[finite] - minimum) / (maximum - minimum)
+    return normalized
 
 
 def mad_threshold(scores: np.ndarray, k: float = DEFAULT_THRESHOLD_K) -> float:
@@ -99,10 +105,11 @@ def compute_metrics(labels: np.ndarray, scores: np.ndarray, window_size: int) ->
     ``window_size`` is the sliding-window tolerance used by VUS — pass the same
     label-derived value (:func:`vus_sliding_window`) for every detector scored
     on a series, so their VUS values are comparable. Scores are min-max
-    normalized first. Returns all-zero metrics when there are no positive
-    labels (metrics would be undefined).
+    normalized first. Returns all-zero metrics when labels contain only one
+    class (metrics would be undefined).
     """
-    if len(labels) == 0 or np.sum(labels) == 0:
+    positives = int(np.sum(labels))
+    if len(labels) == 0 or positives == 0 or positives == len(labels):
         return {
             "auroc": 0.0,
             "aupr": 0.0,
