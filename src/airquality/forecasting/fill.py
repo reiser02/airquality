@@ -1,8 +1,8 @@
 """Fill the NaN gaps of one series with any :class:`GapImputer`.
 
 Thin helper layered on top of the unified ``GapImputer.impute_gaps`` contract
-(:mod:`airquality.imputation.imputers`). It turns a single gappy series into a
-complete one, picking the concrete adapter from the imputer registry so the
+(:mod:`airquality.imputation.imputers`). It fills only eligible short gaps,
+picking the concrete adapter from the imputer registry so the
 preprocessing pipeline can swap imputation models by config name (``interp``,
 ``LinearInterp``, ``Prophet``, a Darts model such as ``TiDE``, or ``TSPulse``).
 """
@@ -35,6 +35,8 @@ from airquality.imputation.registry import (
     TSPULSE_ORIGINAL_MODEL_NAME,
     resolve_imputer_family,
 )
+
+DEFAULT_MAX_GAP_SIZE = 5
 
 
 def _repo_root() -> Path:
@@ -146,18 +148,22 @@ def impute_series(
     *,
     freq: str = "h",
     use_scaler: bool = False,
+    max_gap_size: int = DEFAULT_MAX_GAP_SIZE,
 ) -> pd.Series:
-    """Return a fully-imputed copy of ``series`` (no NaN) on the regular grid.
+    """Fill complete NaN windows no longer than ``max_gap_size``.
 
-    Predictions come from ``imputer.impute_gaps`` over the NaN windows. Any point
-    the imputer leaves unfilled (e.g. a Darts gap without enough left context,
-    reported as a ``GapContextFailure``) falls back to seasonal interpolation so
-    the returned series is always complete.
+    Any eligible point the imputer leaves unfilled falls back to seasonal
+    interpolation. Longer windows remain entirely NaN.
     """
+    if max_gap_size < 1:
+        raise ValueError("max_gap_size debe ser positivo")
     s = ensure_datetime_series(series, freq=freq, name=str(series.name or "series"))
-    gap_windows = nan_gap_windows(s)
+    gap_windows = [
+        window for window in nan_gap_windows(s) if len(window) <= max_gap_size
+    ]
     if not gap_windows:
         return s
+    fill_index = gap_windows[0].append(gap_windows[1:])
 
     scaler = _fit_scaler(s, freq=freq) if use_scaler else None
     test_index = pd.DatetimeIndex(s.index)
@@ -172,15 +178,15 @@ def impute_series(
 
     filled = s.copy()
     if len(pred) > 0:
-        aligned = pred.reindex(filled.index)
-        filled = filled.where(filled.notna(), aligned)
+        filled.loc[fill_index] = pred.reindex(fill_index)
 
-    if filled.isna().any():
-        # Seasonal interpolation backstop for anything the imputer left as NaN.
+    missing = fill_index[filled.reindex(fill_index).isna()]
+    if len(missing) > 0:
+        # Backstop only eligible gaps; long outages must stay missing.
         fallback = InterpolationGapImputer()._fill(s, freq=freq)
-        filled = filled.where(filled.notna(), fallback.reindex(filled.index))
+        filled.loc[missing] = fallback.reindex(missing)
 
     return filled.astype(float)
 
 
-__all__ = ["nan_gap_windows", "build_imputer", "impute_series"]
+__all__ = ["DEFAULT_MAX_GAP_SIZE", "nan_gap_windows", "build_imputer", "impute_series"]

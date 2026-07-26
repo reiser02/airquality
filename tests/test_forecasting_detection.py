@@ -112,9 +112,9 @@ def test_injection_best_uses_top_ranked_only():
     assert result.ranking == {"A": 0.9, "B": 0.8}
 
 
-def test_injection_vote_clamps_when_fewer_models_available():
-    # B and C failed on the real series: the 2-of-3 vote degrades to the lone
-    # survivor's mask instead of flagging nothing.
+def test_injection_vote_abstains_when_fewer_models_available():
+    # B and C failed on the real series: one detector cannot make a 2-vote
+    # decision, so the segment is explicitly unscored rather than normal.
     n = 30
     context = _StubContext(
         n=n,
@@ -126,7 +126,53 @@ def test_injection_vote_clamps_when_fewer_models_available():
     result = strategy.detect(context)
 
     assert result.detectors == ["A"]
+    assert not result.mask.any()
+    assert not result.scored_mask.any()
+    assert result.selected_by_segment == [["A"]]
+    assert result.n_unscored == n
+
+
+def test_injection_vote_backfills_failed_top_ranked_detector():
+    n = 30
+    context = _StubContext(
+        n=n,
+        scores_by_model={
+            "B": _spike_scores(n, [5]),
+            "C": _spike_scores(n, [5]),
+            "D": _spike_scores(n, [20]),
+        },
+        ranking={"A": 0.9, "B": 0.8, "C": 0.7, "D": 0.6},
+    )
+
+    result = InjectionTopKDetection(
+        name="inject-vote", top_k=3, min_votes=2
+    ).detect(context)
+
+    assert result.selected_by_segment == [["B", "C", "D"]]
+    assert result.detectors == ["B", "C", "D"]
     assert list(np.flatnonzero(result.mask.to_numpy())) == [5]
+    assert result.scored_mask.all()
+
+
+def test_injection_vote_abstains_pointwise_without_quorum():
+    n = 30
+    first = _spike_scores(n, [20])
+    second = _spike_scores(n, [20])
+    first[:10] = np.nan
+    second[10:20] = np.nan
+    context = _StubContext(
+        n=n,
+        scores_by_model={"A": first, "B": second},
+        ranking={"A": 0.9, "B": 0.8},
+    )
+
+    result = InjectionTopKDetection(
+        name="inject-vote", top_k=2, min_votes=2
+    ).detect(context)
+
+    assert not result.scored_mask.iloc[:20].any()
+    assert result.scored_mask.iloc[20:].all()
+    assert list(np.flatnonzero(result.mask.to_numpy())) == [20]
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +213,57 @@ def test_strategies_share_detector_fits_through_context():
     assert context.selection_ranking() is context.selection_ranking()
 
 
+def test_context_ignores_detector_scores_with_wrong_length(monkeypatch):
+    series = _seasonal_series(n=30)
+    context = SeriesDetectionContext(series, detectors=["IQR"])
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(segment) + 1) for segment in segments],
+    )
+
+    assert context.real_scores(["IQR"]) == {}
+
+
+def test_context_ignores_detector_scores_without_finite_values(monkeypatch):
+    series = _seasonal_series(n=30)
+    context = SeriesDetectionContext(series, detectors=["IQR"])
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [
+            np.full(len(segment), np.nan) for segment in segments
+        ],
+    )
+
+    assert context.real_scores(["IQR"]) == {}
+
+
+def test_consensus_tracks_partial_finite_coverage():
+    n = 30
+    scores = _spike_scores(n, [20])
+    scores[:10] = np.nan
+    context = _StubContext(n=n, scores_by_model={"A": scores})
+    context.model_names = ["A"]
+
+    result = ConsensusDetection(max_detection_rate=1.0).detect(context)
+
+    assert not result.scored_mask.iloc[:10].any()
+    assert result.scored_mask.iloc[10:].all()
+    assert result.n_unscored == 10
+    assert result.detection_rate == pytest.approx(1 / 20)
+
+
 def test_real_scores_resume_per_detector(tmp_path, monkeypatch):
     series = _seasonal_series(n=500, seed=6)
     cache = BenchmarkCache(tmp_path)
@@ -198,15 +295,21 @@ def test_selection_ranking_resumes_per_detector(tmp_path, monkeypatch):
     names = BASELINE_DETECTORS[:2]
     fit_calls = 0
 
-    def fake_fit_score(*args, **kwargs):
+    def fake_fit_segments(*args, **kwargs):
         nonlocal fit_calls
         fit_calls += 1
         if fit_calls == 2:
             raise KeyboardInterrupt
-        values = args[1]
-        return np.linspace(0.0, 1.0, len(values))
+        return object()
 
-    monkeypatch.setattr(detection_module, "_fit_score", fake_fit_score)
+    monkeypatch.setattr(detection_module, "fit_model_segments", fake_fit_segments)
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [
+            np.linspace(0.0, 1.0, len(segment)) for segment in segments
+        ],
+    )
     monkeypatch.setattr(detection_module, "_selection_vus_pr", lambda labels, scores: 0.5)
     kwargs = {"detectors": names, "cache": cache, "cache_key": {"series": "ST"}}
 
@@ -266,26 +369,73 @@ def test_selection_ranking_scores_failed_segment_as_no_detections(monkeypatch):
     fit_calls = 0
     metric_scores = []
 
-    def fake_fit_score(*args, **kwargs):
+    def fake_fit_segments(*args, **kwargs):
         nonlocal fit_calls
         fit_calls += 1
-        if fit_calls == 2:
-            raise ValueError("cannot fit")
-        values = args[1]
-        return np.linspace(0.0, 1.0, len(values))
+        return object()
 
     def fake_vus_pr(labels, scores):
         metric_scores.append(np.asarray(scores))
         return 0.8 if np.ptp(scores) else 0.2
 
-    monkeypatch.setattr(detection_module, "_fit_score", fake_fit_score)
+    monkeypatch.setattr(detection_module, "fit_model_segments", fake_fit_segments)
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [
+            np.linspace(0.0, 1.0, len(segments[0])),
+            None,
+        ],
+    )
     monkeypatch.setattr(detection_module, "_selection_vus_pr", fake_vus_pr)
 
     ranking = context.selection_ranking()
 
     assert ranking["IQR"] == pytest.approx(0.5)
+    assert fit_calls == 1
     assert len(metric_scores) == 2
     assert np.all(metric_scores[1] == metric_scores[1][0])
+
+
+def test_selection_rankings_are_local_with_station_fallback(monkeypatch):
+    series = _seasonal_series(n=712, seed=8)
+    series.iloc[[300, 611]] = np.nan  # blocks of 300, 310, and 100 points
+    context = SeriesDetectionContext(
+        series,
+        detectors=["IQR", "Hampel_w24"],
+        min_selection_points=300,
+    )
+    values = {
+        "IQRDetector": {300: 0.9, 310: 0.2},
+        "HampelDetector": {300: 0.1, 310: 0.8},
+    }
+
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda model_cls, *_args, **_kwargs: model_cls.__name__,
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda model, segments: [
+            np.full(len(segment), values[model][len(segment)]) for segment in segments
+        ],
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "_selection_vus_pr",
+        lambda _labels, scores: float(scores[0]),
+    )
+
+    rankings = context.selection_rankings()
+
+    assert rankings[0] == {"IQR": 0.9, "Hampel_w24": 0.1}
+    assert rankings[1] == {"IQR": 0.2, "Hampel_w24": 0.8}
+    assert rankings[2] == pytest.approx({"IQR": 0.55, "Hampel_w24": 0.45})
+    assert context.selection_ranking() == pytest.approx(
+        {"IQR": 0.55, "Hampel_w24": 0.45}
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +473,9 @@ def test_build_detection_strategy_resolves_specs():
 
     vote = build_detection_strategy("inject-vote", vote_top_k=5, vote_min_votes=3)
     assert (vote.name, vote.top_k, vote.min_votes) == ("inject-vote", 5, 3)
+
+    with pytest.raises(ValueError, match="entre 2 y top_k"):
+        build_detection_strategy("inject-vote", vote_min_votes=1)
 
     with pytest.raises(ValueError):
         build_detection_strategy("nope")

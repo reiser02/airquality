@@ -1,11 +1,11 @@
 """Config-driven forecasting benchmark over anomaly-cleaning arms.
 
 Measures whether anomaly detection (and the subsequent imputation) improves
-    multi-step forecasting. For every configured series the pipeline builds one
+multi-step forecasting. For every configured series the pipeline builds one
 training *arm* per (detection strategy, imputation) combination — plus the
-    ``raw`` baseline — and backtests the same forecasting models on each arm over
-    the **same** observed holdout window in short (8 h, stride 4 h) and long
-    (48 h, stride 24 h) regimes:
+``raw`` baseline — and backtests the same forecasting models on each arm over
+the **same** fixed observed holdout window in short (8 h, stride 4 h) and long
+(48 h, stride 24 h) regimes:
 
 - ``raw``: the hourly-mean series as loaded (gaps + anomalies kept).
 - ``<strategy>+impute``: anomalies flagged by the strategy are removed and the
@@ -21,9 +21,10 @@ strategies through a per-series :class:`~airquality.forecasting.detection.Series
 and every strategy's mask can be post-processed through ``mask_transforms``
 hooks before removal.
 
-Detection and imputation touch only the training portion; the evaluation
-window (context + holdout) stays the raw observed values for every arm, so
-forecast error differences reflect only the preprocessing of the training data.
+Detection runs over the complete series before splitting. The holdout is chosen
+from the support left observed by every strategy, so no ``+noimpute`` arm can
+break the shared evaluation window. Removal and imputation still touch only the
+training portion.
 
 Detections and backtests are cached on disk (:mod:`airquality.forecasting.cache`,
 ``[forecasting] use_cache`` / ``cache_dir``): an interrupted run resumes where
@@ -55,7 +56,9 @@ from airquality.config import (
     cfg_get_str,
     get_config,
 )
-from airquality.data.io import load_and_normalize_series
+from airquality.data.loaders import load_raw_5m
+from airquality.data.preprocessing import preprocess
+from airquality.data.series import ensure_datetime_series
 from airquality.forecasting.backtest import (
     backtest_forecast,
     get_forecast_model_requirements,
@@ -75,6 +78,7 @@ from airquality.forecasting.detection import (
     DEFAULT_MIN_SELECTION_POINTS,
     DEFAULT_VOTE_MIN_VOTES,
     DEFAULT_VOTE_TOP_K,
+    MIN_SEGMENT_POINTS,
     DetectionResult,
     DetectionStrategy,
     MaskTransform,
@@ -83,6 +87,7 @@ from airquality.forecasting.detection import (
     build_detection_strategy,
 )
 from airquality.forecasting.fill import (
+    DEFAULT_MAX_GAP_SIZE,
     _repo_root,
     _resolve_tspulse_model_path,
     build_imputer,
@@ -116,6 +121,43 @@ IMPUTATION_CHOICES = ("both", "impute", "none")
 #: arm's std / naive error and inflating its scaled metric). Multiply ``rmse``
 #: by the persisted ``scale_ref`` column to recover raw units.
 METRIC_COLS = ("rmse", "mase")
+
+RESULT_COLUMNS = (
+    "regime", "horizon", "forecast_stride", "validation_len",
+    "validation_stride", "series", "arm", "strategy", "imputed",
+    "imputation_model", "detectors", "n_anomalies", "n_anomalies_full",
+    "detection_scope", "split_basis", "split_n_flagged", "split_n_unscored",
+    "test_block_start", "holdout_start", "holdout_end", "test_hours", "model",
+    "model_mode", "rmse", "mase", "train_seconds", "inference_seconds",
+    "scale_ref", "n_eval", "n_forecasts", "n_expected_forecasts",
+    "n_unique_targets", "origin_mae_mean", "origin_mae_std",
+    "origin_rmse_mean", "origin_rmse_std",
+)
+
+SELECTION_COLUMNS = (
+    "series", "series_start", "series_end", "observed_hours",
+    "common_support_hours", "split_n_flagged", "split_n_unscored",
+    "split_strategies", "selected", "exclusion_reason", "source_run_start",
+    "context_start", "train_end", "holdout_start", "holdout_end", "test_hours",
+    "holdout_age_hours",
+)
+
+
+def _load_raw_hourly_series(
+    *, pollutant: str, raw_base_dir: str, freq: str
+) -> list[pd.DataFrame]:
+    """Load raw 5-minute stations and apply the shared hourly preprocess."""
+    if freq != "h":
+        raise ValueError("El forecasting preprocesado desde 5 min requiere freq='h'")
+
+    out: list[pd.DataFrame] = []
+    for station, raw in load_raw_5m(pollutant, raw_base_dir):
+        (hourly,), _ = preprocess([raw], pollutant)
+        series = ensure_datetime_series(
+            hourly.iloc[:, 0].rename(station), freq=freq, name=station
+        )
+        out.append(series.to_frame())
+    return out
 
 
 @dataclass(frozen=True)
@@ -163,7 +205,7 @@ def _build_output_dir() -> Path:
 
 
 def _detect_for_strategies(
-    train_raw: pd.Series,
+    series: pd.Series,
     strategies: Sequence[DetectionStrategy],
     mask_transforms: Sequence[MaskTransform] | None,
     *,
@@ -184,11 +226,25 @@ def _detect_for_strategies(
         detection = cache.get("detection", key)
         if detection is None:
             if context is None:
-                context = SeriesDetectionContext(train_raw, **context_kwargs)
-            detection = apply_mask_transforms(train_raw, strategy.detect(context), mask_transforms)
+                context = SeriesDetectionContext(series, **context_kwargs)
+            detection = apply_mask_transforms(series, strategy.detect(context), mask_transforms)
             cache.put("detection", key, detection)
         detections[strategy.name] = detection
     return detections
+
+
+def _common_detection_support(
+    series: pd.Series,
+    detections: dict[str, DetectionResult],
+) -> tuple[pd.Series, pd.Series]:
+    """Mask anomalies and points where any strategy had to abstain."""
+    common_mask = pd.Series(False, index=series.index, name=series.name)
+    for detection in detections.values():
+        common_mask |= detection.mask.reindex(series.index, fill_value=False).astype(bool)
+        if detection.scored_mask is not None:
+            scored = detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
+            common_mask |= series.notna() & ~scored
+    return series.mask(common_mask), common_mask
 
 
 def _format_ranking(ranking: dict[str, float]) -> str:
@@ -206,7 +262,7 @@ def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.Data
     is read directly against ``raw``.
     """
     if results_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["regime", "series", "model"])
 
     arm_order = list(dict.fromkeys(results_df["arm"]))
     wide = results_df.pivot_table(
@@ -236,6 +292,17 @@ def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def _cacheable_backtest(result: dict[str, Any]) -> bool:
+    """Only persist complete runs; transient failures must be retried."""
+    expected = int(result.get("n_expected_forecasts", 0))
+    return (
+        expected > 0
+        and int(result.get("n_forecasts", 0)) == expected
+        and int(result.get("n_eval", 0)) > 0
+        and math.isfinite(float(result.get("rmse", float("nan"))))
+    )
+
+
 def run_benchmark_from_config(
     mask_transforms: Sequence[MaskTransform] | None = None,
 ) -> dict[str, Any]:
@@ -245,12 +312,15 @@ def run_benchmark_from_config(
     before removal — the hook for future preprocessing of the detection output.
     """
     freq = cfg_get_str("data", "freq", "h")
+    pollutant = cfg_get_str("forecasting", "pollutant", "NO2")
+    raw_base_dir = cfg_get_str(
+        "forecasting", "raw_base_dir", "data/raw/datos_estaciones_5m"
+    )
     imputation_size_k = cfg_get_int("benchmark", "size_k", 5)
     seasonality_m = cfg_get_int("benchmark", "seasonality_m", 24)
 
     holdout = cfg_get_int("forecasting", "holdout", 192)
     context_len = cfg_get_int("forecasting", "context_len", 72)
-    test_alignment = cfg_get_int("forecasting", "test_alignment", 48)
     regimes = (
         ForecastRegime(
             "short",
@@ -265,18 +335,29 @@ def run_benchmark_from_config(
             cfg_get_int("forecasting", "long_validation_len", 96),
         ),
     )
-    if any(
+    if holdout <= 0 or any(
         min(regime.horizon, regime.stride, regime.validation_len) <= 0
+        or regime.stride > regime.horizon
         or regime.validation_len < regime.horizon
+        or (regime.validation_len - regime.horizon) % regime.stride != 0
+        or holdout < regime.horizon
+        or (holdout - regime.horizon) % regime.stride != 0
         for regime in regimes
     ):
-        raise ValueError("Horizonte, stride y validacion de cada regimen deben ser validos")
+        raise ValueError(
+            "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
+        )
     seed = cfg_get_int("forecasting", "seed", 13)
     device = cfg_get_str("forecasting", "device", "cpu")
     threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
     max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
     detectors = list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
-    imputation_model = cfg_get_str("forecasting", "imputation_model", "interp")
+    imputation_model = cfg_get_str("forecasting", "imputation_model", "TSPulse")
+    max_imputation_gap = cfg_get_int(
+        "forecasting", "max_imputation_gap", DEFAULT_MAX_GAP_SIZE
+    )
+    if max_imputation_gap < 1:
+        raise ValueError("max_imputation_gap debe ser positivo")
     forecast_models = list(
         cfg_get_csv_list("forecasting", "forecast_models", ("NLinear", "TiDE"))
     )
@@ -324,6 +405,14 @@ def run_benchmark_from_config(
     min_selection_points = cfg_get_int(
         "forecasting", "min_selection_points", DEFAULT_MIN_SELECTION_POINTS
     )
+    if threshold_k < 0:
+        raise ValueError("threshold_k no puede ser negativo")
+    if not 0.0 <= max_detection_rate <= 1.0:
+        raise ValueError("max_detection_rate debe estar entre 0 y 1")
+    if min_selection_points < MIN_SEGMENT_POINTS:
+        raise ValueError(
+            f"min_selection_points debe ser al menos {MIN_SEGMENT_POINTS}"
+        )
     vote_top_k = cfg_get_int("forecasting", "vote_top_k", DEFAULT_VOTE_TOP_K)
     vote_min_votes = cfg_get_int("forecasting", "vote_min_votes", DEFAULT_VOTE_MIN_VOTES)
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
@@ -344,7 +433,9 @@ def run_benchmark_from_config(
         for spec in dict.fromkeys(arm.strategy for arm in arms if arm.strategy)
     ]
 
-    series_dfs = load_and_normalize_series(freq=freq, name_from_path=True)
+    series_dfs = _load_raw_hourly_series(
+        pollutant=pollutant, raw_base_dir=raw_base_dir, freq=freq
+    )
     if not series_dfs:
         raise RuntimeError("No se cargaron series para el benchmark.")
 
@@ -381,9 +472,11 @@ def run_benchmark_from_config(
     cache_config = effective_config(
         {
             "freq": freq,
+            "pollutant": pollutant,
+            "raw_base_dir": raw_base_dir,
             "holdout": holdout,
             "context_len": context_len,
-            "test_alignment": test_alignment,
+            "split_policy": "fixed-common-detection-support-v1",
             "regimes": [asdict(regime) for regime in regimes],
             "seed": seed,
             "device": device,
@@ -405,6 +498,7 @@ def run_benchmark_from_config(
             "model": imputation_model,
             "family": family,
             "size_k": imputation_size_k,
+            "max_gap_size": max_imputation_gap,
         }
         if family == DARTS_GLOBAL:
             weights = _repo_root() / "models" / f"{imputation_model}_k{imputation_size_k}.pt"
@@ -435,45 +529,15 @@ def run_benchmark_from_config(
 
     rows: list[dict[str, Any]] = []
     detection_rows: list[dict[str, Any]] = []
+    selection_rows: list[dict[str, Any]] = []
     for df in series_dfs:
         series = df.iloc[:, 0]
         name = str(series.name)
-        window = select_holdout_window(
-            series,
-            holdout=holdout,
-            context_len=context_requirement,
-            train_min_len=train_requirement,
-            validation_len=max(regime.validation_len for regime in regimes),
-            test_alignment=test_alignment,
-            freq=freq,
-            host_min_len=host_requirement,
-        )
-        if window is None:
-            print(
-                f"[skip] {name}: falta un bloque de test >= "
-                f"{context_requirement + holdout} h "
-                f"o un bloque anterior de train+validacion >= "
-                f"{host_requirement} h"
-            )
-            continue
-
-        holdout_start = window["holdout_start"]
-        eval_obs = series.loc[window["eval_index"]]
-        train_raw = series.loc[window["train_index"]]
-
-        # One scale factor per series, from the RAW observed training values and
-        # shared by every arm: rmse_scaled = rmse / scale_ref is the RMSE on
-        # standardized data, comparable across series of different levels.
-        scale_ref = float(train_raw.std())
-        if not math.isfinite(scale_ref) or scale_ref <= 0.0:
-            scale_ref = float("nan")
-
-        # Cache keys embed the exact training data + every knob that shapes the
-        # stage, so interrupted runs resume and config/data edits recompute.
+        series_fp = series_fingerprint(series)
         base_key = {
             "version": CACHE_VERSION,
             "series": name,
-            "train_fp": series_fingerprint(train_raw),
+            "series_fp": series_fp,
             "config": cache_config,
             "freq": freq,
             "detectors": sorted(resolved_detectors),
@@ -481,11 +545,10 @@ def run_benchmark_from_config(
             "injection_seed": injection_seed,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
-            "test_alignment": test_alignment,
             "regimes": [asdict(regime) for regime in regimes],
         }
         detections = _detect_for_strategies(
-            train_raw,
+            series,
             strategies,
             mask_transforms,
             cache=cache,
@@ -501,17 +564,29 @@ def run_benchmark_from_config(
                 "cache_key": {
                     "version": CACHE_VERSION,
                     "series": name,
-                    "train_fp": base_key["train_fp"],
+                    "series_fp": series_fp,
                     "freq": freq,
                     "seed": seed,
                 },
             },
         )
         for spec, detection in detections.items():
+            n_observed = int(series.notna().sum())
+            n_scored = (
+                int(
+                    (
+                        detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
+                        & series.notna()
+                    ).sum()
+                )
+                if detection.scored_mask is not None
+                else n_observed
+            )
             print(
                 f"[info] {name}/{spec}: detectores={','.join(detection.detectors) or 'none'} "
                 f"descartados={','.join(detection.discarded) or 'none'} "
-                f"tasa={detection.detection_rate:.2%} anomalias={detection.n_flagged}"
+                f"tasa={detection.detection_rate:.2%} anomalias={detection.n_flagged} "
+                f"cobertura={n_scored / n_observed if n_observed else 0.0:.2%}"
             )
             detection_rows.append(
                 {
@@ -520,10 +595,86 @@ def run_benchmark_from_config(
                     "detectors": ",".join(detection.detectors),
                     "discarded": ",".join(detection.discarded),
                     "n_flagged": detection.n_flagged,
+                    "n_unscored": n_observed - n_scored,
+                    "coverage_rate": n_scored / n_observed if n_observed else 0.0,
                     "detection_rate": detection.detection_rate,
                     "ranking": _format_ranking(detection.ranking),
+                    "scope": "full_series",
+                    "n_observed": n_observed,
                 }
             )
+
+        support, common_mask = _common_detection_support(series, detections)
+        flagged_mask = pd.Series(False, index=series.index)
+        unscored_mask = pd.Series(False, index=series.index)
+        for detection in detections.values():
+            flagged_mask |= detection.mask.reindex(series.index, fill_value=False).astype(bool)
+            if detection.scored_mask is not None:
+                scored = detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
+                unscored_mask |= series.notna() & ~scored
+        split_n_flagged = int((flagged_mask & series.notna()).sum())
+        split_n_unscored = int(unscored_mask.sum())
+        window = select_holdout_window(
+            support,
+            holdout=holdout,
+            context_len=context_requirement,
+            train_min_len=train_requirement,
+            validation_len=max(regime.validation_len for regime in regimes),
+            freq=freq,
+            host_min_len=host_requirement,
+        )
+        selection_common = {
+            "series": name,
+            "series_start": series.index.min(),
+            "series_end": series.index.max(),
+            "observed_hours": int(series.notna().sum()),
+            "common_support_hours": int(support.notna().sum()),
+            "split_n_flagged": split_n_flagged,
+            "split_n_unscored": split_n_unscored,
+            "split_strategies": ",".join(detections),
+        }
+        if window is None:
+            print(
+                f"[skip] {name}: no hay soporte comun para train+validacion y "
+                f"{context_requirement} h de contexto + {holdout} h de test"
+            )
+            selection_rows.append(
+                {
+                    **selection_common,
+                    "selected": False,
+                    "exclusion_reason": "no_common_fixed_holdout_and_training_host",
+                }
+            )
+            continue
+
+        holdout_start = window["holdout_start"]
+        eval_obs = series.loc[window["eval_index"]]
+        train_raw = series.loc[window["train_index"]]
+        if eval_obs.isna().any() or common_mask.loc[window["eval_index"]].any():
+            raise RuntimeError(f"{name}: el bloque comun de evaluacion no es valido")
+        selection_rows.append(
+            {
+                **selection_common,
+                "selected": True,
+                "exclusion_reason": "",
+                "source_run_start": window["source_run_start"],
+                "context_start": window["context_index"][0],
+                "train_end": window["train_end"],
+                "holdout_start": holdout_start,
+                "holdout_end": window["holdout_end"],
+                "test_hours": window["test_hours"],
+                "holdout_age_hours": int(
+                    (series.index.max() - window["holdout_end"]) / pd.Timedelta(hours=1)
+                ),
+            }
+        )
+
+        # One raw scale and MASE history are shared by every arm.
+        scale_ref = float(train_raw.std())
+        if not math.isfinite(scale_ref) or scale_ref <= 0.0:
+            scale_ref = float("nan")
+        train_fp = series_fingerprint(train_raw)
+        support_fp = series_fingerprint(support)
 
         # Arm training series are built lazily: fully-cached arms skip anomaly
         # removal AND imputation entirely (that is what makes resume cheap).
@@ -537,7 +688,13 @@ def run_benchmark_from_config(
                     else remove_anomalies(train_raw, detections[arm.strategy])
                 )
                 train_by_arm[arm.name] = (
-                    impute_series(base, get_imputer(), freq=freq, use_scaler=use_scaler)
+                    impute_series(
+                        base,
+                        get_imputer(),
+                        freq=freq,
+                        use_scaler=use_scaler,
+                        max_gap_size=max_imputation_gap,
+                    )
                     if arm.impute
                     else base
                 )
@@ -547,6 +704,16 @@ def run_benchmark_from_config(
         for regime in regimes:
             for arm in arms:
                 detection = detections.get(arm.strategy) if arm.strategy else None
+                n_train_anomalies = (
+                    int(
+                        (
+                            detection.mask.reindex(train_raw.index, fill_value=False).astype(bool)
+                            & train_raw.notna()
+                        ).sum()
+                    )
+                    if detection
+                    else 0
+                )
                 common = {
                     "regime": regime.name,
                     "horizon": regime.horizon,
@@ -559,7 +726,12 @@ def run_benchmark_from_config(
                     "imputed": arm.impute,
                     "imputation_model": imputation_model if arm.impute else "none",
                     "detectors": ",".join(detection.detectors) if detection else "",
-                    "n_anomalies": detection.n_flagged if detection else 0,
+                    "n_anomalies": n_train_anomalies,
+                    "n_anomalies_full": detection.n_flagged if detection else 0,
+                    "detection_scope": "full_series" if detection else "none",
+                    "split_basis": "common_detection_support" if detections else "raw",
+                    "split_n_flagged": split_n_flagged,
+                    "split_n_unscored": split_n_unscored,
                     "test_block_start": str(window["test_block_start"]),
                     "holdout_start": str(holdout_start),
                     "holdout_end": str(window["holdout_end"]),
@@ -574,6 +746,8 @@ def run_benchmark_from_config(
                         continue
                     backtest_key = {
                         **base_key,
+                        "train_fp": train_fp,
+                        "support_fp": support_fp,
                         "stage": "backtest",
                         "arm": arm.name,
                         "strategy": arm_strategy_key,
@@ -609,7 +783,8 @@ def run_benchmark_from_config(
                             # seasonal-naive denominator (see METRIC_COLS).
                             mase_insample=train_raw,
                         )
-                        cache.put("backtest", backtest_key, res)
+                        if _cacheable_backtest(res):
+                            cache.put("backtest", backtest_key, res)
                     rows.append(
                         {
                             **common,
@@ -624,6 +799,7 @@ def run_benchmark_from_config(
                             "scale_ref": scale_ref,
                             "n_eval": res["n_eval"],
                             "n_forecasts": res.get("n_forecasts", 0),
+                            "n_expected_forecasts": res.get("n_expected_forecasts", 0),
                             "n_unique_targets": res.get("n_unique_targets", 0),
                             "origin_mae_mean": res.get("origin_mae_mean", float("nan")),
                             "origin_mae_std": res.get("origin_mae_std", float("nan")),
@@ -633,7 +809,7 @@ def run_benchmark_from_config(
                     )
 
     print(f"[cache] {cache.stats()}")
-    results_df = pd.DataFrame(rows)
+    results_df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     summary_df = _summarize(results_df)
     detection_df = pd.DataFrame(
         detection_rows,
@@ -643,15 +819,21 @@ def run_benchmark_from_config(
             "detectors",
             "discarded",
             "n_flagged",
+            "n_unscored",
+            "coverage_rate",
             "detection_rate",
             "ranking",
+            "scope",
+            "n_observed",
         ],
     )
+    selection_df = pd.DataFrame(selection_rows, columns=SELECTION_COLUMNS)
 
     output_dir = _build_output_dir()
     results_df.to_csv(output_dir / "results.csv", index=False)
     summary_df.to_csv(output_dir / "summary.csv", index=False)
     detection_df.to_csv(output_dir / "detection.csv", index=False)
+    selection_df.to_csv(output_dir / "selection.csv", index=False)
 
     return {
         "output_dir": output_dir,
@@ -659,6 +841,7 @@ def run_benchmark_from_config(
         "results_df": results_df,
         "summary_df": summary_df,
         "detection_df": detection_df,
+        "selection_df": selection_df,
     }
 
 

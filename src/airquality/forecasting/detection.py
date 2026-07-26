@@ -15,9 +15,9 @@ anomaly mask, so strategies share detector fits instead of refitting per arm:
   into a copy of the training segments, rank every detector by VUS-PR against
   the injection labels, and keep the single best detector's MAD-thresholded
   mask on the real series.
-- ``inject-vote`` (``top_k=3, min_votes=2``): same ranking, but the top-3
-  detectors' real scores are binarized independently and a point is flagged
-  when at least 2 of the 3 masks agree.
+- ``inject-vote`` (``top_k=3, min_votes=2``): rank long blocks locally (short
+  blocks inherit the station mean), backfill detectors that cannot score a
+  block, and flag points where at least 2 selected masks agree.
 
 The injected copies are used ONLY to select detectors; the final mask always
 comes from scores on the real (uninjected) series.
@@ -38,7 +38,7 @@ import pandas as pd
 
 from airquality.anomaly._vendor.vus_volume import vus_roc_pr
 from airquality.anomaly.anomalies import inject_synthetic_anomalies
-from airquality.anomaly.ensemble import consensus, rank_top_k
+from airquality.anomaly.ensemble import rank_top_k
 from airquality.anomaly.metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
@@ -48,8 +48,10 @@ from airquality.anomaly.metrics import (
 )
 from airquality.anomaly.registry import (
     filter_model_kwargs as _filter_model_kwargs,
+    fit_model_segments,
     resolve_model_class,
     resolve_model_names,
+    score_model_segments,
 )
 from airquality.data.segments import contiguous_observed_segments
 from airquality.data.series import ensure_datetime_series
@@ -96,8 +98,11 @@ class DetectionResult:
     threshold_k: float
     mask: pd.Series  # boolean, indexed like the input series (True = anomaly)
     ranking: dict[str, float] = field(default_factory=dict)  # selection VUS-PR per detector
+    scored_mask: pd.Series | None = None  # True where the strategy had enough detectors
+    selected_by_segment: list[list[str]] = field(default_factory=list)
     n_flagged: int = 0
-    detection_rate: float = 0.0  # rate of the final mask over the observed points
+    n_unscored: int = 0
+    detection_rate: float = 0.0  # rate of the final mask over scored observed points
 
 
 class DetectionStrategy(Protocol):
@@ -106,14 +111,6 @@ class DetectionStrategy(Protocol):
     name: str
 
     def detect(self, context: "SeriesDetectionContext") -> DetectionResult: ...
-
-
-def _fit_score(model_cls: type, values: np.ndarray, *, seed: int, device: str) -> np.ndarray:
-    """Instantiate, fit and score one detector on ``values``."""
-    kwargs = _filter_model_kwargs(model_cls, {"device": device})
-    model = model_cls(seed=seed, **kwargs)
-    model.fit(values)
-    return np.asarray(model.score(values), dtype=float)
 
 
 def _score_segments(
@@ -130,19 +127,28 @@ def _score_segments(
     removes that detector from that segment's consensus.
     """
     scores_by_model: dict[str, list[np.ndarray | None]] = {}
+    values = [segment.to_numpy(dtype=np.float32) for segment in segments]
     for name in model_names:
         model_cls = resolve_model_class(name)
-        segment_scores: list[np.ndarray | None] = []
-        for segment in segments:
-            try:
-                segment_scores.append(
-                    _fit_score(model_cls, segment.to_numpy(dtype=np.float32), seed=seed, device=device)
-                )
-            except Exception as exc:  # pragma: no cover - detector-specific failures
-                logging.warning(
-                    "Detector %s fallo en un segmento de %d puntos: %s", name, len(segment), exc
-                )
-                segment_scores.append(None)
+        kwargs = _filter_model_kwargs(model_cls, {"device": device})
+        try:
+            model = fit_model_segments(
+                model_cls, values, seed=seed, model_kwargs=kwargs
+            )
+            segment_scores = score_model_segments(model, values)
+        except Exception as exc:  # pragma: no cover - detector-specific failures
+            logging.warning("Detector %s fallo al entrenar la serie: %s", name, exc)
+            continue
+        for index, (segment, scores) in enumerate(zip(segments, segment_scores, strict=True)):
+            if scores is not None:
+                array = np.asarray(scores)
+                if array.shape != (len(segment),) or not np.isfinite(array).any():
+                    logging.warning(
+                        "Detector %s no produjo scores finitos validos en segmento %d",
+                        name,
+                        index,
+                    )
+                    segment_scores[index] = None
         if all(scores is None for scores in segment_scores):
             logging.warning("Detector %s fallo en todos los segmentos; se omite.", name)
             continue
@@ -157,9 +163,12 @@ def _detector_rate(segment_scores: list[np.ndarray | None], threshold_k: float) 
     for scores in segment_scores:
         if scores is None:
             continue
+        finite = np.isfinite(scores)
+        if not finite.any():
+            continue
         mask = detect_mask(scores, threshold_k)
         flagged += int(mask.sum())
-        total += int(mask.size)
+        total += int(finite.sum())
     return flagged / total if total else 0.0
 
 
@@ -184,8 +193,8 @@ class SeriesDetectionContext:
     Detector fits are the expensive part of the benchmark, so the context
     memoizes the two score families and hands them to any strategy that asks:
 
-    - :meth:`real_scores`: each detector fit/scored per contiguous observed
-      segment of the real series (same convention as the production cleaning);
+    - :meth:`real_scores`: each detector fit once over all block-local windows,
+      then scored separately per contiguous observed segment;
     - :meth:`selection_ranking`: every detector's mean VUS-PR against synthetic
       anomalies injected into the (sufficiently long) segments — the label-based
       selection signal the injection strategies use, with no real labels needed.
@@ -222,6 +231,7 @@ class SeriesDetectionContext:
         self._real_scores: dict[str, list[np.ndarray | None]] = {}
         self._real_failed: set[str] = set()
         self._ranking: dict[str, float] | None = None
+        self._segment_rankings: list[dict[str, float]] | None = None
 
     def _cached(self, namespace: str, key: dict[str, Any]) -> Any | None:
         if self.cache is None or self.cache_key is None:
@@ -237,8 +247,8 @@ class SeriesDetectionContext:
         return pd.Series(False, index=self.series.index, name=self.series.name)
 
     def total_observed(self) -> int:
-        """Observed points that enter detection (sum of segment lengths)."""
-        return sum(len(segment) for segment in self.segments)
+        """All observed points, including short runs where detectors abstain."""
+        return int(self.series.notna().sum())
 
     def real_scores(self, names: Sequence[str]) -> dict[str, list[np.ndarray | None]]:
         """Per-segment scores on the real series for ``names`` (memoized).
@@ -262,70 +272,118 @@ class SeriesDetectionContext:
                 self._real_failed.add(name)
         return {name: self._real_scores[name] for name in names if name in self._real_scores}
 
-    def selection_segments(self) -> list[pd.Series]:
-        """Segments long enough for injection-based selection (longest as fallback)."""
-        eligible = [seg for seg in self.segments if len(seg) >= self.min_selection_points]
+    def selection_segment_indices(self) -> list[int]:
+        """Long segments ranked locally, or the longest segment as fallback."""
+        eligible = [
+            index
+            for index, segment in enumerate(self.segments)
+            if len(segment) >= self.min_selection_points
+        ]
         if eligible:
             return eligible
-        return [max(self.segments, key=len)] if self.segments else []
+        if not self.segments:
+            return []
+        return [max(range(len(self.segments)), key=lambda index: len(self.segments[index]))]
+
+    def selection_segments(self) -> list[pd.Series]:
+        """Segments used to establish local and station fallback rankings."""
+        return [self.segments[index] for index in self.selection_segment_indices()]
+
+    def selection_rankings(self) -> list[dict[str, float]]:
+        """Ranking per real segment, with short segments inheriting the station mean."""
+        if self._segment_rankings is not None:
+            return self._segment_rankings
+
+        selected_indices = self.selection_segment_indices()
+        if not selected_indices:
+            self._ranking = {}
+            self._segment_rankings = []
+            return self._segment_rankings
+
+        injected_pairs = []
+        for segment_index in selected_indices:
+            segment = self.segments[segment_index]
+            injected_pairs.append(
+                inject_synthetic_anomalies(
+                    segment.to_numpy(dtype=np.float32),
+                    self.injection_variant,
+                    self.injection_seed + segment_index,
+                )
+            )
+
+        local = {index: {} for index in selected_indices}
+        for name in self.model_names:
+            cached_values: dict[int, float] = {}
+            for segment_index in selected_indices:
+                cache_key = {
+                    "detector": name,
+                    "segment_index": segment_index,
+                    "ranking_policy": "local-long-fallback-v1",
+                    "injection_variant": self.injection_variant,
+                    "injection_seed": self.injection_seed,
+                    "min_selection_points": self.min_selection_points,
+                }
+                cached = self._cached("selection_scores", cache_key)
+                if cached is not None:
+                    cached_values[segment_index] = float(cached)
+            if len(cached_values) == len(selected_indices):
+                for segment_index, value in cached_values.items():
+                    local[segment_index][name] = value
+                continue
+
+            model_cls = resolve_model_class(name)
+            kwargs = _filter_model_kwargs(model_cls, {"device": self.device})
+            try:
+                model = fit_model_segments(
+                    model_cls,
+                    [injected for injected, _ in injected_pairs],
+                    seed=self.seed,
+                    model_kwargs=kwargs,
+                )
+                selected_scores = score_model_segments(
+                    model, [injected for injected, _ in injected_pairs]
+                )
+            except Exception as exc:  # pragma: no cover - detector-specific failures
+                logging.warning(
+                    "Detector %s fallo al entrenar segmentos inyectados: %s", name, exc
+                )
+                selected_scores = [None] * len(injected_pairs)
+
+            for segment_index, (_, labels), scores in zip(
+                selected_indices, injected_pairs, selected_scores, strict=True
+            ):
+                if scores is None or np.asarray(scores).shape != labels.shape:
+                    scores = np.zeros(labels.shape, dtype=np.float64)
+                value = _selection_vus_pr(labels, scores)
+                local[segment_index][name] = value
+                self._store(
+                    "selection_scores",
+                    {
+                        "detector": name,
+                        "segment_index": segment_index,
+                        "ranking_policy": "local-long-fallback-v1",
+                        "injection_variant": self.injection_variant,
+                        "injection_seed": self.injection_seed,
+                        "min_selection_points": self.min_selection_points,
+                    },
+                    value,
+                )
+
+        self._ranking = {
+            name: float(np.mean([local[index][name] for index in selected_indices]))
+            for name in self.model_names
+            if all(name in local[index] for index in selected_indices)
+        }
+        self._segment_rankings = [
+            dict(local[index]) if index in local else dict(self._ranking)
+            for index in range(len(self.segments))
+        ]
+        return self._segment_rankings
 
     def selection_ranking(self) -> dict[str, float]:
-        """Mean VUS-PR per detector over the injected selection segments (memoized).
-
-        Each eligible segment is injected once (seed = ``injection_seed`` +
-        segment position, so shapes decorrelate across segments) and every
-        requested detector is fit/scored on the injected copy. A detector's
-        ranking value is the mean VUS-PR over every injected segment. A failed
-        fit is represented by constant all-normal scores, so VUS-PR measures the
-        missed injected anomalies instead of silently omitting that segment.
-        """
-        if self._ranking is not None:
-            return self._ranking
-
-        ranking: dict[str, float] = {}
-        injected_pairs: list[tuple[np.ndarray, np.ndarray]] | None = None
-        for name in self.model_names:
-            cache_key = {
-                "detector": name,
-                "injection_variant": self.injection_variant,
-                "injection_seed": self.injection_seed,
-                "min_selection_points": self.min_selection_points,
-            }
-            cached = self._cached("selection_scores", cache_key)
-            if cached is not None:
-                ranking[name] = float(cached)
-                continue
-            if injected_pairs is None:
-                injected_pairs = []
-                for position, segment in enumerate(self.selection_segments()):
-                    injected, labels = inject_synthetic_anomalies(
-                        segment.to_numpy(dtype=np.float32),
-                        self.injection_variant,
-                        self.injection_seed + position,
-                    )
-                    injected_pairs.append((injected, labels))
-            model_cls = resolve_model_class(name)
-            vus_values: list[float] = []
-            for injected, labels in injected_pairs:
-                try:
-                    scores = _fit_score(model_cls, injected, seed=self.seed, device=self.device)
-                except Exception as exc:  # pragma: no cover - detector-specific failures
-                    logging.warning(
-                        "Detector %s fallo en un segmento inyectado de %d puntos; "
-                        "se evalua como ninguna anomalia detectada: %s",
-                        name, len(injected), exc,
-                    )
-                    scores = np.zeros(labels.shape, dtype=np.float64)
-                vus_values.append(_selection_vus_pr(labels, scores))
-            if vus_values:
-                ranking[name] = float(np.mean(vus_values))
-                self._store("selection_scores", cache_key, ranking[name])
-            else:
-                logging.warning(
-                    "Detector %s fallo en todos los segmentos inyectados; fuera de la seleccion.", name
-                )
-        self._ranking = ranking
-        return ranking
+        """Station fallback ranking: mean of the locally ranked long segments."""
+        self.selection_rankings()
+        return self._ranking or {}
 
 
 def _empty_result(
@@ -343,6 +401,8 @@ def _empty_result(
         threshold_k=threshold_k,
         mask=context.empty_mask(),
         ranking=dict(ranking or {}),
+        scored_mask=context.empty_mask(),
+        n_unscored=context.total_observed(),
     )
 
 
@@ -374,6 +434,7 @@ class ConsensusDetection:
         discarded = sorted(name for name, rate in rates.items() if rate > self.max_detection_rate)
 
         mask = context.empty_mask()
+        scored_mask = context.empty_mask()
         n_flagged = 0
         for segment_index, segment in enumerate(context.segments):
             score_arrays = [
@@ -383,11 +444,19 @@ class ConsensusDetection:
             ]
             if not score_arrays:
                 continue
-            flagged = consensus(score_arrays, threshold_k=self.threshold_k).astype(bool)
+            finite = np.stack([np.isfinite(scores) for scores in score_arrays])
+            votes = np.stack(
+                [detect_mask(scores, self.threshold_k) for scores in score_arrays]
+            )
+            available = finite.sum(axis=0)
+            supported = available > 0
+            flagged = supported & (votes.sum(axis=0) > available / 2.0)
             mask.loc[segment.index] = flagged
+            scored_mask.loc[segment.index] = supported
             n_flagged += int(flagged.sum())
 
         total_observed = context.total_observed()
+        n_scored = int(scored_mask.sum())
         return DetectionResult(
             strategy=self.name,
             detectors=survivors,
@@ -395,8 +464,10 @@ class ConsensusDetection:
             rates=rates,
             threshold_k=self.threshold_k,
             mask=mask,
+            scored_mask=scored_mask,
             n_flagged=n_flagged,
-            detection_rate=n_flagged / total_observed if total_observed else 0.0,
+            n_unscored=total_observed - n_scored,
+            detection_rate=n_flagged / n_scored if n_scored else 0.0,
         )
 
 
@@ -407,15 +478,21 @@ class InjectionTopKDetection:
     ``top_k=1`` keeps the single best detector's MAD-thresholded mask. With
     ``top_k > 1`` each selected detector's real scores are binarized
     independently (same MAD rule per segment) and a point is flagged when at
-    least ``min_votes`` masks agree. When fewer detectors than ``min_votes``
-    could score a segment, the vote degrades to unanimity among the available
-    ones (so a lone survivor still contributes its detections).
+    least ``min_votes`` masks agree. Segments with fewer available detectors
+    than ``min_votes`` are unscored rather than silently treated as normal.
     """
 
     name: str = STRATEGY_INJECT_BEST
     top_k: int = 1
     min_votes: int = 1
     threshold_k: float = DEFAULT_THRESHOLD_K
+
+    def __post_init__(self) -> None:
+        minimum = 2 if self.name == STRATEGY_INJECT_VOTE else 1
+        if self.top_k < 1 or not minimum <= self.min_votes <= self.top_k:
+            raise ValueError(
+                f"{self.name}: min_votes debe estar entre {minimum} y top_k"
+            )
 
     def detect(self, context: SeriesDetectionContext) -> DetectionResult:
         if not context.segments:
@@ -424,43 +501,73 @@ class InjectionTopKDetection:
         ranking = context.selection_ranking()
         if not ranking:
             return _empty_result(self.name, context, self.threshold_k)
-        top_models = rank_top_k(ranking, self.top_k)
+        segment_rankings = (
+            context.selection_rankings()
+            if hasattr(context, "selection_rankings")
+            else [ranking] * len(context.segments)
+        )
 
         # The mask always comes from the REAL series: the injection only ranks.
-        scores_by_model = context.real_scores(top_models)
-        selected = [name for name in top_models if name in scores_by_model]
-        if not selected:
-            return _empty_result(self.name, context, self.threshold_k, ranking)
-        rates = {
-            name: _detector_rate(scores_by_model[name], self.threshold_k) for name in selected
-        }
+        scores_by_model = context.real_scores(list(ranking))
 
         mask = context.empty_mask()
+        scored_mask = context.empty_mask()
         n_flagged = 0
-        for segment_index, segment in enumerate(context.segments):
+        selected_by_segment: list[list[str]] = []
+        selected_set: set[str] = set()
+        for segment_index, (segment, local_ranking) in enumerate(
+            zip(context.segments, segment_rankings, strict=True)
+        ):
+            eligible = [
+                name
+                for name in rank_top_k(local_ranking, len(local_ranking))
+                if name in scores_by_model
+                and scores_by_model[name][segment_index] is not None
+            ]
+            selected = eligible[: self.top_k]
+            selected_by_segment.append(selected)
+            selected_set.update(selected)
+            if len(selected) < self.min_votes:
+                continue
             segment_masks = [
                 detect_mask(scores_by_model[name][segment_index], self.threshold_k)
                 for name in selected
-                if scores_by_model[name][segment_index] is not None
             ]
-            if not segment_masks:
-                continue
-            needed = min(self.min_votes, len(segment_masks))
-            flagged = np.sum(segment_masks, axis=0) >= needed
+            available = np.sum(
+                [
+                    np.isfinite(scores_by_model[name][segment_index])
+                    for name in selected
+                ],
+                axis=0,
+            )
+            supported = available >= self.min_votes
+            flagged = supported & (np.sum(segment_masks, axis=0) >= self.min_votes)
             mask.loc[segment.index] = flagged
+            scored_mask.loc[segment.index] = supported
             n_flagged += int(flagged.sum())
 
+        selected_all = [
+            name for name in rank_top_k(ranking, len(ranking)) if name in selected_set
+        ]
+        rates = {
+            name: _detector_rate(scores_by_model[name], self.threshold_k)
+            for name in selected_all
+        }
         total_observed = context.total_observed()
+        n_scored = int(scored_mask.sum())
         return DetectionResult(
             strategy=self.name,
-            detectors=selected,
-            discarded=sorted(set(ranking) - set(selected)),
+            detectors=selected_all,
+            discarded=sorted(set(ranking) - selected_set),
             rates=rates,
             threshold_k=self.threshold_k,
             mask=mask,
             ranking=dict(ranking),
+            scored_mask=scored_mask,
+            selected_by_segment=selected_by_segment,
             n_flagged=n_flagged,
-            detection_rate=n_flagged / total_observed if total_observed else 0.0,
+            n_unscored=total_observed - n_scored,
+            detection_rate=n_flagged / n_scored if n_scored else 0.0,
         )
 
 
@@ -512,13 +619,16 @@ def apply_mask_transforms(
     mask = result.mask
     for transform in transforms:
         mask = transform(series, mask).reindex(result.mask.index, fill_value=False).astype(bool)
+    if result.scored_mask is not None:
+        mask &= result.scored_mask.reindex(mask.index, fill_value=False).astype(bool)
     n_flagged = int(mask.sum())
-    total_observed = int(series.notna().sum())
+    scored = result.scored_mask if result.scored_mask is not None else series.notna()
+    n_scored = int((scored.reindex(series.index, fill_value=False) & series.notna()).sum())
     return replace(
         result,
         mask=mask,
         n_flagged=n_flagged,
-        detection_rate=n_flagged / total_observed if total_observed else 0.0,
+        detection_rate=n_flagged / n_scored if n_scored else 0.0,
     )
 
 

@@ -16,6 +16,7 @@ from airquality.forecasting.backtest import (
     split_train_val_subseries,
 )
 from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
+from airquality.forecasting.detection import DetectionResult
 from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
 from airquality.imputation.registry import resolve_imputer_family
 
@@ -119,6 +120,40 @@ def test_detect_anomaly_mask_detects_per_contiguous_segment():
     assert not result.mask.iloc[300:340].any()
 
 
+def test_common_detection_support_masks_every_strategy_timestamp():
+    series = _seasonal_series(n=20)
+    first = pd.Series(False, index=series.index)
+    second = pd.Series(False, index=series.index)
+    first.iloc[5] = True
+    second.iloc[12] = True
+    detections = {
+        name: DetectionResult(name, [], [], {}, 3.5, mask)
+        for name, mask in (("first", first), ("second", second))
+    }
+
+    support, common_mask = cp._common_detection_support(series, detections)
+
+    assert common_mask[common_mask].index.tolist() == [series.index[5], series.index[12]]
+    assert support.isna().iloc[[5, 12]].all()
+
+
+def test_common_detection_support_excludes_unscored_timestamps():
+    series = _seasonal_series(n=20)
+    mask = pd.Series(False, index=series.index)
+    scored = pd.Series(True, index=series.index)
+    scored.iloc[7] = False
+    detection = DetectionResult(
+        "inject-vote", [], [], {}, 3.5, mask, scored_mask=scored, n_unscored=1
+    )
+
+    support, common_mask = cp._common_detection_support(
+        series, {"inject-vote": detection}
+    )
+
+    assert common_mask[common_mask].index.tolist() == [series.index[7]]
+    assert pd.isna(support.iloc[7])
+
+
 # --------------------------------------------------------------------------- #
 # Output paths
 # --------------------------------------------------------------------------- #
@@ -128,6 +163,21 @@ def test_repo_root_resolves_to_repository_root():
     root = cp._repo_root()
     assert (root / "pyproject.toml").exists()
     assert root.name != "src"
+
+
+def test_load_raw_hourly_series_applies_preprocess_and_preserves_station(monkeypatch):
+    index = pd.date_range("2024-01-01", periods=36, freq="5min")
+    raw = pd.DataFrame({"NO2": 10.0 + np.arange(36)}, index=index)
+    raw = raw.drop(index[12:24])
+    monkeypatch.setattr(cp, "load_raw_5m", lambda pollutant, base_dir: [("Station A", raw)])
+
+    (frame,) = cp._load_raw_hourly_series(
+        pollutant="NO2", raw_base_dir="raw", freq="h"
+    )
+
+    assert frame.columns.tolist() == ["Station A"]
+    assert len(frame) == 3
+    assert pd.isna(frame.iloc[1, 0])
 
 
 # --------------------------------------------------------------------------- #
@@ -145,19 +195,20 @@ def test_nan_gap_windows_splits_contiguous_runs():
     assert [len(w) for w in windows] == [4, 1]
 
 
-def test_impute_series_interp_fills_and_preserves_observed():
+def test_impute_series_only_fills_complete_gaps_up_to_five():
     series = _seasonal_series(n=300)
-    observed_before = series.iloc[0]
-    series.iloc[5:9] = np.nan
-    series.iloc[60:90] = np.nan
-    series.iloc[-3:] = np.nan
+    original = series.copy()
+    series.iloc[5:10] = np.nan
+    series.iloc[60:66] = np.nan
 
     imputer = build_imputer("interp", freq="h")
     filled = impute_series(series, imputer, freq="h")
 
-    assert not filled.isna().any()
-    assert filled.iloc[0] == pytest.approx(observed_before)
-    assert filled.iloc[7] == pytest.approx(filled.iloc[7])  # finite
+    assert filled.iloc[5:10].notna().all()
+    assert filled.iloc[60:66].isna().all()
+    pd.testing.assert_series_equal(
+        filled[series.notna()], original[series.notna()], check_names=False
+    )
 
 
 def test_build_imputer_routes_base_and_finetuned_tspulse(
@@ -217,16 +268,15 @@ def test_select_holdout_window_requires_contiguous_run():
         context_len=72,
         train_min_len=77,
         validation_len=48,
-        test_alignment=48,
     )
     assert select_holdout_window(series, holdout=500, **kwargs) is None
     window = select_holdout_window(series, holdout=40, **kwargs)
     assert window is not None
-    assert len(window["holdout_index"]) == 144
-    assert len(window["eval_index"]) == 216
-    assert window["train_index"][-1] == series.index[169]
-    assert series.loc[window["train_index"]].last_valid_index() == series.index[149]
-    assert window["test_block_index"][0] == series.index[170]
+    assert len(window["holdout_index"]) == 40
+    assert len(window["eval_index"]) == 112
+    assert window["train_index"][-1] == window["holdout_start"] - pd.Timedelta(hours=1)
+    assert window["source_run_start"] == series.index[170]
+    assert window["test_block_start"] == window["context_index"][0]
 
 
 def test_select_holdout_window_prefers_most_recent_run_over_longest():
@@ -241,7 +291,6 @@ def test_select_holdout_window_prefers_most_recent_run_over_longest():
         context_len=72,
         train_min_len=77,
         validation_len=48,
-        test_alignment=8,
     )
     assert window is not None
     # Holdout ends at the tail of the recent run, not inside the longer early one.
@@ -249,23 +298,25 @@ def test_select_holdout_window_prefers_most_recent_run_over_longest():
     assert window["holdout_start"] > series.index[750]
 
 
-def test_select_holdout_window_requires_distinct_earlier_validation_host():
+def test_select_holdout_window_uses_same_run_prefix_as_validation_host():
     kwargs = dict(
         holdout=40,
         context_len=72,
         train_min_len=77,
         validation_len=48,
-        test_alignment=8,
     )
-    assert select_holdout_window(_seasonal_series(n=300, seed=4), **kwargs) is None
+    assert select_holdout_window(_seasonal_series(n=160, seed=4), **kwargs) is None
+    single_run = select_holdout_window(_seasonal_series(n=300, seed=4), **kwargs)
+    assert single_run is not None
+    assert single_run["source_run_start"] == single_run["train_index"][0]
+    assert single_run["train_end"] == single_run["holdout_start"] - pd.Timedelta(hours=1)
 
     series = _seasonal_series(n=500, seed=4)
     series.iloc[150:170] = np.nan
     window = select_holdout_window(series, **kwargs)
     assert window is not None
-    assert window["test_block_start"] == series.index[170]
-    assert window["train_index"][-1] == series.index[169]
-    assert series.loc[window["train_index"]].last_valid_index() == series.index[149]
+    assert window["source_run_start"] == series.index[170]
+    assert window["train_end"] == series.index[459]
 
 
 def test_backtest_forecast_returns_finite_metrics():
@@ -277,7 +328,6 @@ def test_backtest_forecast_returns_finite_metrics():
         context_len=72,
         train_min_len=77,
         validation_len=48,
-        test_alignment=8,
     )
     train = series.loc[window["train_index"]]
     eval_obs = series.loc[window["eval_index"]]
@@ -359,7 +409,6 @@ def test_backtest_forecast_mase_uses_shared_insample():
         context_len=72,
         train_min_len=77,
         validation_len=48,
-        test_alignment=8,
     )
     train = series.loc[window["train_index"]]
     eval_obs = series.loc[window["eval_index"]]
@@ -399,11 +448,111 @@ def test_build_arms_expands_strategies_and_imputation_variants():
         cp.build_arms(["unlabeled"], "sometimes")
 
 
+def test_only_complete_backtests_are_cacheable():
+    complete = {
+        "rmse": 1.0,
+        "n_eval": 16,
+        "n_forecasts": 2,
+        "n_expected_forecasts": 2,
+    }
+
+    assert cp._cacheable_backtest(complete)
+    assert not cp._cacheable_backtest({**complete, "n_forecasts": 1})
+    assert not cp._cacheable_backtest({**complete, "rmse": float("nan")})
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end orchestration
 # --------------------------------------------------------------------------- #
+def test_run_benchmark_selects_holdout_from_full_series_common_support(
+    tmp_path, monkeypatch
+):
+    series = _seasonal_series(n=600, name="ST0", seed=8)
+    seen_detection_index: list[pd.DatetimeIndex] = []
+    eval_indices: list[pd.DatetimeIndex] = []
+
+    monkeypatch.setattr(
+        cp,
+        "_load_raw_hourly_series",
+        lambda **_kwargs: [series.to_frame()],
+    )
+    csv_map = {
+        ("forecasting", "detectors"): tuple(BASELINE_DETECTORS),
+        ("forecasting", "forecast_models"): ("LinearRegression",),
+        ("forecasting", "strategies"): ("unlabeled", "inject-vote"),
+    }
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_csv_list",
+        lambda section, option, default, *, cfg=None: csv_map.get(
+            (section, option), default
+        ),
+    )
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_int",
+        lambda section, option, default, cfg=None: 96
+        if (section, option) == ("forecasting", "holdout")
+        else default,
+    )
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_str",
+        lambda section, option, default, cfg=None: "none"
+        if (section, option) == ("forecasting", "imputation")
+        else default,
+    )
+    monkeypatch.setattr(cp, "cfg_get_bool", lambda *args, **kwargs: False)
+    monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
+
+    def fake_detect(full_series, strategies, *_args, **_kwargs):
+        seen_detection_index.append(pd.DatetimeIndex(full_series.index))
+        out = {}
+        for strategy, position in zip(strategies, (500, 550), strict=True):
+            mask = pd.Series(False, index=full_series.index)
+            mask.iloc[position] = True
+            out[strategy.name] = DetectionResult(
+                strategy.name,
+                [],
+                [],
+                {},
+                3.5,
+                mask,
+                n_flagged=1,
+                detection_rate=1 / len(full_series),
+            )
+        return out
+
+    def fake_backtest(_train, eval_series, _model, **kwargs):
+        eval_indices.append(pd.DatetimeIndex(eval_series.index))
+        horizon = kwargs["size_k"]
+        stride = kwargs["forecast_stride"]
+        n_forecasts = (96 - horizon) // stride + 1
+        return {
+            "rmse": 1.0,
+            "mase": 1.0,
+            "n_eval": n_forecasts * horizon,
+            "n_forecasts": n_forecasts,
+            "n_unique_targets": 96,
+        }
+
+    monkeypatch.setattr(cp, "_detect_for_strategies", fake_detect)
+    monkeypatch.setattr(cp, "backtest_forecast", fake_backtest)
+
+    artifacts = cp.run_benchmark_from_config()
+
+    assert len(seen_detection_index) == 1
+    assert seen_detection_index[0].equals(series.index)
+    selection = artifacts["selection_df"].iloc[0]
+    assert bool(selection["selected"])
+    assert selection["split_n_flagged"] == 2
+    assert pd.Timestamp(selection["holdout_end"]) == series.index[499]
+    assert all(index.equals(eval_indices[0]) for index in eval_indices)
+    assert series.index[500] not in eval_indices[0]
+
+
 def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
-    def fake_loader(*, freq, name_from_path=True, target_column_index=None):
+    def fake_loader(**_kwargs):
         s = _seasonal_series(n=900, name="ST0", seed=0)
         s.iloc[200] = 130.0
         s.iloc[300:330] = np.nan
@@ -415,10 +564,11 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         ("forecasting", "strategies"): ("unlabeled", "inject-vote"),
     }
     int_map = {
-        ("forecasting", "holdout"): 40,
+        ("forecasting", "holdout"): 96,
         ("forecasting", "context_len"): 72,
         ("forecasting", "min_series_points"): 300,
     }
+    str_map = {("forecasting", "imputation_model"): "interp"}
 
     def fake_csv(section, option, default, *, cfg=None):
         return csv_map.get((section, option), default)
@@ -426,9 +576,16 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     def fake_int(section, option, default, cfg=None):
         return int_map.get((section, option), default)
 
-    monkeypatch.setattr(cp, "load_and_normalize_series", fake_loader)
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(cp, "cfg_get_csv_list", fake_csv)
     monkeypatch.setattr(cp, "cfg_get_int", fake_int)
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_str",
+        lambda section, option, default, cfg=None: str_map.get(
+            (section, option), default
+        ),
+    )
     monkeypatch.setattr(cp, "cfg_get_bool", lambda s, o, d, cfg=None: False)  # no disk cache
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
 
@@ -466,10 +623,11 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
             subset["n_forecasts"]
             == (subset["test_hours"] - horizon) // stride + 1
         ).all()
+        assert (subset["n_expected_forecasts"] == subset["n_forecasts"]).all()
         assert (subset["n_eval"] == subset["n_forecasts"] * horizon).all()
         assert (subset["n_unique_targets"] == subset["test_hours"]).all()
 
-    for artifact in ("results.csv", "summary.csv", "detection.csv"):
+    for artifact in ("results.csv", "summary.csv", "detection.csv", "selection.csv"):
         assert (tmp_path / artifact).exists()
     for col in (
         "rmse_raw",
@@ -481,12 +639,14 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         assert col in summary_df.columns
 
     assert set(detection_df["strategy"]) == {"unlabeled", "inject-vote"}
+    assert set(detection_df["scope"]) == {"full_series"}
+    assert artifacts["selection_df"].iloc[0]["test_hours"] == 96
     vote_row = detection_df[detection_df["strategy"] == "inject-vote"].iloc[0]
     assert vote_row["ranking"]  # the injection ranking is persisted
 
 
 def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
-    def fake_loader(*, freq, name_from_path=True, target_column_index=None):
+    def fake_loader(**_kwargs):
         s = _seasonal_series(n=900, name="ST0", seed=1)
         s.iloc[200] = 130.0
         s.iloc[300:330] = np.nan
@@ -498,13 +658,13 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
         ("forecasting", "strategies"): ("unlabeled",),
     }
     int_map = {
-        ("forecasting", "holdout"): 40,
+        ("forecasting", "holdout"): 96,
         ("forecasting", "context_len"): 72,
         ("forecasting", "min_series_points"): 300,
     }
     str_map = {("forecasting", "imputation"): "none"}
 
-    monkeypatch.setattr(cp, "load_and_normalize_series", fake_loader)
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(cp, "cfg_get_csv_list", lambda s, o, d, *, cfg=None: csv_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_int", lambda s, o, d, cfg=None: int_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_str", lambda s, o, d, cfg=None: str_map.get((s, o), d))
@@ -522,7 +682,7 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
 
 
 def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatch):
-    def fake_loader(*, freq, name_from_path=True, target_column_index=None):
+    def fake_loader(**_kwargs):
         series = _seasonal_series(n=900, name="ST0", seed=2)
         series.iloc[300:330] = np.nan
         return [series.to_frame()]
@@ -532,10 +692,10 @@ def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatc
         ("forecasting", "strategies"): ("unlabeled",),
     }
     int_map = {
-        ("forecasting", "holdout"): 40,
+        ("forecasting", "holdout"): 96,
         ("forecasting", "context_len"): 72,
     }
-    monkeypatch.setattr(cp, "load_and_normalize_series", fake_loader)
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(
         cp,
         "cfg_get_csv_list",
@@ -582,10 +742,14 @@ def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatc
         "series",
         "strategy",
         "detectors",
-        "discarded",
-        "n_flagged",
-        "detection_rate",
+            "discarded",
+            "n_flagged",
+            "n_unscored",
+            "coverage_rate",
+            "detection_rate",
         "ranking",
+        "scope",
+        "n_observed",
     ]
 
 
