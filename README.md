@@ -39,7 +39,7 @@ uv sync
 
 - `src/airquality/`: main package code
 - `config/`: shared runtime configuration, especially `config/pipeline.cfg`
-- `data/`: processed datasets used by training and benchmarking
+- `data/`: raw station data and generated datasets
 - `models/`: saved model checkpoints and fine-tuned artifacts
 - `reports/`: benchmark outputs and training metrics
 - `tests/`: pytest coverage for config, loaders, training, benchmark helpers, and CLIs
@@ -80,8 +80,8 @@ The main shared config is `config/pipeline.cfg`.
 
 Controls where series are loaded from and their shared time-series schema.
 
-- `data_root`: base dataset directory
-- `base_path_glob`: folders searched for files
+- `data_root`: raw 5-minute stations used by the independent TSPulse fine-tuning CLI
+- `raw_base_dir`: shared raw 5-minute source used by training and benchmarks
 - `key_word`: pollutant keyword such as `NO2`
 - `file_extension`: expected file type, currently `csv`
 - `freq`: sampling frequency, default `h`
@@ -130,20 +130,22 @@ per-model architecture parameters.
 
 ## Expected Data Layout
 
-Training and imputation use processed hourly CSV data under:
+Training and imputation load raw 5-minute station CSVs under:
 
 ```text
-data/processed/Datos-post-COUTA/*/
+data/raw/datos_estaciones_5m/<station>/<station>_<pollutant>.csv
 ```
 
-with filenames or paths matching the configured pollutant keyword, currently `NO2`.
-Anomaly detection, forecasting, and the block reports instead read raw 5-minute
-stations under `data/raw/datos_estaciones_5m/` and apply the shared hourly
-preprocessing.
+The pollutant is selected with `[data] key_word`, currently `NO2`. Every station
+is passed through the shared `preprocess()` function, which aggregates it to an
+hourly grid and preserves missing or frozen intervals as `NaN`. Anomaly detection,
+forecasting, and the block reports use the same raw source and preprocessing.
+The independent TSPulse fine-tuning CLI uses `[data] data_root` and applies the
+same shared `preprocess()` before constructing its training windows.
 
 Key assumptions in the loaders:
 
-- only `.csv` and `.json` are supported
+- raw station loading expects `.csv`; the generic loader also supports `.json`
 - many loaders silently skip unsupported files or invalid shapes
 - the default timestamp column is `fecha`
 - each workflow expects a loaded station to become a single-column time series
@@ -152,19 +154,18 @@ Key assumptions in the loaders:
 
 ### Generate data-block reports
 
-Three diagnostics can be generated under `reports/data_blocks/`. They all read
-the raw 5-minute station files, apply the shared hourly preprocessing, and
-preserve gaps instead of concatenating observations across missing timestamps.
-Use `--output-dir` with any command to select a fixed destination.
+Two diagnostics can be generated under `reports/data_blocks/`. Both read the
+raw 5-minute station files, apply the shared hourly preprocessing, and preserve
+gaps instead of concatenating observations across missing timestamps.
 
-#### Available forecasting blocks
+#### Fast raw inventory
 
 ```bash
 uv run python -m airquality.data.block_analysis
 ```
 
-This is the fast, model-free pre-study for NO2 and CO. It reserves the fixed
-holdout, measures contiguous observed blocks before it, and reports whether
+This is the fast pre-study for NO2 and CO. It reserves the fixed test, measures
+contiguous observed blocks before it, and reports whether
 each block can support the configured short/long forecasting and validation
 geometry. It does not run anomaly detectors or forecasting models, so the
 reported support is an upper bound for detector-aware runs.
@@ -181,85 +182,51 @@ Useful options include `--pollutants`, `--context`, short/long horizon, stride,
 and validation lengths, `--holdout`, and `--forecast-models`. Defaults are read
 from the forecasting configuration where applicable.
 
-#### Support recovered by bridging short gaps
+#### Raw, detection and imputation support
 
 ```bash
-uv run python -m airquality.data.gap_bridge_analysis
+uv run python -m airquality.data.block_support_analysis
 ```
 
-This report estimates how much usable support would be gained by joining
-observed runs across short gaps. By default it analyzes NO2, requires a final
-component of at least 80 hourly points, and bridges gaps of at most 5 hours.
-It distinguishes newly eligible components from extensions of blocks that were
-already eligible.
+This is the canonical support report for the configured forecasting protocol.
+It compares the same training prefix in the real benchmark states:
 
-The default output is `reports/data_blocks/gap_bridge_YYYYMMDD_HHMMSS/` and contains:
+- `raw`
+- `<strategy>+noimpute`, after anomaly removal
+- `<strategy>+impute`, after the configured imputer processes complete short gaps
 
-- `components.csv`: composition, observed/imputed points, age, and recovery type for each joined component
-- `summary.csv`: aggregate baseline support, recovered real points, imputation cost, and usable gain
-- `gap_bridge_overview.png`: support gain, recovery type, and recency overview
+There is no `raw+impute` arm. Detection runs on the full series, all states use
+the same common test, and support is measured only before the first test target.
+Short and long each use the strictest native requirement among configured models
+that participate in training arms. Foundation models still affect common-test
+selection but do not distort the training-arm comparison.
 
-Use `--pollutant`, `--minimum`, and `--max-gap` to change the analysis.
-
-#### Blocks after anomaly detection
-
-```bash
-uv run python -m airquality.data.detected_block_analysis
-```
-
-This is the detector-aware NO2 audit. It compares raw blocks with every
-registered detector, the rate-filtered `unlabeled` consensus, and the
-injection-ranked `inject-vote` strategy. Unlike the other two reports, this
-command fits and scores detectors and can therefore take substantially longer.
-Detection results are cached in `reports/data_blocks/detection_cache/` by default.
-
-The default output is `reports/data_blocks/detected_NO2_YYYYMMDD_HHMMSS/` and contains:
-
-- `summary.csv` and `series_summary.csv`: aggregate and per-station impact of each detector/strategy
-- `blocks.csv` and `block_distribution.csv`: resulting blocks and their length distribution
-- `detector_coverage.csv`: coverage, detection rates, unlabeled filtering, and unscored segments
-- `selection.csv`: detector ranking and selection used by `inject-vote` for each block
-- `manifest.json`: effective parameters and detector list
-- `README.md`: protocol and principal results for that run
-- `retention_overview.png`, `block_length_distribution.png`, `block_impact_by_detector.png`, and `detection_rate_distribution.png`
-
-Use `--cache-dir` to change the detection cache or `--output-dir` to select the
-report directory.
-
-### Generate the imputation-support report
-
-This audit measures how many train-eligible hourly points are recovered by each
-configured anomaly-detection strategy after imputation. It uses the shared
-holdout and the strictest configured training-length requirement, but does not
-run forecasting models.
-
-First generate the persisted data from the `[forecasting]` configuration:
-
-```bash
-uv run python -m airquality.forecasting.imputation_support_analysis
-```
-
-The command reuses the forecasting detection/imputation cache and writes
-`training_support.csv` under a new timestamped directory:
+The command reuses the forecasting cache and writes under:
 
 ```text
-reports/forecasting_support/YYYYMMDD_HHMMSS/
+reports/data_blocks/forecasting_YYYYMMDD_HHMMSS/
 ```
 
-Then render the figures from that CSV without rerunning detection or imputation:
+The persisted report contains:
+
+- `summary.csv`: aggregate support and deltas against raw by arm and regime
+- `series_summary.csv`: support per station, arm and short/long regime
+- `blocks.csv`: every resulting block, its provenance and short/long eligibility
+- `gaps.csv`: actual gap origin, length, eligibility and filled hours
+- `detection.csv`: coverage and anomaly rate per strategy
+- `excluded_series.csv`: stations without a viable common test and training host
+- `manifest.json` and `README.md`: effective protocol and artifact guide
+
+Render all figures without rerunning detection or imputation:
 
 ```bash
-uv run python -m airquality.forecasting.plot_imputation_support_analysis \
-  reports/forecasting_support/YYYYMMDD_HHMMSS
+uv run python -m airquality.data.plot_block_support_analysis \
+  reports/data_blocks/forecasting_YYYYMMDD_HHMMSS
 ```
 
-Omit the directory to render the newest run. The report contains:
-
-- `training_support.csv`: per-series and per-strategy support counts and ages
-- `support_composition.png`: aggregate support before and after imputation
-- `support_gain_by_series.png`: additional usable training days per series
-- `support_age.png`: median age of filled hours by strategy
-- `support_age_timeline.png`: the same age metric positioned relative to the holdout
+Omit the directory to render the newest run. The figures cover aggregate
+observed/imputed support, per-series retention, valid block counts, block-length
+survival, recovered-gap composition, strategy-level detection and imputation age.
 
 ### Train the configured forecasting models
 
