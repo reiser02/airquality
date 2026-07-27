@@ -1,10 +1,10 @@
-"""Multi-step forecasting backtest on a fixed held-out tail window.
+"""Multi-step forecasting backtest on a fixed test window.
 
 Used to compare forecasting error between a *raw* hourly series and its
 *preprocessed* (anomaly-removed + imputed) version. Every arm forecasts over the
 same fixed, contiguous holdout selected by the pipeline's common support.
 
-The forecast input (context + holdout) is a contiguous observed block of the raw
+The test input (context + targets) is a contiguous observed block of the raw
 series, so neither arm needs its gaps imputed *for inference* -- the preprocessing
 effect is carried entirely by the trained model.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Mapping
 import warnings
 
 import numpy as np
@@ -87,24 +88,23 @@ def select_holdout_window(
         if end - start < context_len + holdout:
             continue
 
-        holdout_start_pos = end - holdout
-        eval_start = holdout_start_pos - context_len
-        train_runs = _observed_runs(s.iloc[:holdout_start_pos])
+        test_target_pos = end - holdout
+        test_start_pos = test_target_pos - context_len
+        train_runs = _observed_runs(s.iloc[:test_target_pos])
         if not any(host_end - host_start >= host_len for host_start, host_end in train_runs):
             continue
 
         return {
-            "train_index": index[:holdout_start_pos],
-            "train_end": index[holdout_start_pos - 1],
-            "test_block_index": index[eval_start:end],
-            "test_block_start": index[eval_start],
+            "train_index": index[:test_target_pos],
+            "train_end": index[test_target_pos - 1],
+            "test_context_start": index[test_start_pos],
             "source_run_start": index[start],
-            "eval_index": index[eval_start:end],
-            "context_index": index[eval_start:holdout_start_pos],
-            "holdout_index": index[holdout_start_pos:end],
-            "holdout_start": index[holdout_start_pos],
-            "holdout_end": index[end - 1],
-            "test_hours": holdout,
+            "test_index": index[test_start_pos:end],
+            "context_index": index[test_start_pos:test_target_pos],
+            "test_target_index": index[test_target_pos:end],
+            "test_target_start": index[test_target_pos],
+            "test_target_end": index[end - 1],
+            "test_target_hours": holdout,
         }
     return None
 
@@ -210,6 +210,80 @@ def get_forecast_model_requirements(
     )
 
 
+def get_strict_forecast_requirements(
+    model_configs: Mapping[str, ForecastModelConfig],
+    *,
+    size_k: int,
+    validation_len: int,
+    validation_stride: int,
+    seasonality_m: int,
+    context_len: int,
+    training_arms_only: bool = False,
+) -> dict[str, object]:
+    """Return the conservative geometry envelope across configured models."""
+    if min(size_k, validation_len, validation_stride, seasonality_m, context_len) <= 0:
+        raise ValueError("Los requisitos de forecasting deben ser positivos")
+    candidates = []
+    for name, config in model_configs.items():
+        if training_arms_only and not config.uses_training_arms:
+            continue
+        native = get_forecast_model_requirements(
+            config,
+            size_k=size_k,
+            seasonality_m=seasonality_m,
+            context_len=context_len,
+        )
+        reserve = (
+            max(validation_len, native.validation_target_length)
+            if native.validation_target_offset is not None
+            else 0
+        )
+        candidates.append(
+            {
+                "model": name,
+                "minimum": native.min_train_series_length,
+                "prediction_context": native.prediction_context_length,
+                "reserve": reserve,
+                "host": native.min_train_series_length + reserve,
+                "validation_forecasts": (
+                    (reserve - native.validation_target_length) // validation_stride + 1
+                    if reserve
+                    else 0
+                ),
+            }
+        )
+    if not candidates:
+        raise ValueError("No hay modelos compatibles para calcular requisitos")
+
+    minimum = max(int(item["minimum"]) for item in candidates)
+    native_context = max(int(item["prediction_context"]) for item in candidates)
+    prediction_context = max(context_len, native_context)
+    reserve = max(int(item["reserve"]) for item in candidates)
+    host = max(int(item["host"]) for item in candidates)
+    return {
+        "minimum_hours": minimum,
+        "minimum_models": "/".join(
+            str(item["model"]) for item in candidates if item["minimum"] == minimum
+        ),
+        "prediction_context_hours": prediction_context,
+        "context_models": "/".join(
+            str(item["model"])
+            for item in candidates
+            if item["prediction_context"] == prediction_context
+        ) or "configured_context",
+        "validation_hours": reserve,
+        "host_minimum_hours": host,
+        "limiting_models": "/".join(
+            str(item["model"]) for item in candidates if item["host"] == host
+        ),
+        "validation_forecasts": min(
+            int(item["validation_forecasts"])
+            for item in candidates
+            if item["reserve"] == reserve
+        ),
+    }
+
+
 def _fit_forecast_model(
     config: ForecastModelConfig,
     train_scaled: list[TimeSeries],
@@ -231,13 +305,123 @@ def _fit_forecast_model(
     )
 
 
-def backtest_forecast(
+def prepare_foundation_model(
     train_series: pd.Series,
-    eval_series: pd.Series,
     model_name: str,
     *,
     size_k: int,
-    holdout_start: pd.Timestamp,
+    seasonality_m: int = 24,
+    freq: str = "h",
+    context_len: int = 72,
+    model_config: ForecastModelConfig | None = None,
+) -> tuple[object, Scaler, pd.Series, float]:
+    """Load one frozen foundation model and its shared raw-history scaler."""
+    if model_config is None:
+        model_config = resolve_forecasting_model_configs(
+            [model_name],
+            seasonality_m=seasonality_m,
+            context_length=context_len,
+        )[model_name]
+    if model_config.mode != "foundation":
+        raise ValueError("prepare_foundation_model requiere un modelo foundation")
+
+    train_s = ensure_datetime_series(
+        train_series, freq=freq, name=str(train_series.name or "series")
+    )
+    requirements = get_forecast_model_requirements(
+        model_config,
+        size_k=size_k,
+        seasonality_m=seasonality_m,
+        context_len=context_len,
+    )
+    split = split_train_val_subseries(
+        TimeSeries.from_series(train_s, freq=freq),
+        input_chunk=requirements.prediction_context_length,
+        size_k=size_k,
+        validation_len=size_k,
+        requirements=requirements,
+    )
+    if split is None:
+        raise ValueError(
+            f"{model_name}: no hay bloque para registrar el foundation "
+            f"(min_len={requirements.min_train_series_length})"
+        )
+    train_subs, _ = split
+    latest = train_subs[-1].astype(np.float32)
+    scaler = Scaler(global_fit=True, scaler=StandardScaler())
+    train_scaled = [scaler.fit_transform(latest)]
+
+    load_start = time.perf_counter()
+    model = _fit_forecast_model(model_config, train_scaled, [], size_k=size_k)
+    return model, scaler, train_s, time.perf_counter() - load_start
+
+
+def forecast_foundation_context(
+    model: object,
+    scaler: Scaler,
+    context: pd.Series,
+    target: pd.Series,
+    mase_insample: pd.Series,
+    *,
+    seasonality_m: int = 24,
+    freq: str = "h",
+) -> dict[str, float | int]:
+    """Forecast one exact target horizon from one as-of-origin context."""
+    context_s = ensure_datetime_series(
+        context, freq=freq, name=str(context.name or "series")
+    )
+    target_s = ensure_datetime_series(
+        target, freq=freq, name=str(target.name or context_s.name)
+    )
+    if context_s.index[-1] + pd.tseries.frequencies.to_offset(freq) != target_s.index[0]:
+        raise ValueError("El target debe comenzar inmediatamente despues del contexto")
+
+    context_ts = TimeSeries.from_series(context_s, freq=freq).astype(np.float32)
+    context_scaled = scaler.transform(context_ts)
+    inference_start = time.perf_counter()
+    prediction = model.predict(
+        n=len(target_s),
+        series=context_scaled,
+        verbose=False,
+    )
+    inference_seconds = time.perf_counter() - inference_start
+    if isinstance(prediction, list):
+        if len(prediction) != 1:
+            raise RuntimeError("El foundation devolvio un numero inesperado de forecasts")
+        prediction = prediction[0]
+    prediction = scaler.inverse_transform(prediction)
+    if not pd.DatetimeIndex(prediction.time_index).equals(target_s.index):
+        raise RuntimeError("El foundation devolvio timestamps distintos del target")
+
+    actual = TimeSeries.from_series(target_s, freq=freq)
+    errors = target_s.to_numpy(dtype=float) - prediction.to_series().to_numpy(dtype=float)
+    if not np.isfinite(errors).all():
+        raise RuntimeError("El foundation devolvio predicciones no finitas")
+    insample = ensure_datetime_series(
+        mase_insample,
+        freq=freq,
+        name=str(mase_insample.name or context_s.name),
+    )
+    return {
+        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+        "mase": compute_mase(
+            actual,
+            prediction,
+            insample,
+            seasonality_m=seasonality_m,
+        ),
+        "inference_seconds": inference_seconds,
+        "n_test_predictions": len(errors),
+    }
+
+
+def backtest_forecast(
+    train_series: pd.Series,
+    test_series: pd.Series,
+    model_name: str,
+    *,
+    size_k: int,
+    test_target_start: pd.Timestamp,
     seasonality_m: int = 24,
     freq: str = "h",
     mase_insample: pd.Series | None = None,
@@ -253,7 +437,7 @@ def backtest_forecast(
     subseries for training. Trained global models use the causal validation split
     from :func:`split_train_val_subseries`; local statistical and zero-shot
     foundation models use the latest eligible block without validation.
-    ``eval_series`` is the
+    ``test_series`` is the
     contiguous observed block
     (context + holdout) shared by both arms. Returns RMSE/MAE/MASE, the model
     ``train_seconds`` (wall time of the ``fit`` only) and ``inference_seconds``
@@ -283,7 +467,7 @@ def backtest_forecast(
         "mase": float("nan"),
         "train_seconds": float("nan"),
         "inference_seconds": float("nan"),
-        "n_eval": 0,
+        "n_test_predictions": 0,
         "n_forecasts": 0,
         "n_expected_forecasts": 0,
         "n_unique_targets": 0,
@@ -331,16 +515,20 @@ def backtest_forecast(
         else []
     )
 
-    eval_s = ensure_datetime_series(eval_series, freq=freq, name=str(eval_series.name or "series"))
+    test_s = ensure_datetime_series(
+        test_series, freq=freq, name=str(test_series.name or "series")
+    )
     try:
-        holdout_pos = int(eval_s.index.get_loc(holdout_start))
+        test_target_pos = int(test_s.index.get_loc(test_target_start))
     except KeyError as exc:
-        raise ValueError("holdout_start debe pertenecer a eval_series") from exc
-    expected_positions = list(range(holdout_pos, len(eval_s) - size_k + 1, forecast_stride))
-    expected_starts = pd.DatetimeIndex(eval_s.index[expected_positions])
+        raise ValueError("test_target_start debe pertenecer a test_series") from exc
+    expected_positions = list(
+        range(test_target_pos, len(test_s) - size_k + 1, forecast_stride)
+    )
+    expected_starts = pd.DatetimeIndex(test_s.index[expected_positions])
     result["n_expected_forecasts"] = len(expected_starts)
-    eval_ts = TimeSeries.from_series(eval_s, freq=freq).astype(np.float32)
-    eval_scaled = scaler.transform(eval_ts)
+    test_ts = TimeSeries.from_series(test_s, freq=freq).astype(np.float32)
+    test_scaled = scaler.transform(test_ts)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -355,8 +543,8 @@ def backtest_forecast(
         try:
             inference_start = time.perf_counter()
             forecasts = model.historical_forecasts(
-                series=eval_scaled,
-                start=holdout_start,
+                series=test_scaled,
+                start=test_target_start,
                 forecast_horizon=size_k,
                 stride=forecast_stride,
                 retrain=False,
@@ -378,7 +566,7 @@ def backtest_forecast(
     if exact_windows:
         exact_windows = all(
             pd.DatetimeIndex(forecast.time_index).equals(
-                pd.DatetimeIndex(eval_s.index[position : position + size_k])
+                pd.DatetimeIndex(test_s.index[position : position + size_k])
             )
             for forecast, position in zip(forecast_list, expected_positions, strict=True)
         )
@@ -403,7 +591,7 @@ def backtest_forecast(
     origin_lengths: list[int] = []
     target_times: set[pd.Timestamp] = set()
     for prediction in predictions:
-        actual = eval_ts.slice_intersect(prediction)
+        actual = test_ts.slice_intersect(prediction)
         pred = prediction.slice_intersect(actual)
         if len(actual) == 0:
             continue
@@ -441,7 +629,7 @@ def backtest_forecast(
                 weights=np.asarray(origin_lengths)[finite_mase],
             )
         )
-    result["n_eval"] = int(len(errors))
+    result["n_test_predictions"] = int(len(errors))
     result["n_forecasts"] = len(origin_mae)
     result["n_unique_targets"] = len(target_times)
     result["origin_mae_mean"] = float(np.mean(origin_mae))
@@ -454,6 +642,9 @@ def backtest_forecast(
 __all__ = [
     "select_holdout_window",
     "get_forecast_model_requirements",
+    "get_strict_forecast_requirements",
     "backtest_forecast",
+    "forecast_foundation_context",
+    "prepare_foundation_model",
     "split_train_val_subseries",
 ]

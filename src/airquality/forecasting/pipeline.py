@@ -4,7 +4,7 @@ Measures whether anomaly detection (and the subsequent imputation) improves
 multi-step forecasting. For every configured series the pipeline builds one
 training *arm* per (detection strategy, imputation) combination — plus the
 ``raw`` baseline — and backtests the same forecasting models on each arm over
-the **same** fixed observed holdout window in short (8 h, stride 4 h) and long
+the **same** fixed observed test in short (8 h, stride 4 h) and long
 (48 h, stride 24 h) regimes:
 
 - ``raw``: the hourly-mean series as loaded (gaps + anomalies kept).
@@ -21,10 +21,16 @@ strategies through a per-series :class:`~airquality.forecasting.detection.Series
 and every strategy's mask can be post-processed through ``mask_transforms``
 hooks before removal.
 
-Detection runs over the complete series before splitting. The holdout is chosen
+Detection runs over the complete series before splitting. The test is chosen
 from the support left observed by every strategy, so no ``+noimpute`` arm can
-break the shared evaluation window. Removal and imputation still touch only the
+break the shared test. Removal and imputation still touch only the
 training portion.
+
+Foundation models remain single zero-shot references in that common test. A
+separate paired experiment injects one synthetic anomaly type into copies of
+clean test contexts and compares ``clean_reference``, ``corrupted`` and each
+detection strategy; imputation is only a compatibility fallback after a NaN
+causes foundation prediction to fail.
 
 Detections and backtests are cached on disk (:mod:`airquality.forecasting.cache`,
 ``[forecasting] use_cache`` / ``cache_dir``): an interrupted run resumes where
@@ -39,6 +45,7 @@ Run with::
 
 from __future__ import annotations
 
+import gc
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
@@ -61,7 +68,9 @@ from airquality.data.preprocessing import preprocess
 from airquality.data.series import ensure_datetime_series
 from airquality.forecasting.backtest import (
     backtest_forecast,
-    get_forecast_model_requirements,
+    forecast_foundation_context,
+    get_strict_forecast_requirements,
+    prepare_foundation_model,
     select_holdout_window,
 )
 from airquality.forecasting.cache import (
@@ -85,6 +94,7 @@ from airquality.forecasting.detection import (
     SeriesDetectionContext,
     apply_mask_transforms,
     build_detection_strategy,
+    common_detection_support,
 )
 from airquality.forecasting.fill import (
     DEFAULT_MAX_GAP_SIZE,
@@ -92,6 +102,13 @@ from airquality.forecasting.fill import (
     _resolve_tspulse_model_path,
     build_imputer,
     impute_series,
+)
+from airquality.forecasting.foundation_preprocessing import (
+    CLEAN_REFERENCE,
+    CORRUPTED,
+    build_preprocessing_contexts,
+    build_synthetic_context_cases,
+    summarize_foundation_preprocessing,
 )
 from airquality.forecasting.registry import (
     forecast_model_cache_identity,
@@ -127,9 +144,10 @@ RESULT_COLUMNS = (
     "validation_stride", "series", "arm", "strategy", "imputed",
     "imputation_model", "detectors", "n_anomalies", "n_anomalies_full",
     "detection_scope", "split_basis", "split_n_flagged", "split_n_unscored",
-    "test_block_start", "holdout_start", "holdout_end", "test_hours", "model",
+    "test_context_start", "test_target_start", "test_target_end",
+    "test_target_hours", "model",
     "model_mode", "rmse", "mase", "train_seconds", "inference_seconds",
-    "scale_ref", "n_eval", "n_forecasts", "n_expected_forecasts",
+    "scale_ref", "n_test_predictions", "n_forecasts", "n_expected_forecasts",
     "n_unique_targets", "origin_mae_mean", "origin_mae_std",
     "origin_rmse_mean", "origin_rmse_std",
 )
@@ -138,8 +156,17 @@ SELECTION_COLUMNS = (
     "series", "series_start", "series_end", "observed_hours",
     "common_support_hours", "split_n_flagged", "split_n_unscored",
     "split_strategies", "selected", "exclusion_reason", "source_run_start",
-    "context_start", "train_end", "holdout_start", "holdout_end", "test_hours",
-    "holdout_age_hours",
+    "test_context_start", "train_end", "test_target_start", "test_target_end",
+    "test_target_hours", "test_age_hours",
+)
+
+FOUNDATION_PREPROCESSING_COLUMNS = (
+    "series", "regime", "horizon", "model", "case_id", "anomaly_type",
+    "test_seed", "test_target_start", "condition", "detectors", "n_injected",
+    "n_context_flagged", "n_injected_detected", "n_context_nan",
+    "imputation_applied", "imputation_model", "n_imputed", "rmse", "mase",
+    "model_load_seconds", "inference_seconds", "scale_ref",
+    "n_test_predictions", "failure_reason",
 )
 
 
@@ -237,14 +264,8 @@ def _common_detection_support(
     series: pd.Series,
     detections: dict[str, DetectionResult],
 ) -> tuple[pd.Series, pd.Series]:
-    """Mask anomalies and points where any strategy had to abstain."""
-    common_mask = pd.Series(False, index=series.index, name=series.name)
-    for detection in detections.values():
-        common_mask |= detection.mask.reindex(series.index, fill_value=False).astype(bool)
-        if detection.scored_mask is not None:
-            scored = detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
-            common_mask |= series.notna() & ~scored
-    return series.mask(common_mask), common_mask
+    """Compatibility alias for :func:`common_detection_support`."""
+    return common_detection_support(series, detections)
 
 
 def _format_ranking(ranking: dict[str, float]) -> str:
@@ -298,8 +319,17 @@ def _cacheable_backtest(result: dict[str, Any]) -> bool:
     return (
         expected > 0
         and int(result.get("n_forecasts", 0)) == expected
-        and int(result.get("n_eval", 0)) > 0
+        and int(result.get("n_test_predictions", 0)) > 0
         and math.isfinite(float(result.get("rmse", float("nan"))))
+    )
+
+
+def _cacheable_foundation_test(result: dict[str, Any], horizon: int) -> bool:
+    """Persist only complete finite single-origin foundation forecasts."""
+    return (
+        int(result.get("n_test_predictions", 0)) == horizon
+        and math.isfinite(float(result.get("rmse", float("nan"))))
+        and math.isfinite(float(result.get("mase", float("nan"))))
     )
 
 
@@ -314,7 +344,7 @@ def run_benchmark_from_config(
     freq = cfg_get_str("data", "freq", "h")
     pollutant = cfg_get_str("forecasting", "pollutant", "NO2")
     raw_base_dir = cfg_get_str(
-        "forecasting", "raw_base_dir", "data/raw/datos_estaciones_5m"
+        "data", "raw_base_dir", "data/raw/datos_estaciones_5m"
     )
     imputation_size_k = cfg_get_int("benchmark", "size_k", 5)
     seasonality_m = cfg_get_int("benchmark", "seasonality_m", 24)
@@ -367,34 +397,35 @@ def run_benchmark_from_config(
         context_length=context_len,
     )
     forecast_models = list(forecast_model_configs)
-    native_requirements = [
-        (
-            regime,
-            get_forecast_model_requirements(
-                config,
-                size_k=regime.horizon,
-                seasonality_m=seasonality_m,
-                context_len=context_len,
-            ),
+    foundation_model_configs = {
+        name: config
+        for name, config in forecast_model_configs.items()
+        if config.mode == "foundation"
+    }
+    strict_requirements = {
+        regime.name: get_strict_forecast_requirements(
+            forecast_model_configs,
+            size_k=regime.horizon,
+            validation_len=regime.validation_len,
+            validation_stride=regime.stride,
+            seasonality_m=seasonality_m,
+            context_len=context_len,
         )
         for regime in regimes
-        for config in forecast_model_configs.values()
-    ]
+    }
     context_requirement = max(
         context_len,
-        *(native.prediction_context_length for _, native in native_requirements),
+        *(
+            int(requirement["prediction_context_hours"])
+            for requirement in strict_requirements.values()
+        ),
     )
     train_requirement = max(
-        native.min_train_series_length for _, native in native_requirements
+        int(requirement["minimum_hours"]) for requirement in strict_requirements.values()
     )
     host_requirement = max(
-        native.min_train_series_length
-        + (
-            max(regime.validation_len, native.validation_target_length)
-            if native.validation_target_offset is not None
-            else 0
-        )
-        for regime, native in native_requirements
+        int(requirement["host_minimum_hours"])
+        for requirement in strict_requirements.values()
     )
     strategy_specs = [
         spec.strip().lower()
@@ -402,6 +433,15 @@ def run_benchmark_from_config(
     ]
     imputation = cfg_get_str("forecasting", "imputation", "both").strip().lower()
     injection_seed = cfg_get_int("forecasting", "injection_seed", DEFAULT_INJECTION_SEED)
+    foundation_test_requested = cfg_get_bool(
+        "forecasting", "foundation_preprocessing_test", True
+    )
+    foundation_test_seed = cfg_get_int(
+        "forecasting", "foundation_test_seed", 1001
+    )
+    foundation_test_repeats = cfg_get_int(
+        "forecasting", "foundation_test_repeats", 1
+    )
     min_selection_points = cfg_get_int(
         "forecasting", "min_selection_points", DEFAULT_MIN_SELECTION_POINTS
     )
@@ -413,15 +453,34 @@ def run_benchmark_from_config(
         raise ValueError(
             f"min_selection_points debe ser al menos {MIN_SEGMENT_POINTS}"
         )
+    if foundation_test_repeats < 1:
+        raise ValueError("foundation_test_repeats debe ser positivo")
+    foundation_test_seeds = range(
+        foundation_test_seed,
+        foundation_test_seed + foundation_test_repeats * 4,
+    )
+    if injection_seed in foundation_test_seeds:
+        raise ValueError(
+            "Las semillas foundation deben diferir de injection_seed para separar "
+            "seleccion y test sintetico"
+        )
     vote_top_k = cfg_get_int("forecasting", "vote_top_k", DEFAULT_VOTE_TOP_K)
     vote_min_votes = cfg_get_int("forecasting", "vote_min_votes", DEFAULT_VOTE_MIN_VOTES)
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
     cache_dir = cfg_get_str("forecasting", "cache_dir", "reports/forecasting/cache")
     cache = BenchmarkCache((_repo_root() / cache_dir) if use_cache else None)
+    foundation_test_enabled = foundation_test_requested and bool(
+        foundation_model_configs
+    )
 
     arms = build_arms(strategy_specs, imputation)
-    if all(config.raw_only for config in forecast_model_configs.values()):
+    if all(not config.uses_training_arms for config in forecast_model_configs.values()):
         arms = arms[:1]
+    active_strategy_specs = (
+        strategy_specs
+        if foundation_test_enabled
+        else [arm.strategy for arm in arms if arm.strategy]
+    )
     strategies = [
         build_detection_strategy(
             spec,
@@ -430,7 +489,7 @@ def run_benchmark_from_config(
             vote_top_k=vote_top_k,
             vote_min_votes=vote_min_votes,
         )
-        for spec in dict.fromkeys(arm.strategy for arm in arms if arm.strategy)
+        for spec in dict.fromkeys(active_strategy_specs)
     ]
 
     series_dfs = _load_raw_hourly_series(
@@ -489,9 +548,18 @@ def run_benchmark_from_config(
             "vote_min_votes": vote_min_votes,
         }
     )
+    foundation_test_config = effective_config(
+        {
+            "enabled": foundation_test_enabled,
+            "test_seed": foundation_test_seed,
+            "repeats": foundation_test_repeats,
+            "anomaly_policy": "single-type-per-case-v1",
+            "imputation_policy": "fallback-after-nan-prediction-failure-v1",
+        }
+    )
 
     imputer_identity: dict[str, Any] | None = None
-    if any(arm.impute for arm in arms):
+    if any(arm.impute for arm in arms) or foundation_test_enabled:
         family = resolve_imputer_family(imputation_model)
         artifacts: dict[str, str | None] = {}
         imputer_config: dict[str, Any] = {
@@ -528,12 +596,14 @@ def run_benchmark_from_config(
         imputer_identity = {"config": imputer_config, "artifacts": artifacts}
 
     rows: list[dict[str, Any]] = []
+    foundation_preprocessing_rows: list[dict[str, Any]] = []
     detection_rows: list[dict[str, Any]] = []
     selection_rows: list[dict[str, Any]] = []
     for df in series_dfs:
         series = df.iloc[:, 0]
         name = str(series.name)
         series_fp = series_fingerprint(series)
+        series_foundation_test_seed = foundation_test_seed + int(series_fp[:8], 16)
         base_key = {
             "version": CACHE_VERSION,
             "series": name,
@@ -647,24 +717,25 @@ def run_benchmark_from_config(
             )
             continue
 
-        holdout_start = window["holdout_start"]
-        eval_obs = series.loc[window["eval_index"]]
+        test_target_start = window["test_target_start"]
+        test_series = series.loc[window["test_index"]]
         train_raw = series.loc[window["train_index"]]
-        if eval_obs.isna().any() or common_mask.loc[window["eval_index"]].any():
-            raise RuntimeError(f"{name}: el bloque comun de evaluacion no es valido")
+        if test_series.isna().any() or common_mask.loc[window["test_index"]].any():
+            raise RuntimeError(f"{name}: el test comun no es valido")
         selection_rows.append(
             {
                 **selection_common,
                 "selected": True,
                 "exclusion_reason": "",
                 "source_run_start": window["source_run_start"],
-                "context_start": window["context_index"][0],
+                "test_context_start": window["context_index"][0],
                 "train_end": window["train_end"],
-                "holdout_start": holdout_start,
-                "holdout_end": window["holdout_end"],
-                "test_hours": window["test_hours"],
-                "holdout_age_hours": int(
-                    (series.index.max() - window["holdout_end"]) / pd.Timedelta(hours=1)
+                "test_target_start": test_target_start,
+                "test_target_end": window["test_target_end"],
+                "test_target_hours": window["test_target_hours"],
+                "test_age_hours": int(
+                    (series.index.max() - window["test_target_end"])
+                    / pd.Timedelta(hours=1)
                 ),
             }
         )
@@ -700,7 +771,7 @@ def run_benchmark_from_config(
                 )
             return train_by_arm[arm.name]
 
-        eval_fp = series_fingerprint(eval_obs)
+        test_fp = series_fingerprint(test_series)
         for regime in regimes:
             for arm in arms:
                 detection = detections.get(arm.strategy) if arm.strategy else None
@@ -732,17 +803,17 @@ def run_benchmark_from_config(
                     "split_basis": "common_detection_support" if detections else "raw",
                     "split_n_flagged": split_n_flagged,
                     "split_n_unscored": split_n_unscored,
-                    "test_block_start": str(window["test_block_start"]),
-                    "holdout_start": str(holdout_start),
-                    "holdout_end": str(window["holdout_end"]),
-                    "test_hours": window["test_hours"],
+                    "test_context_start": str(window["test_context_start"]),
+                    "test_target_start": str(test_target_start),
+                    "test_target_end": str(window["test_target_end"]),
+                    "test_target_hours": window["test_target_hours"],
                 }
                 arm_strategy_key = (
                     asdict(strategy_by_spec[arm.strategy]) if arm.strategy else None
                 )
                 for model_name in forecast_models:
                     forecast_model_config = forecast_model_configs[model_name]
-                    if forecast_model_config.raw_only and arm.name != RAW_ARM:
+                    if not forecast_model_config.uses_training_arms and arm.name != RAW_ARM:
                         continue
                     backtest_key = {
                         **base_key,
@@ -761,17 +832,17 @@ def run_benchmark_from_config(
                         "imputer": imputer_identity if arm.impute else None,
                         "regime": asdict(regime),
                         "seasonality_m": seasonality_m,
-                        "holdout_start": str(holdout_start),
-                        "eval_fp": eval_fp,
+                        "test_target_start": str(test_target_start),
+                        "test_fp": test_fp,
                     }
                     res = cache.get("backtest", backtest_key)
                     if res is None:
                         res = backtest_forecast(
                             train_for(arm),
-                            eval_obs,
+                            test_series,
                             model_name,
                             size_k=regime.horizon,
-                            holdout_start=holdout_start,
+                            test_target_start=test_target_start,
                             seasonality_m=seasonality_m,
                             freq=freq,
                             validation_len=regime.validation_len,
@@ -797,7 +868,7 @@ def run_benchmark_from_config(
                             "train_seconds": res.get("train_seconds", float("nan")),
                             "inference_seconds": res.get("inference_seconds", float("nan")),
                             "scale_ref": scale_ref,
-                            "n_eval": res["n_eval"],
+                            "n_test_predictions": res["n_test_predictions"],
                             "n_forecasts": res.get("n_forecasts", 0),
                             "n_expected_forecasts": res.get("n_expected_forecasts", 0),
                             "n_unique_targets": res.get("n_unique_targets", 0),
@@ -807,6 +878,242 @@ def run_benchmark_from_config(
                             "origin_rmse_std": res.get("origin_rmse_std", float("nan")),
                         }
                     )
+
+        if foundation_test_enabled:
+            for regime in regimes:
+                cases = build_synthetic_context_cases(
+                    test_series,
+                    test_target_start=test_target_start,
+                    context_len=context_len,
+                    horizon=regime.horizon,
+                    stride=regime.stride,
+                    repeats=foundation_test_repeats,
+                    test_seed=series_foundation_test_seed,
+                    freq=freq,
+                )
+                prepared_cases = []
+                for case in cases:
+                    history = series.loc[: case.clean_context.index[-1]].copy()
+                    history.loc[case.corrupted_context.index] = case.corrupted_context
+                    synthetic_fp = series_fingerprint(history)
+                    synthetic_base_key = {
+                        **base_key,
+                        "series_fp": synthetic_fp,
+                        "experiment": "foundation-preprocessing-synthetic-v1",
+                        "foundation_test_config": foundation_test_config,
+                        "anomaly_type": case.anomaly_type,
+                        "test_seed": case.test_seed,
+                        "test_target_start": str(case.origin),
+                    }
+                    synthetic_detections = _detect_for_strategies(
+                        history,
+                        strategies,
+                        mask_transforms,
+                        cache=cache,
+                        base_key=synthetic_base_key,
+                        context_kwargs={
+                            "detectors": resolved_detectors,
+                            "seed": seed,
+                            "device": device,
+                            "freq": freq,
+                            "injection_seed": injection_seed,
+                            "min_selection_points": min_selection_points,
+                            "cache": cache,
+                            "cache_key": {
+                                "version": CACHE_VERSION,
+                                "series": name,
+                                "series_fp": synthetic_fp,
+                                "experiment": "foundation-preprocessing-synthetic-v1",
+                                "foundation_test_config": foundation_test_config,
+                                "freq": freq,
+                                "seed": seed,
+                            },
+                        },
+                    )
+                    prepared_cases.append(
+                        (
+                            case,
+                            synthetic_detections,
+                            build_preprocessing_contexts(case, synthetic_detections),
+                        )
+                    )
+
+                for model_name, model_config in foundation_model_configs.items():
+                    prepared_model: tuple[object, Any, pd.Series, float] | None = None
+                    prepare_error: str | None = None
+                    for case, synthetic_detections, contexts in prepared_cases:
+                        for condition, context in contexts.items():
+                            detection = synthetic_detections.get(condition)
+                            context_mask = (
+                                detection.mask.reindex(context.index, fill_value=False).astype(bool)
+                                if detection is not None
+                                else pd.Series(False, index=context.index)
+                            )
+                            n_injected_detected = int(
+                                (context_mask & case.injected_mask).sum()
+                            )
+                            forecast_key = {
+                                **base_key,
+                                "stage": "foundation_preprocessing_forecast",
+                                "experiment": "foundation-preprocessing-synthetic-v1",
+                                "model": model_name,
+                                "forecast_model": effective_config(
+                                    forecast_model_cache_identity(model_config)
+                                ),
+                                "model_config": training_model_config,
+                                "regime": asdict(regime),
+                                "condition": condition,
+                                "anomaly_type": case.anomaly_type,
+                                "test_seed": case.test_seed,
+                                "test_target_start": str(case.origin),
+                                "train_fp": train_fp,
+                                "context_fp": series_fingerprint(context),
+                                "target_fp": series_fingerprint(case.target),
+                                "compatibility_imputer": imputer_identity,
+                            }
+                            result = cache.get(
+                                "foundation_preprocessing", forecast_key
+                            )
+                            if result is None:
+                                if prepared_model is None and prepare_error is None:
+                                    try:
+                                        prepared_model = prepare_foundation_model(
+                                            train_raw,
+                                            model_name,
+                                            size_k=regime.horizon,
+                                            seasonality_m=seasonality_m,
+                                            freq=freq,
+                                            context_len=context_len,
+                                            model_config=model_config,
+                                        )
+                                    except Exception as exc:
+                                        prepare_error = f"{type(exc).__name__}: {exc}"
+
+                                result = {
+                                    "rmse": float("nan"),
+                                    "mase": float("nan"),
+                                    "model_load_seconds": float("nan"),
+                                    "inference_seconds": float("nan"),
+                                    "n_test_predictions": 0,
+                                    "imputation_applied": False,
+                                    "n_imputed": 0,
+                                    "failure_reason": prepare_error or "",
+                                }
+                                if prepared_model is not None:
+                                    model, scaler, foundation_insample, load_seconds = (
+                                        prepared_model
+                                    )
+                                    result["model_load_seconds"] = load_seconds
+                                    try:
+                                        result.update(
+                                            forecast_foundation_context(
+                                                model,
+                                                scaler,
+                                                context,
+                                                case.target,
+                                                foundation_insample,
+                                                seasonality_m=seasonality_m,
+                                                freq=freq,
+                                            )
+                                        )
+                                    except Exception as first_error:
+                                        if context.isna().any():
+                                            result["imputation_applied"] = True
+                                            try:
+                                                filled = impute_series(
+                                                    context,
+                                                    get_imputer(),
+                                                    freq=freq,
+                                                    use_scaler=use_scaler,
+                                                    max_gap_size=len(context),
+                                                )
+                                                result["n_imputed"] = int(
+                                                    (
+                                                        context.isna()
+                                                        & filled.notna()
+                                                    ).sum()
+                                                )
+                                                result.update(
+                                                    forecast_foundation_context(
+                                                        model,
+                                                        scaler,
+                                                        filled,
+                                                        case.target,
+                                                        foundation_insample,
+                                                        seasonality_m=seasonality_m,
+                                                        freq=freq,
+                                                    )
+                                                )
+                                            except Exception as retry_error:
+                                                result["failure_reason"] = (
+                                                    f"{type(retry_error).__name__}: "
+                                                    f"{retry_error}"
+                                                )
+                                        else:
+                                            result["failure_reason"] = (
+                                                f"{type(first_error).__name__}: "
+                                                f"{first_error}"
+                                            )
+                                    if _cacheable_foundation_test(
+                                        result, regime.horizon
+                                    ):
+                                        result["failure_reason"] = ""
+                                        cache.put(
+                                            "foundation_preprocessing",
+                                            forecast_key,
+                                            result,
+                                        )
+
+                            foundation_preprocessing_rows.append(
+                                {
+                                    "series": name,
+                                    "regime": regime.name,
+                                    "horizon": regime.horizon,
+                                    "model": model_name,
+                                    "case_id": case.case_id,
+                                    "anomaly_type": case.anomaly_type,
+                                    "test_seed": case.test_seed,
+                                    "test_target_start": case.origin,
+                                    "condition": condition,
+                                    "detectors": (
+                                        ",".join(detection.detectors)
+                                        if detection is not None
+                                        else ""
+                                    ),
+                                    "n_injected": int(case.injected_mask.sum()),
+                                    "n_context_flagged": int(context_mask.sum()),
+                                    "n_injected_detected": n_injected_detected,
+                                    "n_context_nan": int(context.isna().sum()),
+                                    "imputation_applied": bool(
+                                        result.get("imputation_applied", False)
+                                    ),
+                                    "imputation_model": (
+                                        imputation_model
+                                        if result.get("imputation_applied", False)
+                                        else "none"
+                                    ),
+                                    "n_imputed": int(result.get("n_imputed", 0)),
+                                    "rmse": result["rmse"] / scale_ref,
+                                    "mase": result["mase"],
+                                    "model_load_seconds": result.get(
+                                        "model_load_seconds", float("nan")
+                                    ),
+                                    "inference_seconds": result.get(
+                                        "inference_seconds", float("nan")
+                                    ),
+                                    "scale_ref": scale_ref,
+                                    "n_test_predictions": result.get(
+                                        "n_test_predictions", 0
+                                    ),
+                                    "failure_reason": result.get(
+                                        "failure_reason", ""
+                                    ),
+                                }
+                            )
+                    if prepared_model is not None:
+                        prepared_model = None
+                        del model, scaler, foundation_insample
+                        gc.collect()
 
     print(f"[cache] {cache.stats()}")
     results_df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
@@ -828,12 +1135,25 @@ def run_benchmark_from_config(
         ],
     )
     selection_df = pd.DataFrame(selection_rows, columns=SELECTION_COLUMNS)
+    foundation_preprocessing_df = pd.DataFrame(
+        foundation_preprocessing_rows,
+        columns=FOUNDATION_PREPROCESSING_COLUMNS,
+    )
+    foundation_preprocessing_summary_df = summarize_foundation_preprocessing(
+        foundation_preprocessing_df
+    )
 
     output_dir = _build_output_dir()
     results_df.to_csv(output_dir / "results.csv", index=False)
     summary_df.to_csv(output_dir / "summary.csv", index=False)
     detection_df.to_csv(output_dir / "detection.csv", index=False)
     selection_df.to_csv(output_dir / "selection.csv", index=False)
+    foundation_preprocessing_df.to_csv(
+        output_dir / "foundation_preprocessing_results.csv", index=False
+    )
+    foundation_preprocessing_summary_df.to_csv(
+        output_dir / "foundation_preprocessing_summary.csv", index=False
+    )
 
     return {
         "output_dir": output_dir,
@@ -842,6 +1162,8 @@ def run_benchmark_from_config(
         "summary_df": summary_df,
         "detection_df": detection_df,
         "selection_df": selection_df,
+        "foundation_preprocessing_df": foundation_preprocessing_df,
+        "foundation_preprocessing_summary_df": foundation_preprocessing_summary_df,
     }
 
 

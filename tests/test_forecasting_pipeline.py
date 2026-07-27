@@ -272,11 +272,11 @@ def test_select_holdout_window_requires_contiguous_run():
     assert select_holdout_window(series, holdout=500, **kwargs) is None
     window = select_holdout_window(series, holdout=40, **kwargs)
     assert window is not None
-    assert len(window["holdout_index"]) == 40
-    assert len(window["eval_index"]) == 112
-    assert window["train_index"][-1] == window["holdout_start"] - pd.Timedelta(hours=1)
+    assert len(window["test_target_index"]) == 40
+    assert len(window["test_index"]) == 112
+    assert window["train_index"][-1] == window["test_target_start"] - pd.Timedelta(hours=1)
     assert window["source_run_start"] == series.index[170]
-    assert window["test_block_start"] == window["context_index"][0]
+    assert window["test_context_start"] == window["context_index"][0]
 
 
 def test_select_holdout_window_prefers_most_recent_run_over_longest():
@@ -294,8 +294,8 @@ def test_select_holdout_window_prefers_most_recent_run_over_longest():
     )
     assert window is not None
     # Holdout ends at the tail of the recent run, not inside the longer early one.
-    assert window["holdout_index"][-1] == series.index[999]
-    assert window["holdout_start"] > series.index[750]
+    assert window["test_target_index"][-1] == series.index[999]
+    assert window["test_target_start"] > series.index[750]
 
 
 def test_select_holdout_window_uses_same_run_prefix_as_validation_host():
@@ -309,7 +309,7 @@ def test_select_holdout_window_uses_same_run_prefix_as_validation_host():
     single_run = select_holdout_window(_seasonal_series(n=300, seed=4), **kwargs)
     assert single_run is not None
     assert single_run["source_run_start"] == single_run["train_index"][0]
-    assert single_run["train_end"] == single_run["holdout_start"] - pd.Timedelta(hours=1)
+    assert single_run["train_end"] == single_run["test_target_start"] - pd.Timedelta(hours=1)
 
     series = _seasonal_series(n=500, seed=4)
     series.iloc[150:170] = np.nan
@@ -330,17 +330,17 @@ def test_backtest_forecast_returns_finite_metrics():
         validation_len=48,
     )
     train = series.loc[window["train_index"]]
-    eval_obs = series.loc[window["eval_index"]]
+    test_series = series.loc[window["test_index"]]
 
     res = backtest_forecast(
-        train, eval_obs, "LinearRegression",
-        size_k=5, holdout_start=window["holdout_start"], seasonality_m=24,
+        train, test_series, "LinearRegression",
+        size_k=5, test_target_start=window["test_target_start"], seasonality_m=24,
         forecast_stride=2,
     )
-    assert res["n_eval"] > 0
+    assert res["n_test_predictions"] > 0
     assert np.isfinite(res["rmse"]) and np.isfinite(res["mae"])
     assert res["n_forecasts"] > 1
-    assert res["n_eval"] > res["n_unique_targets"]
+    assert res["n_test_predictions"] > res["n_unique_targets"]
 
 
 def test_train_val_split_keeps_train_before_validation():
@@ -411,12 +411,16 @@ def test_backtest_forecast_mase_uses_shared_insample():
         validation_len=48,
     )
     train = series.loc[window["train_index"]]
-    eval_obs = series.loc[window["eval_index"]]
-    kwargs = dict(size_k=5, holdout_start=window["holdout_start"], seasonality_m=24)
+    test_series = series.loc[window["test_index"]]
+    kwargs = dict(
+        size_k=5,
+        test_target_start=window["test_target_start"],
+        seasonality_m=24,
+    )
 
-    res_own = backtest_forecast(train, eval_obs, "LinearRegression", **kwargs)
+    res_own = backtest_forecast(train, test_series, "LinearRegression", **kwargs)
     res_shared = backtest_forecast(
-        train, eval_obs, "LinearRegression", **kwargs, mase_insample=train * 2.0
+        train, test_series, "LinearRegression", **kwargs, mase_insample=train * 2.0
     )
 
     assert res_shared["rmse"] == pytest.approx(res_own["rmse"])
@@ -451,7 +455,7 @@ def test_build_arms_expands_strategies_and_imputation_variants():
 def test_only_complete_backtests_are_cacheable():
     complete = {
         "rmse": 1.0,
-        "n_eval": 16,
+        "n_test_predictions": 16,
         "n_forecasts": 2,
         "n_expected_forecasts": 2,
     }
@@ -469,7 +473,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 ):
     series = _seasonal_series(n=600, name="ST0", seed=8)
     seen_detection_index: list[pd.DatetimeIndex] = []
-    eval_indices: list[pd.DatetimeIndex] = []
+    test_indices: list[pd.DatetimeIndex] = []
 
     monkeypatch.setattr(
         cp,
@@ -523,15 +527,15 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
             )
         return out
 
-    def fake_backtest(_train, eval_series, _model, **kwargs):
-        eval_indices.append(pd.DatetimeIndex(eval_series.index))
+    def fake_backtest(_train, test_series, _model, **kwargs):
+        test_indices.append(pd.DatetimeIndex(test_series.index))
         horizon = kwargs["size_k"]
         stride = kwargs["forecast_stride"]
         n_forecasts = (96 - horizon) // stride + 1
         return {
             "rmse": 1.0,
             "mase": 1.0,
-            "n_eval": n_forecasts * horizon,
+            "n_test_predictions": n_forecasts * horizon,
             "n_forecasts": n_forecasts,
             "n_unique_targets": 96,
         }
@@ -546,9 +550,9 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     selection = artifacts["selection_df"].iloc[0]
     assert bool(selection["selected"])
     assert selection["split_n_flagged"] == 2
-    assert pd.Timestamp(selection["holdout_end"]) == series.index[499]
-    assert all(index.equals(eval_indices[0]) for index in eval_indices)
-    assert series.index[500] not in eval_indices[0]
+    assert pd.Timestamp(selection["test_target_end"]) == series.index[499]
+    assert all(index.equals(test_indices[0]) for index in test_indices)
+    assert series.index[500] not in test_indices[0]
 
 
 def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
@@ -621,11 +625,15 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         assert (subset["forecast_stride"] == stride).all()
         assert (
             subset["n_forecasts"]
-            == (subset["test_hours"] - horizon) // stride + 1
+            == (subset["test_target_hours"] - horizon) // stride + 1
         ).all()
         assert (subset["n_expected_forecasts"] == subset["n_forecasts"]).all()
-        assert (subset["n_eval"] == subset["n_forecasts"] * horizon).all()
-        assert (subset["n_unique_targets"] == subset["test_hours"]).all()
+        assert (
+            subset["n_test_predictions"] == subset["n_forecasts"] * horizon
+        ).all()
+        assert (
+            subset["n_unique_targets"] == subset["test_target_hours"]
+        ).all()
 
     for artifact in ("results.csv", "summary.csv", "detection.csv", "selection.csv"):
         assert (tmp_path / artifact).exists()
@@ -640,7 +648,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
 
     assert set(detection_df["strategy"]) == {"unlabeled", "inject-vote"}
     assert set(detection_df["scope"]) == {"full_series"}
-    assert artifacts["selection_df"].iloc[0]["test_hours"] == 96
+    assert artifacts["selection_df"].iloc[0]["test_target_hours"] == 96
     vote_row = detection_df[detection_df["strategy"] == "inject-vote"].iloc[0]
     assert vote_row["ranking"]  # the injection ranking is persisted
 
@@ -681,7 +689,7 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
     assert (artifacts["results_df"]["n_anomalies"] == 0).all()
 
 
-def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatch):
+def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     def fake_loader(**_kwargs):
         series = _seasonal_series(n=900, name="ST0", seed=2)
         series.iloc[300:330] = np.nan
@@ -716,7 +724,7 @@ def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatc
         cp,
         "build_detection_strategy",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("foundation-only run must not build detectors")
+            AssertionError("common foundation reference must not build training arms")
         ),
     )
     monkeypatch.setattr(
@@ -725,7 +733,7 @@ def test_foundation_only_run_uses_raw_arm_without_detection(tmp_path, monkeypatc
         lambda *args, **kwargs: {
             "rmse": 1.0,
             "mase": 1.0,
-            "n_eval": 8,
+            "n_test_predictions": 8,
             "n_forecasts": 1,
             "n_unique_targets": 8,
         },

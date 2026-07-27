@@ -632,6 +632,20 @@ def apply_mask_transforms(
     )
 
 
+def common_detection_support(
+    series: pd.Series,
+    detections: dict[str, DetectionResult],
+) -> tuple[pd.Series, pd.Series]:
+    """Mask anomalies and observed points where any strategy abstained."""
+    common_mask = pd.Series(False, index=series.index, name=series.name)
+    for detection in detections.values():
+        common_mask |= detection.mask.reindex(series.index, fill_value=False).astype(bool)
+        if detection.scored_mask is not None:
+            scored = detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
+            common_mask |= series.notna() & ~scored
+    return series.mask(common_mask), common_mask
+
+
 __all__ = [
     "DEFAULT_INJECTION_SEED",
     "DEFAULT_INJECTION_VARIANT",
@@ -652,4 +666,5 @@ __all__ = [
     "SeriesDetectionContext",
     "apply_mask_transforms",
     "build_detection_strategy",
+    "common_detection_support",
 ]

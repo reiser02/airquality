@@ -1,7 +1,8 @@
 """Figure builders + CLI for the forecasting-benchmark reports.
 
 Reads the CSVs persisted by :mod:`airquality.forecasting.pipeline`
-(``results.csv`` + ``detection.csv``) from one run directory and renders the
+(``results.csv``, ``detection.csv`` and the optional paired-foundation summary)
+from one run directory and renders the
 report figures next to them — plots regenerate any time without recomputing
 detections or backtests:
 
@@ -23,6 +24,8 @@ values are comparable across series and can be averaged.
 - ``{train,inference}_time_vs_{rmse,mase}.png`` — cost/accuracy scatter: mean
   training / inference time vs mean error per (arm, model), so the bottom-left
   region is fast and precise.
+- ``foundation_preprocessing_recovery_{rmse,mase}.png`` — paired error recovered
+  after preprocessing synthetic context anomalies, by model, strategy and type.
 
 Arm colors follow the strategy *family* and stay fixed across figures
 (``raw`` is deliberately neutral: it is the baseline, not a competing series).
@@ -652,6 +655,82 @@ def save_imputation_effect_plot(
     return True
 
 
+def save_foundation_preprocessing_plot(
+    output_path: Path,
+    summary_df: pd.DataFrame,
+    metric: str = "rmse",
+) -> bool:
+    """Plot mean paired recovery from corrupted synthetic contexts."""
+    value_col = f"{metric}_recovery"
+    required = {"model", "regime", "strategy", "anomaly_type", value_col}
+    if summary_df.empty or not required <= set(summary_df.columns):
+        return False
+
+    data = summary_df.copy()
+    data["row"] = (
+        data["model"].astype(str)
+        + " ["
+        + data["regime"].astype(str)
+        + "] / "
+        + data["strategy"].astype(str)
+    )
+    table = data.pivot_table(
+        index="row",
+        columns="anomaly_type",
+        values=value_col,
+        aggfunc="mean",
+        sort=False,
+    )
+    if table.empty or not np.isfinite(table.to_numpy(dtype=float)).any():
+        return False
+
+    values = table.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    limit = max(float(np.max(np.abs(finite))), 1e-9)
+    figure, axis = plt.subplots(
+        figsize=(max(7.5, 1.25 * len(table.columns)), max(4.5, 0.34 * len(table) + 1.8)),
+        facecolor=FIGURE_FACE,
+    )
+    axis.set_facecolor(FIGURE_FACE)
+    image = axis.imshow(
+        values,
+        aspect="auto",
+        cmap=IMPROVEMENT_CMAP,
+        vmin=-limit,
+        vmax=limit,
+    )
+    axis.set_xticks(range(len(table.columns)), table.columns)
+    axis.set_yticks(range(len(table.index)), table.index)
+    axis.tick_params(axis="x", rotation=25)
+    for row in range(values.shape[0]):
+        for col in range(values.shape[1]):
+            value = values[row, col]
+            if np.isfinite(value):
+                axis.text(
+                    col,
+                    row,
+                    f"{value:+.3f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=TEXT_COLOR,
+                )
+    axis.set_xlabel("Tipo de anomalia sintetica")
+    axis.set_ylabel("Foundation [regimen] / estrategia")
+    style_axis(axis)
+    top = _add_header(
+        figure,
+        f"Recuperacion del dano sintetico — {_metric_label(metric)}",
+        "Positivo: el preprocesamiento reduce el error frente al contexto corrompido.",
+    )
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
+    colorbar.set_label("Error recuperado")
+    figure.tight_layout(rect=(0, 0, 1, top))
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+    return True
+
+
 def render_run_figures(run_dir: Path) -> list[Path]:
     """Render every applicable figure for one run directory; return saved paths."""
     results_df = pd.read_csv(run_dir / "results.csv")
@@ -662,6 +741,10 @@ def render_run_figures(run_dir: Path) -> list[Path]:
         )
     detection_path = run_dir / "detection.csv"
     detection_df = pd.read_csv(detection_path) if detection_path.exists() else pd.DataFrame()
+    foundation_path = run_dir / "foundation_preprocessing_summary.csv"
+    foundation_df = (
+        pd.read_csv(foundation_path) if foundation_path.exists() else pd.DataFrame()
+    )
 
     saved: list[Path] = []
     jobs = [
@@ -678,6 +761,14 @@ def render_run_figures(run_dir: Path) -> list[Path]:
         (run_dir / "inference_time.png", lambda p: save_inference_time_plot(p, results_df)),
         (run_dir / "inference_time_vs_rmse.png", lambda p: save_inference_time_vs_error_plot(p, results_df, "rmse")),
         (run_dir / "inference_time_vs_mase.png", lambda p: save_inference_time_vs_error_plot(p, results_df, "mase")),
+        (
+            run_dir / "foundation_preprocessing_recovery_rmse.png",
+            lambda p: save_foundation_preprocessing_plot(p, foundation_df, "rmse"),
+        ),
+        (
+            run_dir / "foundation_preprocessing_recovery_mase.png",
+            lambda p: save_foundation_preprocessing_plot(p, foundation_df, "mase"),
+        ),
     ]
     for path, job in jobs:
         if job(path):

@@ -43,7 +43,9 @@ import pandas as pd
 #: v9: each detector is fitted once on all block-local windows of a station.
 #: v10: injected rankings and detector eligibility are resolved per block. v11:
 #: detector coverage is finite-score-aware and failed backtests are not persisted.
-CACHE_VERSION = 11
+#: v12: test terminology is explicit and the paired synthetic foundation-context
+#: experiment has its own content-keyed payloads.
+CACHE_VERSION = 12
 
 
 def series_fingerprint(series: pd.Series) -> str:

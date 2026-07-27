@@ -13,6 +13,7 @@ from airquality.forecasting.plot_benchmark_results import (
     render_run_figures,
     save_arm_error_plot,
     save_detector_selection_plot,
+    save_foundation_preprocessing_plot,
     save_imputation_effect_plot,
     save_improvement_heatmap,
     save_inference_time_plot,
@@ -56,7 +57,7 @@ def _results_df(n_series: int = 3, models: tuple[str, ...] = ("NLinear", "TiDE")
                         "train_seconds": 2.0 + rng.uniform(0, 8),
                         "inference_seconds": 0.1 + rng.uniform(0, 0.5),
                         "scale_ref": 10.0 + s,
-                        "n_eval": 40,
+                        "n_test_predictions": 40,
                     }
                 )
     return pd.DataFrame(rows)
@@ -167,7 +168,24 @@ def test_save_figures_report_empty_inputs(tmp_path):
     assert not save_train_time_vs_error_plot(tmp_path / "f.png", empty, "rmse")
     assert not save_inference_time_plot(tmp_path / "g.png", empty)
     assert not save_inference_time_vs_error_plot(tmp_path / "h.png", empty, "rmse")
+    assert not save_foundation_preprocessing_plot(tmp_path / "i.png", pd.DataFrame())
     assert not list(tmp_path.iterdir())
+
+
+def test_save_foundation_preprocessing_plot(tmp_path):
+    summary = pd.DataFrame(
+        {
+            "model": ["Chronos2"] * 4,
+            "regime": ["short"] * 4,
+            "strategy": ["unlabeled"] * 4,
+            "anomaly_type": ["spikes", "scale", "noise", "drift"],
+            "rmse_recovery": [0.2, -0.1, 0.3, 0.05],
+        }
+    )
+    output = tmp_path / "foundation.png"
+
+    assert save_foundation_preprocessing_plot(output, summary, "rmse")
+    assert output.exists() and output.stat().st_size > 5_000
 
 
 def test_render_run_figures_from_csvs(tmp_path):
@@ -178,6 +196,16 @@ def test_render_run_figures_from_csvs(tmp_path):
     long[["rmse", "mase"]] *= 1.1
     pd.concat([short, long], ignore_index=True).to_csv(tmp_path / "results.csv", index=False)
     _detection_df().to_csv(tmp_path / "detection.csv", index=False)
+    pd.DataFrame(
+        {
+            "model": ["Chronos2"] * 4,
+            "regime": ["short"] * 4,
+            "strategy": ["unlabeled"] * 4,
+            "anomaly_type": ["spikes", "scale", "noise", "drift"],
+            "rmse_recovery": [0.2, -0.1, 0.3, 0.05],
+            "mase_recovery": [0.1, -0.05, 0.2, 0.02],
+        }
+    ).to_csv(tmp_path / "foundation_preprocessing_summary.csv", index=False)
 
     saved = render_run_figures(tmp_path)
 
@@ -196,4 +224,6 @@ def test_render_run_figures_from_csvs(tmp_path):
         "inference_time.png",
         "inference_time_vs_rmse.png",
         "inference_time_vs_mase.png",
+        "foundation_preprocessing_recovery_rmse.png",
+        "foundation_preprocessing_recovery_mase.png",
     }

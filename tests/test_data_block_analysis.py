@@ -15,6 +15,8 @@ from airquality.data.block_analysis import (
     summarize_blocks,
 )
 from airquality.data.segments import contiguous_observed_segments
+from airquality.forecasting.backtest import get_strict_forecast_requirements
+from airquality.forecasting.registry import resolve_forecasting_model_configs
 
 
 def test_observed_blocks_and_validation_chronology() -> None:
@@ -116,6 +118,27 @@ def test_worst_case_requirements_use_native_model_geometry() -> None:
     assert requirements["long"]["limiting_models"] == "TCN"
 
 
+def test_strict_requirements_exclude_foundations_from_training_arm_comparison() -> None:
+    configs = resolve_forecasting_model_configs(
+        ["AutoARIMA", "Chronos2"], seasonality_m=24, context_length=72
+    )
+
+    requirements = get_strict_forecast_requirements(
+        configs,
+        size_k=8,
+        validation_len=48,
+        validation_stride=4,
+        seasonality_m=24,
+        context_len=72,
+        training_arms_only=True,
+    )
+
+    assert requirements["minimum_hours"] == 48
+    assert requirements["minimum_models"] == "AutoARIMA"
+    assert requirements["prediction_context_hours"] == 72
+    assert requirements["context_models"] == "configured_context"
+
+
 def test_analysis_retains_same_run_prefix_before_fixed_holdout(
     tmp_path, monkeypatch
 ) -> None:
@@ -150,7 +173,7 @@ def test_analysis_retains_same_run_prefix_before_fixed_holdout(
     )
 
     assert excluded.empty
-    assert series.iloc[0]["test_hours"] == 192
+    assert series.iloc[0]["test_target_hours"] == 192
     assert series.iloc[0]["prior_observed_hours"] == 308
     assert blocks["hours"].sum() == 308
     assert series.iloc[0]["source_run_start"] == index[0]
