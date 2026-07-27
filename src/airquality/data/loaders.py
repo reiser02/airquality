@@ -9,19 +9,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from airquality.config import cfg_get_str
-
 
 class UnsupportedFileFormatError(Exception):
     """Exception raised when the file format is not supported."""
-
-
-def load_dataset_paths() -> list[str]:
-    """Return files selected by the shared project configuration."""
-    base_path = cfg_get_str("data", "base_path_glob", "../../data/*/")
-    key_word = cfg_get_str("data", "key_word", "CO_media_horaria")
-    file_extension = cfg_get_str("data", "file_extension", "json")
-    return glob.glob(os.path.join(base_path, f"*{key_word}*.{file_extension}"))
 
 
 def _load_json_df(file_path: str) -> pd.DataFrame:

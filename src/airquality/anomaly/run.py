@@ -55,7 +55,7 @@ def main() -> None:
     parser.add_argument("--pollutant", default=cfg_get_str("anomaly", "pollutant", "NO2"))
     parser.add_argument(
         "--raw-base-dir",
-        default=cfg_get_str("anomaly", "raw_base_dir", "data/raw/datos_estaciones_5m"),
+        default=cfg_get_str("data", "raw_base_dir", "data/raw/datos_estaciones_5m"),
     )
     parser.add_argument("--models", nargs="*", default=None, help="Model names, or 'all' (default from config)")
     parser.add_argument("--device", default=cfg_get_str("anomaly", "device", "cpu"))

@@ -74,7 +74,7 @@ def test_main_trains_from_config(monkeypatch) -> None:
 
     main()
 
-    assert calls["series_kwargs"] == {"freq": "h", "name_from_path": True}
+    assert calls["series_kwargs"] == {"freq": "h"}
     assert calls["segment_kwargs"] == {"series_dfs": ["series"], "verbose": False}
     assert calls["bundle_kwargs"] == {
         "series_dfs": ["series"],

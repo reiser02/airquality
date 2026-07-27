@@ -15,6 +15,7 @@ from airquality.imputation.tspulse_finetune import (
     build_series_name,
     build_train_valid_datasets,
     discover_csv_files,
+    load_series_list,
     run,
     sanitize_name,
     split_long_train_valid,
@@ -41,6 +42,43 @@ def test_discover_csv_files_uses_requested_data_root(tmp_path: Path) -> None:
     assert discover_csv_files(
         tmp_path, key_word="NO2", file_extension="csv"
     ) == [expected.resolve()]
+
+
+def test_load_series_list_applies_shared_preprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    csv_path = tmp_path / "station_NO2.csv"
+    raw = pd.DataFrame(
+        {"NO2": [1.0]}, index=pd.DatetimeIndex(["2024-01-01"])
+    )
+    hourly = pd.DataFrame(
+        {"NO2": [2.0, 3.0]}, index=pd.date_range("2024-01-01", periods=2, freq="h")
+    )
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "airquality.imputation.tspulse_finetune.load_to_df", lambda *_args, **_kwargs: raw
+    )
+    monkeypatch.setattr(
+        "airquality.imputation.tspulse_finetune.preprocess",
+        lambda frames, pollutant: calls.update(
+            {"frames": frames, "pollutant": pollutant}
+        )
+        or ([hourly], [0]),
+    )
+
+    out = load_series_list(
+        [csv_path],
+        pollutant="NO2",
+        target_column_index=0,
+        freq="h",
+        min_non_nan_ratio=1.0,
+        min_points=2,
+    )
+
+    assert calls["pollutant"] == "NO2"
+    assert calls["frames"][0].equals(raw[["NO2"]])
+    assert out[0].iloc[:, 0].tolist() == [2.0, 3.0]
 
 
 def test_train_valid_examples_have_disjoint_observed_targets(

@@ -54,7 +54,7 @@ def train_from_config() -> dict[str, Any]:
     )
 
     print("[info] Loading series selected by config")
-    series_dfs = load_and_normalize_series(freq=freq, name_from_path=True)
+    series_dfs = load_and_normalize_series(freq=freq)
     if not series_dfs:
         raise RuntimeError("No se pudieron construir series validas desde los archivos cargados.")
 

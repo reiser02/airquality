@@ -21,11 +21,24 @@ from airquality.imputation.run_benchmark import (
     _resolve_requested_models,
     _resolve_repo_root,
     load_darts_models_from_artifacts,
+    load_series,
     run_imputation_benchmark,
     run_imputation_benchmark_parallel,
     summarize_results_by_model,
     summarize_montecarlo_rankings,
 )
+
+
+def test_load_series_uses_shared_raw_preprocessing(monkeypatch) -> None:
+    expected = [pd.DataFrame({"Station": [1.0]})]
+    calls = {}
+    monkeypatch.setattr(
+        "airquality.imputation.run_benchmark.load_and_normalize_series",
+        lambda **kwargs: calls.update(kwargs) or expected,
+    )
+
+    assert load_series("h") is expected
+    assert calls == {"freq": "h"}
 
 
 def test_darts_global_imputer_casts_context_to_float32() -> None:
