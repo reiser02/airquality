@@ -14,10 +14,12 @@ import pandas as pd
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 from airquality.data.io import resolve_device, to_pd_series
 from airquality.data.loaders import load_to_df
+from airquality.data.preprocessing import preprocess
 from airquality.data.segments import get_longest_segment
-from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 
 try:
     from transformers import Trainer, TrainingArguments, set_seed
@@ -125,12 +127,13 @@ def discover_csv_files(
 def load_series_list(
     csv_files: Sequence[Path],
     *,
+    pollutant: str,
     target_column_index: int,
     freq: str,
     min_non_nan_ratio: float,
     min_points: int,
 ) -> list[pd.DataFrame]:
-    """Load, validate, and filter the raw series used for TSPulse fine-tuning."""
+    """Load, preprocess, validate, and filter raw series for TSPulse fine-tuning."""
     out: list[pd.DataFrame] = []
     seen_names: set[str] = set()
 
@@ -145,7 +148,8 @@ def load_series_list(
                 f"Columnas disponibles ({len(df.columns)}): {list(df.columns)}"
             )
         value_col = str(df.columns[int(target_column_index)])
-        values = to_pd_series(df[[value_col]], freq=freq, name=value_col)
+        (hourly,), _ = preprocess([df[[value_col]]], pollutant)
+        values = to_pd_series(hourly, freq=freq, name=value_col)
 
         name = build_series_name(csv_path, value_col)
         if name in seen_names:
@@ -410,6 +414,7 @@ def _load_training_series_and_split(
 
     series_dfs = load_series_list(
         csv_files,
+        pollutant=args.key_word,
         target_column_index=args.target_column_index,
         freq=args.freq,
         min_non_nan_ratio=args.min_non_nan_ratio,
@@ -712,7 +717,9 @@ def run(args: argparse.Namespace) -> None:
 def _build_parser_defaults() -> dict[str, object]:
     """Read CLI default values from the project configuration files."""
     return {
-        "data_root": cfg_get_str("data", "data_root", "Datos-post-COUTA"),
+        "data_root": cfg_get_str(
+            "data", "data_root", "data/raw/datos_estaciones_5m"
+        ),
         "key_word": cfg_get_str("data", "key_word", "NO2"),
         "file_extension": cfg_get_str("data", "file_extension", "csv"),
         "timestamp_column": cfg_get_str("data", "timestamp_column", "fecha"),

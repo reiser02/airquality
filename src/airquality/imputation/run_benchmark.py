@@ -385,10 +385,7 @@ def _build_parallel_task_common(repo_root: Path, config: BenchmarkRunConfig) -> 
 
 def load_series(freq: str) -> list[pd.DataFrame]:
     """Load and normalize the raw project series selected for benchmarking."""
-    series_dfs = load_and_normalize_series(
-        freq=freq,
-        name_from_path=True,
-    )
+    series_dfs = load_and_normalize_series(freq=freq)
     if not series_dfs:
         raise RuntimeError(
             "No se pudieron construir series validas desde los archivos cargados."
