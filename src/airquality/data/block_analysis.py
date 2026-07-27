@@ -30,9 +30,10 @@ from airquality.anomaly.presentation import (
 from airquality.config import cfg_get_csv_list, cfg_get_int
 from airquality.data.loaders import load_raw_5m
 from airquality.data.preprocessing import MIN_RUN, MIN_USEFUL, preprocess
+from airquality.data.segments import observed_blocks
 from airquality.data.series import ensure_datetime_series
 from airquality.forecasting.backtest import (
-    get_forecast_model_requirements,
+    get_strict_forecast_requirements,
     select_holdout_window,
 )
 from airquality.forecasting.registry import resolve_forecasting_model_configs
@@ -40,26 +41,6 @@ from airquality.paths import create_run_dir
 
 SHORT_COLOR = "#3d7ab5"
 LONG_COLOR = "#cf6f1e"
-
-
-def observed_blocks(series: pd.Series) -> pd.DataFrame:
-    """Return maximal gap-free blocks as ``start/end/hours`` rows."""
-    observed = series.notna()
-    if not observed.any():
-        return pd.DataFrame(columns=["start", "end", "hours"])
-
-    frame = pd.DataFrame({"timestamp": series.index, "observed": observed.to_numpy()})
-    starts = (
-        ~frame["observed"].shift(fill_value=False)
-        | frame["timestamp"].diff().ne(pd.Timedelta(hours=1))
-    )
-    frame["block"] = (frame["observed"] & starts).cumsum()
-    return (
-        frame.loc[frame["observed"]]
-        .groupby("block", sort=True)
-        .agg(start=("timestamp", "first"), end=("timestamp", "last"), hours=("timestamp", "size"))
-        .reset_index(drop=True)
-    )
 
 
 def _worst_case_requirements(
@@ -78,53 +59,26 @@ def _worst_case_requirements(
     configs = resolve_forecasting_model_configs(
         list(model_names), seasonality_m=seasonality_m, context_length=context
     )
-    out: dict[str, dict[str, object]] = {}
+    out = {}
     for regime, horizon in horizons.items():
-        candidates = []
-        for name, config in configs.items():
-            native = get_forecast_model_requirements(
-                config,
-                size_k=horizon,
-                seasonality_m=seasonality_m,
-                context_len=context,
-            )
-            reserve = (
-                max(validation_hours[regime], native.validation_target_length)
-                if native.validation_target_offset is not None
-                else 0
-            )
-            candidates.append(
-                {
-                    "model": name,
-                    "minimum": native.min_train_series_length,
-                    "prediction_context": native.prediction_context_length,
-                    "reserve": reserve,
-                    "host": native.min_train_series_length + reserve,
-                    "validation_forecasts": (
-                        (reserve - native.validation_target_length) // strides[regime] + 1
-                        if reserve
-                        else 0
-                    ),
-                }
-            )
-
-        host_minimum = max(int(item["host"]) for item in candidates)
-        limiting = [item for item in candidates if item["host"] == host_minimum]
-        validation_reserve = max(int(item["reserve"]) for item in candidates)
-        validation_limiting = [
-            item for item in candidates if item["reserve"] == validation_reserve
-        ]
+        strict = get_strict_forecast_requirements(
+            configs,
+            size_k=horizon,
+            validation_len=validation_hours[regime],
+            validation_stride=strides[regime],
+            seasonality_m=seasonality_m,
+            context_len=context,
+        )
         out[regime] = {
-            "minimum_hours": max(int(item["minimum"]) for item in candidates),
-            "prediction_context_hours": max(
-                int(item["prediction_context"]) for item in candidates
-            ),
-            "host_minimum_hours": host_minimum,
-            "validation_hours": validation_reserve,
-            "validation_forecasts": min(
-                int(item["validation_forecasts"]) for item in validation_limiting
-            ),
-            "limiting_models": "/".join(str(item["model"]) for item in limiting),
+            key: strict[key]
+            for key in (
+                "minimum_hours",
+                "prediction_context_hours",
+                "host_minimum_hours",
+                "validation_hours",
+                "validation_forecasts",
+                "limiting_models",
+            )
         }
     return out
 
@@ -261,11 +215,11 @@ def analyze_raw_blocks(
 
             train = series.loc[window["train_index"]]
             details |= {
-                "test_block_start": window["test_block_start"],
+                "test_context_start": window["test_context_start"],
                 "source_run_start": window["source_run_start"],
-                "holdout_start": window["holdout_start"],
-                "holdout_end": window["holdout_end"],
-                "test_hours": window["test_hours"],
+                "test_target_start": window["test_target_start"],
+                "test_target_end": window["test_target_end"],
+                "test_target_hours": window["test_target_hours"],
                 "prior_observed_hours": int(train.notna().sum()),
             }
             # The new split keeps every pre-target value, including the prefix
@@ -284,11 +238,11 @@ def analyze_raw_blocks(
             row: dict[str, object] = {
                 "pollutant": pollutant,
                 "station": station,
-                "holdout_start": details["holdout_start"],
-                "holdout_end": details["holdout_end"],
-                "test_block_start": details["test_block_start"],
+                "test_target_start": details["test_target_start"],
+                "test_target_end": details["test_target_end"],
+                "test_context_start": details["test_context_start"],
                 "source_run_start": details["source_run_start"],
-                "test_hours": details["test_hours"],
+                "test_target_hours": details["test_target_hours"],
                 "prior_observed_hours": details["prior_observed_hours"],
                 "forecast_models": ", ".join(forecast_models),
                 "observed_hours": int(blocks["hours"].sum()),

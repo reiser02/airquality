@@ -5,6 +5,19 @@ from __future__ import annotations
 import pandas as pd
 
 
+def observed_blocks(series: pd.Series) -> pd.DataFrame:
+    """Return maximal gap-free blocks as ``start/end/hours`` rows."""
+    segments = contiguous_observed_segments(series)
+    return pd.DataFrame(
+        {
+            "start": [segment.index[0] for segment in segments],
+            "end": [segment.index[-1] for segment in segments],
+            "hours": [len(segment) for segment in segments],
+        },
+        columns=["start", "end", "hours"],
+    )
+
+
 def contiguous_observed_segments(series: pd.Series, min_len: int = 1) -> list[pd.Series]:
     """Split ``series`` into contiguous NaN-free runs of at least ``min_len`` points.
 

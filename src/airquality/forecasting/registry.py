@@ -32,9 +32,9 @@ class ForecastModelConfig:
     mode: ForecastModelMode
 
     @property
-    def raw_only(self) -> bool:
-        """Foundation models are zero-shot, so preprocessing arms cannot alter them."""
-        return self.mode == "foundation"
+    def uses_training_arms(self) -> bool:
+        """Whether raw/preprocessed histories can alter this model's fit."""
+        return self.mode != "foundation"
 
 
 def build_forecasting_model_configs(

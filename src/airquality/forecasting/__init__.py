@@ -3,12 +3,15 @@
 This subpackage consumes the anomaly and imputation subsystems (kept as pure
 benchmarks) to build, per series, one training arm per (detection strategy,
 imputation) combination — plus the ``raw`` baseline — and compare their
-multi-step forecasting error over a shared observed holdout.
+multi-step forecasting error over a shared observed test. A separate paired
+synthetic-context experiment measures preprocessing recovery for frozen
+foundation models.
 """
 
 from airquality.forecasting.backtest import (
     backtest_forecast,
     get_forecast_model_requirements,
+    get_strict_forecast_requirements,
     select_holdout_window,
 )
 from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
@@ -21,6 +24,7 @@ from airquality.forecasting.detection import (
     SeriesDetectionContext,
     apply_mask_transforms,
     build_detection_strategy,
+    common_detection_support,
 )
 from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
 from airquality.forecasting.pipeline import (
@@ -45,10 +49,12 @@ __all__ = [
     "MaskTransform",
     "apply_mask_transforms",
     "build_detection_strategy",
+    "common_detection_support",
     "build_imputer",
     "impute_series",
     "nan_gap_windows",
     "backtest_forecast",
     "get_forecast_model_requirements",
+    "get_strict_forecast_requirements",
     "select_holdout_window",
 ]
