@@ -4,9 +4,10 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-import airquality.forecasting.imputation_support_analysis as analysis
+import airquality.data.block_support_analysis as analysis
 from airquality.forecasting.detection import DetectionResult
-from airquality.forecasting.imputation_support_analysis import (
+from airquality.data.block_support_analysis import (
+    _gap_diagnostics,
     training_support_diagnostics,
 )
 
@@ -25,7 +26,7 @@ def test_training_support_diagnostics_uses_one_worst_case_threshold() -> None:
         cleaned,
         imputed,
         anomaly_mask,
-        holdout_start=index[-1] + pd.Timedelta(hours=1),
+        test_target_start=index[-1] + pd.Timedelta(hours=1),
         min_train_points=4,
     )
 
@@ -46,7 +47,26 @@ def test_training_support_diagnostics_uses_one_worst_case_threshold() -> None:
     assert result["recovered_observed_age_hours_max"] == 12.0
 
 
-def test_run_analysis_writes_one_row_per_imputed_arm(tmp_path, monkeypatch) -> None:
+def test_gap_diagnostics_keeps_adjacent_gap_over_limit_unfilled() -> None:
+    index = pd.date_range("2024-01-01", periods=20, freq="h")
+    raw = pd.Series(1.0, index=index, name="ST")
+    raw.iloc[5:10] = np.nan
+    mask = pd.Series(False, index=index)
+    mask.iloc[4] = True
+    cleaned = raw.mask(mask)
+    detection = DetectionResult("test", [], [], {}, 3.5, mask)
+
+    rows = _gap_diagnostics(
+        raw, cleaned, cleaned, detection, strategy="test", max_gap_size=5
+    )
+
+    mixed = next(row for row in rows if row["origin"] == "mixed")
+    assert mixed["hours"] == 6
+    assert not mixed["eligible_for_imputation"]
+    assert mixed["filled_hours"] == 0
+
+
+def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypatch) -> None:
     index = pd.date_range("2024-01-01", periods=30, freq="h")
     series = pd.Series(1.0, index=index, name="ST")
     series.iloc[8] = np.nan
@@ -112,23 +132,31 @@ def test_run_analysis_writes_one_row_per_imputed_arm(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         analysis,
         "resolve_forecasting_model_configs",
-        lambda *args, **kwargs: {"Model": SimpleNamespace(raw_only=False)},
+        lambda *args, **kwargs: {"Model": SimpleNamespace(uses_training_arms=True)},
     )
     monkeypatch.setattr(
         analysis,
-        "get_forecast_model_requirements",
-        lambda *args, **kwargs: SimpleNamespace(
-            min_train_series_length=4,
-            prediction_context_length=2,
-            validation_target_offset=None,
-            validation_target_length=0,
-        ),
+        "get_strict_forecast_requirements",
+        lambda *args, **kwargs: {
+            "minimum_hours": 4,
+            "minimum_models": "Model",
+            "prediction_context_hours": 2,
+            "context_models": "Model",
+            "validation_hours": 0,
+            "host_minimum_hours": 4,
+            "limiting_models": "Model",
+            "validation_forecasts": 0,
+        },
     )
     monkeypatch.setattr(analysis, "resolve_model_names", lambda names: names)
     monkeypatch.setattr(
         analysis, "build_detection_strategy", lambda spec, **kwargs: FakeStrategy(spec)
     )
-    monkeypatch.setattr(analysis, "SeriesDetectionContext", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        analysis,
+        "_detect_for_strategies",
+        lambda *_args, **_kwargs: {"unlabeled": detection},
+    )
     monkeypatch.setattr(
         analysis, "_load_raw_hourly_series", lambda **kwargs: [series.to_frame()]
     )
@@ -141,15 +169,29 @@ def test_run_analysis_writes_one_row_per_imputed_arm(tmp_path, monkeypatch) -> N
             method="time", limit_direction="both"
         ),
     )
-    monkeypatch.setattr(analysis, "_repo_root", lambda: tmp_path)
+    artifacts = analysis.run_analysis(output_dir=tmp_path)
+    results = artifacts["series_summary_df"]
 
-    artifacts = analysis.run_analysis()
-    results = artifacts["results_df"]
-
-    assert len(results) == 1
-    assert results.iloc[0]["arm"] == "unlabeled+impute"
-    assert results.iloc[0]["worst_case_min_train_points"] == 4
-    assert "model" not in results.columns
-    assert "regime" not in results.columns
-    assert (artifacts["output_dir"] / "training_support.csv").exists()
+    assert len(results) == 6
+    assert set(results["arm"]) == {
+        "raw",
+        "unlabeled+noimpute",
+        "unlabeled+impute",
+    }
+    assert set(results["stage"]) == {"raw", "detected", "imputed"}
+    assert set(results["regime"]) == {"short", "long"}
+    assert not results["arm"].eq("raw+impute").any()
+    assert results.loc[results["stage"] == "imputed", "imputed"].all()
+    assert set(results["minimum_hours"]) == {4}
+    for filename in (
+        "summary.csv",
+        "series_summary.csv",
+        "blocks.csv",
+        "gaps.csv",
+        "detection.csv",
+        "excluded_series.csv",
+        "manifest.json",
+        "README.md",
+    ):
+        assert (tmp_path / filename).exists()
     assert not list(artifacts["output_dir"].glob("*.png"))
