@@ -35,7 +35,7 @@ DETECTION_LIMITS = {
 RAW_FREQ = "5min"
 HOURLY_FREQ = "h"
 MIN_RUN = 6      # >= 6 lecturas de 5 min identicas (>=30 min) = sensor congelado
-MIN_USEFUL = 3   # lecturas utiles minimas en la hora para calcular la media
+MIN_USEFUL = 1   # lecturas utiles minimas en la hora para calcular la media
 
 
 def frozen_mask(series: pd.Series, min_run: int = MIN_RUN) -> pd.Series:
