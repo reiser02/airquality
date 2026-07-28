@@ -41,15 +41,24 @@ def build_forecasting_model_configs(
     *,
     seasonality_m: int = 24,
     context_length: int = 72,
+    accelerator: str | None = None,
+    devices: int | str | list[int] | None = None,
 ) -> dict[str, ForecastModelConfig]:
     """Return trained, local-statistical, and zero-shot forecasting models."""
     if min(seasonality_m, context_length) <= 0:
         raise ValueError("seasonality_m y context_length deben ser positivos")
 
+    accelerator = accelerator or resolve_training_accelerator()
     configs = {
         name: ForecastModelConfig(model_cls, kwargs, "trained")
         for name, (model_cls, kwargs) in build_model_configs().items()
     }
+    for config in configs.values():
+        if "pl_trainer_kwargs" in config.kwargs:
+            config.kwargs["pl_trainer_kwargs"] = build_lightning_trainer_kwargs(
+                accelerator,
+                devices=devices,
+            )
     configs.update(
         {
             "AutoARIMA": ForecastModelConfig(
@@ -66,8 +75,9 @@ def build_forecasting_model_configs(
     )
 
     trainer_kwargs = build_lightning_trainer_kwargs(
-        resolve_training_accelerator(),
+        accelerator,
         use_early_stopping=False,
+        devices=devices,
         enable_checkpointing=False,
         enable_model_summary=False,
         logger=False,
@@ -118,11 +128,15 @@ def resolve_forecasting_model_configs(
     *,
     seasonality_m: int = 24,
     context_length: int = 72,
+    accelerator: str | None = None,
+    devices: int | str | list[int] | None = None,
 ) -> dict[str, ForecastModelConfig]:
     """Validate requested names and preserve their configured order."""
     configs = build_forecasting_model_configs(
         seasonality_m=seasonality_m,
         context_length=context_length,
+        accelerator=accelerator,
+        devices=devices,
     )
     requested = list(dict.fromkeys(names))
     unknown = [name for name in requested if name not in configs]

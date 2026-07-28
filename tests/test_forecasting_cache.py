@@ -159,6 +159,7 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "cfg_get_int", lambda s, o, d, cfg=None: int_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_str", lambda s, o, d, cfg=None: str_map.get((s, o), d))
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path / "run1")
+    monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
     (tmp_path / "run1").mkdir()
 
     calls = {"backtest": 0, "detect": 0}

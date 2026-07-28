@@ -209,6 +209,9 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         pipeline, "_load_raw_hourly_series", lambda **_kwargs: [series.to_frame()]
     )
     monkeypatch.setattr(pipeline, "_build_output_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        pipeline, "resolve_forecasting_devices", lambda _request: ("cpu",)
+    )
 
     def fake_detect(values, strategies, *_args, base_key, **_kwargs):
         synthetic = base_key.get("experiment") == "foundation-preprocessing-synthetic-v1"
