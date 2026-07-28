@@ -581,6 +581,8 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         device: str | None = None,
         seed: int = 13,
     ) -> None:
+        if stride <= 0:
+            raise ValueError("stride must be positive")
         super().__init__(window_size=window_size, stride=stride, device=device, seed=seed)
         self.batch_size = batch_size
         self.pretext_epochs = pretext_epochs
@@ -604,8 +606,8 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         return self.generator
 
     def _resolve_training_stride(self, num_raw_windows: int) -> int:
-        """Stride that keeps the training-window count near ``max_windows``."""
-        return resolve_training_stride(num_raw_windows, self.max_windows)
+        """Honor the requested stride while keeping at most ``max_windows``."""
+        return max(self.stride, resolve_training_stride(num_raw_windows, self.max_windows))
 
     def _fit_normalized(self, train_values: np.ndarray) -> None:
         """Run the two CARLA stages: contrastive pretext, then head classification.
@@ -860,7 +862,7 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
             raise RuntimeError("Model must be fitted before evaluation")
         head_losses = [[] for _ in range(self.num_heads)]
         self.classification_model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in loader:
                 anchors = batch["anchor"].float().to(self.device).transpose(1, 2)
                 nneighbors = batch["NNeighbor"].float().to(self.device).transpose(1, 2)
@@ -880,7 +882,7 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
         probabilities = []
         self.classification_model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in loader:
                 batch = batch.float().to(self.device).transpose(1, 2)
                 logits = self.classification_model(batch)[self.selected_head_]
@@ -896,7 +898,7 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
         probabilities = []
         self.classification_model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in loader:
                 batch = batch.float().to(self.device).transpose(1, 2)
                 logits = self.classification_model(batch)[head_index]
