@@ -52,11 +52,10 @@ def test_hourly_mean_averages_only_useful_readings() -> None:
     assert out.iloc[0] == round(expected, 10) or abs(out.iloc[0] - expected) < 1e-9
 
 
-def test_hourly_mean_nan_when_fewer_than_min_useful() -> None:
-    # Solo 2 lecturas por encima del umbral -> NaN (min_useful=3).
-    vals = [10.0, 10.0] + [1.0] * 10
+def test_hourly_mean_keeps_one_useful_reading() -> None:
+    vals = [10.0] + [np.nan] * 11
     out = hourly_mean(_series_5m(vals), "NO2")["NO2"]
-    assert out.isna().all()
+    assert out.tolist() == [10.0]
 
 
 def test_hourly_mean_frozen_counts_as_below_threshold() -> None:
