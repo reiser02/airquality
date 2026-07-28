@@ -106,7 +106,7 @@ def save_station_coverage(
         axis.text(
             1.015,
             position,
-            f"{missing_pct:5.1f}%   {len(blocks):>5}",
+            f"{missing_pct:6.2f}%   {len(blocks):>5}",
             transform=summary_transform,
             ha="left",
             va="center",
@@ -142,7 +142,9 @@ def save_station_coverage(
     figure.text(
         0.06,
         1.0 - 0.4 / height,
-        "Datos de 5 minutos agregados con preprocess(); cada hueco separa bloques observados continuos.",
+        "Preprocesado: se descartan tramos congelados, se promedia por hora y las repeticiones "
+        "horarias pasan a NaN.\n"
+        "El porcentaje cuenta horas ausentes, no huecos; cada hueco separa bloques continuos.",
         ha="left",
         va="top",
         fontsize=9,
@@ -239,7 +241,9 @@ def save_combined_station_coverage(
         axis.text(
             1.015,
             position,
-            f"{co:5.1f}%    {no2:5.1f}%" if co is not None and no2 is not None else "   n/d       n/d",
+            f"{co:6.2f}%    {no2:6.2f}%"
+            if co is not None and no2 is not None
+            else "    n/d        n/d",
             transform=summary_transform,
             ha="left",
             va="center",
@@ -272,7 +276,9 @@ def save_combined_station_coverage(
     figure.text(
         0.06,
         1.0 - 0.4 / height,
-        "Datos de 5 minutos agregados con preprocess(); cada contaminante ocupa una banda.",
+        "Preprocesado: se descartan tramos congelados, se promedia por hora y las repeticiones "
+        "horarias pasan a NaN.\n"
+        "El porcentaje cuenta horas ausentes, no huecos; cada contaminante ocupa una banda.",
         ha="left",
         va="top",
         fontsize=9,
