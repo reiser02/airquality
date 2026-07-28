@@ -37,7 +37,10 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.get("training", "model_names").split(",") == darts_models
     assert cfg.get("imputation", "model_names").split(",") == [
         *darts_models,
+        "Prophet",
         "TSPulse",
+        "interp",
+        "LinearInterp",
     ]
     assert cfg.getboolean("imputation", "strict_artifacts") is True
     assert cfg.getint("imputation", "max_workers") == 1
@@ -49,6 +52,7 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.get("forecasting", "imputation_model") == "TSPulse"
     assert cfg.getint("forecasting", "max_imputation_gap") == 5
     assert cfg.get("forecasting", "pollutant") == "NO2"
+    assert cfg.get("forecasting", "device") == "multi-gpu"
     assert not cfg.has_option("forecasting", "raw_base_dir")
     assert cfg.getboolean("forecasting", "foundation_preprocessing_test") is True
     assert cfg.getint("forecasting", "foundation_test_seed") == 1001
