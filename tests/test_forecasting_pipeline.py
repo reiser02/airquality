@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -465,6 +467,54 @@ def test_only_complete_backtests_are_cacheable():
     assert not cp._cacheable_backtest({**complete, "rmse": float("nan")})
 
 
+def test_resolve_forecasting_devices_uses_visible_gpus_and_cpu_fallback(
+    monkeypatch,
+):
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+
+    assert cp.resolve_forecasting_devices("multi-gpu") == ("cuda:0", "cuda:1")
+    assert cp.resolve_forecasting_devices("cuda") == ("cuda:0",)
+    assert cp.resolve_forecasting_devices("cpu") == ("cpu",)
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    assert cp.resolve_forecasting_devices("multi-gpu") == ("cpu",)
+    with pytest.raises(ValueError, match="device"):
+        cp.resolve_forecasting_devices("tpu")
+
+
+def test_gpu_worker_preserves_train_and_inference_timings(monkeypatch):
+    series = _seasonal_series(n=120)
+    task = cp._BacktestTask(
+        train_series=series.iloc[:80],
+        test_series=series.iloc[80:],
+        mase_insample=series.iloc[:80],
+        model_name="TiDE",
+        size_k=8,
+        test_target_start=series.index[88],
+        seasonality_m=24,
+        freq="h",
+        validation_len=16,
+        validation_stride=4,
+        forecast_stride=4,
+        context_len=8,
+    )
+    seen = {}
+    monkeypatch.setattr(cp, "_FORECAST_WORKER_GPU", 1)
+
+    def fake_configs(names, **kwargs):
+        seen.update(kwargs)
+        return {names[0]: object()}
+
+    expected = {"train_seconds": 1.25, "inference_seconds": 0.5}
+    monkeypatch.setattr(cp, "resolve_forecasting_model_configs", fake_configs)
+    monkeypatch.setattr(cp, "backtest_forecast", lambda *args, **kwargs: expected)
+
+    assert cp._run_gpu_backtest(task) is expected
+    assert seen["accelerator"] == "gpu"
+    assert seen["devices"] == [1]
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end orchestration
 # --------------------------------------------------------------------------- #
@@ -542,6 +592,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     monkeypatch.setattr(cp, "_detect_for_strategies", fake_detect)
     monkeypatch.setattr(cp, "backtest_forecast", fake_backtest)
+    monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
 
     artifacts = cp.run_benchmark_from_config()
 
@@ -592,6 +643,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cp, "cfg_get_bool", lambda s, o, d, cfg=None: False)  # no disk cache
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
+    monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
 
     artifacts = cp.run_benchmark_from_config()
 
@@ -678,6 +730,7 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "cfg_get_str", lambda s, o, d, cfg=None: str_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_bool", lambda s, o, d, cfg=None: False)  # no disk cache
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
+    monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
 
     def clear_all(_series, mask):
         return pd.Series(False, index=mask.index, name=mask.name)
@@ -690,6 +743,25 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
 
 
 def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, fn, task):
+            submitted.append(task)
+            future = Future()
+            future.set_result(fn(task))
+            return future
+
+        def shutdown(self, wait=True):
+            assert wait
+
+    class FakeQueue:
+        def close(self):
+            pass
+
+        def join_thread(self):
+            pass
+
     def fake_loader(**_kwargs):
         series = _seasonal_series(n=900, name="ST0", seed=2)
         series.iloc[300:330] = np.nan
@@ -722,6 +794,16 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
     monkeypatch.setattr(
         cp,
+        "resolve_forecasting_devices",
+        lambda _request: ("cuda:0", "cuda:1"),
+    )
+    monkeypatch.setattr(
+        cp,
+        "_create_gpu_executor",
+        lambda _indices: (FakeExecutor(), FakeQueue()),
+    )
+    monkeypatch.setattr(
+        cp,
         "build_detection_strategy",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("common foundation reference must not build training arms")
@@ -729,13 +811,16 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         cp,
-        "backtest_forecast",
-        lambda *args, **kwargs: {
+        "_run_gpu_backtest",
+        lambda task: {
             "rmse": 1.0,
             "mase": 1.0,
-            "n_test_predictions": 8,
+            "train_seconds": 1.25,
+            "inference_seconds": 0.5,
+            "n_test_predictions": task.size_k,
             "n_forecasts": 1,
-            "n_unique_targets": 8,
+            "n_expected_forecasts": 1,
+            "n_unique_targets": task.size_k,
         },
     )
 
@@ -745,6 +830,9 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     assert set(artifacts["results_df"]["arm"]) == {"raw"}
     assert set(artifacts["results_df"]["model_mode"]) == {"foundation"}
     assert len(artifacts["results_df"]) == 2
+    assert len(submitted) == 2
+    assert (artifacts["results_df"]["train_seconds"] == 1.25).all()
+    assert (artifacts["results_df"]["inference_seconds"] == 0.5).all()
     assert artifacts["detection_df"].empty
     assert list(pd.read_csv(tmp_path / "detection.csv").columns) == [
         "series",

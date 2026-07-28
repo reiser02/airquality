@@ -74,3 +74,17 @@ def test_local_model_fits_only_latest_series() -> None:
     assert isinstance(model, LocalModel)
     assert calls["init"] == {"season_length": 24}
     assert calls["fit"] == (latest, False)
+
+
+def test_forecasting_registry_overrides_worker_gpu() -> None:
+    configs = resolve_forecasting_model_configs(
+        ["TiDE", "Chronos2"],
+        accelerator="gpu",
+        devices=[2],
+    )
+
+    for config in configs.values():
+        trainer = config.kwargs["pl_trainer_kwargs"]
+        assert trainer["accelerator"] == "gpu"
+        assert trainer["devices"] == [2]
+        assert trainer["precision"] == "16-mixed"

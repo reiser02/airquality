@@ -45,7 +45,9 @@ Run with::
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
+import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
@@ -204,6 +206,112 @@ class ForecastRegime:
     horizon: int
     stride: int
     validation_len: int
+
+
+@dataclass(frozen=True)
+class _BacktestTask:
+    """CPU inputs for one forecast backtest executed by a GPU worker."""
+
+    train_series: pd.Series
+    test_series: pd.Series
+    mase_insample: pd.Series
+    model_name: str
+    size_k: int
+    test_target_start: pd.Timestamp
+    seasonality_m: int
+    freq: str
+    validation_len: int
+    validation_stride: int
+    forecast_stride: int
+    context_len: int
+
+
+_FORECAST_WORKER_GPU: int | None = None
+
+
+def resolve_forecasting_devices(requested: str) -> tuple[str, ...]:
+    """Resolve a forecasting request to visible CUDA devices or CPU fallback."""
+    choice = str(requested).strip().lower()
+    if choice not in {"cpu", "cuda", "multi-gpu"}:
+        raise ValueError("`[forecasting] device` debe ser cpu, cuda o multi-gpu")
+    if choice == "cpu":
+        return ("cpu",)
+    try:
+        import torch
+
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        count = 0
+    if count == 0:
+        return ("cpu",)
+    if choice == "cuda":
+        return ("cuda:0",)
+    return tuple(f"cuda:{index}" for index in range(count))
+
+
+def _bind_forecast_worker(device_queue: Any) -> None:
+    """Claim exactly one GPU for the lifetime of a spawned forecast worker."""
+    import torch
+
+    global _FORECAST_WORKER_GPU
+    _FORECAST_WORKER_GPU = int(device_queue.get())
+    torch.cuda.set_device(_FORECAST_WORKER_GPU)
+
+
+def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
+    """Build and run one Darts model on the GPU owned by this worker."""
+    if _FORECAST_WORKER_GPU is None:
+        raise RuntimeError("El worker de forecasting no tiene una GPU asignada")
+    model_config = resolve_forecasting_model_configs(
+        [task.model_name],
+        seasonality_m=task.seasonality_m,
+        context_length=task.context_len,
+        accelerator="gpu",
+        devices=[_FORECAST_WORKER_GPU],
+    )[task.model_name]
+    try:
+        return backtest_forecast(
+            task.train_series,
+            task.test_series,
+            task.model_name,
+            size_k=task.size_k,
+            test_target_start=task.test_target_start,
+            seasonality_m=task.seasonality_m,
+            freq=task.freq,
+            mase_insample=task.mase_insample,
+            validation_len=task.validation_len,
+            validation_stride=task.validation_stride,
+            forecast_stride=task.forecast_stride,
+            context_len=task.context_len,
+            model_config=model_config,
+        )
+    finally:
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+
+
+def _uses_gpu_worker(model_config: Any) -> bool:
+    """Return whether a model owns a Lightning trainer and benefits from a GPU."""
+    return "pl_trainer_kwargs" in model_config.kwargs
+
+
+def _create_gpu_executor(
+    gpu_indices: tuple[int, ...],
+) -> tuple[ProcessPoolExecutor, Any]:
+    """Create one spawned, device-bound worker per visible GPU."""
+    spawn_context = mp.get_context("spawn")
+    device_queue = spawn_context.Queue()
+    for gpu_index in gpu_indices:
+        device_queue.put(gpu_index)
+    executor = ProcessPoolExecutor(
+        max_workers=len(gpu_indices),
+        mp_context=spawn_context,
+        initializer=_bind_forecast_worker,
+        initargs=(device_queue,),
+    )
+    return executor, device_queue
 
 
 def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
@@ -378,7 +486,14 @@ def run_benchmark_from_config(
             "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
         )
     seed = cfg_get_int("forecasting", "seed", 13)
-    device = cfg_get_str("forecasting", "device", "cpu")
+    device_request = cfg_get_str("forecasting", "device", "multi-gpu")
+    forecast_devices = resolve_forecasting_devices(device_request)
+    gpu_indices = tuple(
+        int(device.split(":", 1)[1])
+        for device in forecast_devices
+        if device.startswith("cuda:")
+    )
+    detection_device = "cuda" if gpu_indices else "cpu"
     threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
     max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
     detectors = list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
@@ -395,6 +510,8 @@ def run_benchmark_from_config(
         forecast_models,
         seasonality_m=seasonality_m,
         context_length=context_len,
+        accelerator="gpu" if gpu_indices else "cpu",
+        devices=[gpu_indices[0]] if gpu_indices else 1,
     )
     forecast_models = list(forecast_model_configs)
     foundation_model_configs = {
@@ -538,7 +655,7 @@ def run_benchmark_from_config(
             "split_policy": "fixed-common-detection-support-v1",
             "regimes": [asdict(regime) for regime in regimes],
             "seed": seed,
-            "device": device,
+            "device": device_request,
             "threshold_k": threshold_k,
             "max_detection_rate": max_detection_rate,
             "detectors": sorted(resolved_detectors),
@@ -599,6 +716,13 @@ def run_benchmark_from_config(
     foundation_preprocessing_rows: list[dict[str, Any]] = []
     detection_rows: list[dict[str, Any]] = []
     selection_rows: list[dict[str, Any]] = []
+    gpu_executor: ProcessPoolExecutor | None = None
+    device_queue: Any | None = None
+    if gpu_indices and any(
+        _uses_gpu_worker(config) for config in forecast_model_configs.values()
+    ):
+        gpu_executor, device_queue = _create_gpu_executor(gpu_indices)
+    print(f"[info] Forecast devices: {','.join(forecast_devices)}")
     for df in series_dfs:
         series = df.iloc[:, 0]
         name = str(series.name)
@@ -626,7 +750,7 @@ def run_benchmark_from_config(
             context_kwargs={
                 "detectors": resolved_detectors,
                 "seed": seed,
-                "device": device,
+                "device": detection_device,
                 "freq": freq,
                 "injection_seed": injection_seed,
                 "min_selection_points": min_selection_points,
@@ -772,6 +896,39 @@ def run_benchmark_from_config(
             return train_by_arm[arm.name]
 
         test_fp = series_fingerprint(test_series)
+        series_backtest_rows: dict[int, dict[str, Any]] = {}
+        pending_gpu: dict[
+            Any, tuple[int, dict[str, Any], str, str, dict[str, Any]]
+        ] = {}
+        backtest_ordinal = 0
+
+        def store_backtest_row(
+            ordinal: int,
+            common: dict[str, Any],
+            model_name: str,
+            model_mode: str,
+            result: dict[str, Any],
+        ) -> None:
+            series_backtest_rows[ordinal] = {
+                **common,
+                "model": model_name,
+                "model_mode": model_mode,
+                # Timings are measured inside the worker around fit/predict only.
+                "rmse": result["rmse"] / scale_ref,
+                "mase": result["mase"],
+                "train_seconds": result.get("train_seconds", float("nan")),
+                "inference_seconds": result.get("inference_seconds", float("nan")),
+                "scale_ref": scale_ref,
+                "n_test_predictions": result["n_test_predictions"],
+                "n_forecasts": result.get("n_forecasts", 0),
+                "n_expected_forecasts": result.get("n_expected_forecasts", 0),
+                "n_unique_targets": result.get("n_unique_targets", 0),
+                "origin_mae_mean": result.get("origin_mae_mean", float("nan")),
+                "origin_mae_std": result.get("origin_mae_std", float("nan")),
+                "origin_rmse_mean": result.get("origin_rmse_mean", float("nan")),
+                "origin_rmse_std": result.get("origin_rmse_std", float("nan")),
+            }
+
         for regime in regimes:
             for arm in arms:
                 detection = detections.get(arm.strategy) if arm.strategy else None
@@ -815,6 +972,8 @@ def run_benchmark_from_config(
                     forecast_model_config = forecast_model_configs[model_name]
                     if not forecast_model_config.uses_training_arms and arm.name != RAW_ARM:
                         continue
+                    ordinal = backtest_ordinal
+                    backtest_ordinal += 1
                     backtest_key = {
                         **base_key,
                         "train_fp": train_fp,
@@ -837,8 +996,37 @@ def run_benchmark_from_config(
                     }
                     res = cache.get("backtest", backtest_key)
                     if res is None:
+                        arm_train = train_for(arm)
+                        if gpu_executor is not None and _uses_gpu_worker(
+                            forecast_model_config
+                        ):
+                            future = gpu_executor.submit(
+                                _run_gpu_backtest,
+                                _BacktestTask(
+                                    train_series=arm_train,
+                                    test_series=test_series,
+                                    mase_insample=train_raw,
+                                    model_name=model_name,
+                                    size_k=regime.horizon,
+                                    test_target_start=test_target_start,
+                                    seasonality_m=seasonality_m,
+                                    freq=freq,
+                                    validation_len=regime.validation_len,
+                                    validation_stride=regime.stride,
+                                    forecast_stride=regime.stride,
+                                    context_len=context_len,
+                                ),
+                            )
+                            pending_gpu[future] = (
+                                ordinal,
+                                common,
+                                model_name,
+                                forecast_model_config.mode,
+                                backtest_key,
+                            )
+                            continue
                         res = backtest_forecast(
-                            train_for(arm),
+                            arm_train,
                             test_series,
                             model_name,
                             size_k=regime.horizon,
@@ -856,28 +1044,21 @@ def run_benchmark_from_config(
                         )
                         if _cacheable_backtest(res):
                             cache.put("backtest", backtest_key, res)
-                    rows.append(
-                        {
-                            **common,
-                            "model": model_name,
-                            "model_mode": forecast_model_config.mode,
-                            # RMSE scaled at row-assembly (the cache keeps raw-unit
-                            # errors, so entries stay valid if scaling evolves).
-                            "rmse": res["rmse"] / scale_ref,
-                            "mase": res["mase"],
-                            "train_seconds": res.get("train_seconds", float("nan")),
-                            "inference_seconds": res.get("inference_seconds", float("nan")),
-                            "scale_ref": scale_ref,
-                            "n_test_predictions": res["n_test_predictions"],
-                            "n_forecasts": res.get("n_forecasts", 0),
-                            "n_expected_forecasts": res.get("n_expected_forecasts", 0),
-                            "n_unique_targets": res.get("n_unique_targets", 0),
-                            "origin_mae_mean": res.get("origin_mae_mean", float("nan")),
-                            "origin_mae_std": res.get("origin_mae_std", float("nan")),
-                            "origin_rmse_mean": res.get("origin_rmse_mean", float("nan")),
-                            "origin_rmse_std": res.get("origin_rmse_std", float("nan")),
-                        }
+                    store_backtest_row(
+                        ordinal,
+                        common,
+                        model_name,
+                        forecast_model_config.mode,
+                        res,
                     )
+
+        for future in as_completed(pending_gpu):
+            ordinal, common, model_name, model_mode, backtest_key = pending_gpu[future]
+            res = future.result()
+            if _cacheable_backtest(res):
+                cache.put("backtest", backtest_key, res)
+            store_backtest_row(ordinal, common, model_name, model_mode, res)
+        rows.extend(series_backtest_rows[index] for index in sorted(series_backtest_rows))
 
         if foundation_test_enabled:
             for regime in regimes:
@@ -914,7 +1095,7 @@ def run_benchmark_from_config(
                         context_kwargs={
                             "detectors": resolved_detectors,
                             "seed": seed,
-                            "device": device,
+                            "device": detection_device,
                             "freq": freq,
                             "injection_seed": injection_seed,
                             "min_selection_points": min_selection_points,
@@ -1115,6 +1296,11 @@ def run_benchmark_from_config(
                         del model, scaler, foundation_insample
                         gc.collect()
 
+    if gpu_executor is not None:
+        gpu_executor.shutdown(wait=True)
+    if device_queue is not None:
+        device_queue.close()
+        device_queue.join_thread()
     print(f"[cache] {cache.stats()}")
     results_df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     summary_df = _summarize(results_df)
