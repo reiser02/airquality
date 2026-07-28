@@ -193,6 +193,7 @@ class AnomalyBenchmarkConfig:
     models: list[str] | None = None
     device: str = "cpu"
     seed: int = 13
+    carla_stride: int = 1
     # unlabeled mode:
     threshold_k: float = DEFAULT_THRESHOLD_K
     max_detection_rate: float = DEFAULT_MAX_DETECTION_RATE
@@ -534,7 +535,10 @@ def _run_detector(
     mode = normalize_mode(config.mode)
     score_case = _score_case_synthetic if mode == "synthetic" else _score_case_unlabeled
     model_cls = resolve_model_class(model_name)
-    model_kwargs = _filter_model_kwargs(model_cls, {"device": device})
+    requested_kwargs: dict[str, object] = {"device": device}
+    if model_name in {"CARLABase", "CARLAGenIAS"}:
+        requested_kwargs["stride"] = config.carla_stride
+    model_kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
 
     per_case = []
     total = len(cases)

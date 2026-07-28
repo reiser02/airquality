@@ -68,6 +68,13 @@ def test_carla_pretext_loss_accepts_partial_training_batch():
     loss.backward()
 
 
+def test_carla_honors_explicit_training_stride():
+    model = CARLABase(device="cpu", stride=5, max_windows=100)
+
+    assert model._resolve_training_stride(250) == 5
+    assert model._resolve_training_stride(1000) == 10
+
+
 def test_pooled_windows_do_not_cross_segment_boundaries():
     windows = pooled_windows_nd(
         [

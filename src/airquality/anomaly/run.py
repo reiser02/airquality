@@ -33,6 +33,7 @@ def build_config_from_args(args: argparse.Namespace) -> AnomalyBenchmarkConfig:
         models=args.models if args.models else _csv_default(cfg_get_str("anomaly", "models", "all")),
         device=args.device,
         seed=args.seed,
+        carla_stride=args.carla_stride,
         threshold_k=args.threshold_k,
         max_detection_rate=args.max_detection_rate,
         eval_seed=args.eval_seed,
@@ -60,6 +61,12 @@ def main() -> None:
     parser.add_argument("--models", nargs="*", default=None, help="Model names, or 'all' (default from config)")
     parser.add_argument("--device", default=cfg_get_str("anomaly", "device", "cpu"))
     parser.add_argument("--seed", type=int, default=cfg_get_int("anomaly", "seed", 13))
+    parser.add_argument(
+        "--carla-stride",
+        type=int,
+        default=cfg_get_int("anomaly", "carla_stride", 1),
+        help="Training-window stride for CARLA variants (1 preserves full sampling)",
+    )
     parser.add_argument(
         "--threshold-k",
         type=float,
