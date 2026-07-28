@@ -51,12 +51,13 @@ PLOT_GUIDE = """## Figuras
 
 - `retention_overview.png`: resume el historial raw. Compara, para short y long, el porcentaje y la cantidad absoluta de bloques usados y horas efectivas de entrenamiento; las horas ya descuentan la reserva de validación.
 - `block_length_distribution.png`: distribución de longitudes de los bloques raw. Las líneas verticales marcan el mínimo de entrenamiento y el mínimo del bloque anfitrión que además debe alojar la validación.
+- `detected_block_length_distribution.png`: compara la distribución raw con la resultante tras retirar las anomalías de cada estrategia. Un desplazamiento hacia bloques cortos indica fragmentación del historial.
 - `support_overview.png`: horas observadas e imputadas dentro de bloques válidos para cada brazo. La etiqueta indica también cuántos bloques alcanzan el mínimo del régimen.
 - `support_by_series.png`: soporte válido de cada brazo respecto a raw para cada serie. Un valor de 100 conserva el mismo número de horas; menos de 100 pierde soporte y más de 100 lo amplía.
 - `valid_blocks_by_series.png`: cantidad absoluta de bloques que alcanzan el mínimo short o long en cada serie y brazo. Más bloques no implica necesariamente más horas, porque sus longitudes difieren.
 - `block_length_survival.png`: para cada longitud del eje X muestra cuántos bloques tienen al menos esa duración. Permite ver cómo detección e imputación fragmentan o conectan el historial.
-- `gap_recovery.png`: descompone las horas válidas ganadas por imputación entre horas observadas desbloqueadas, anomalías imputadas y huecos previos imputados.
-- `detection_strategy_summary.png`: muestra qué porcentaje del historial pudo puntuar cada estrategia y qué porcentaje terminó retirando como anomalía.
+- `gap_recovery.png`: descompone las horas válidas ganadas por imputación entre horas observadas desbloqueadas, anomalías imputadas y huecos previos imputados; las etiquetas muestran el total y el reparto porcentual.
+- `detection_strategy_summary.png`: muestra qué porcentaje del historial pudo puntuar cada estrategia y qué porcentaje terminó retirando como anomalía. Una hora recibe score cuando hay suficientes salidas válidas de detectores para que la estrategia pueda clasificarla.
 - `imputation_age.png`: distribución entre series de la antigüedad de las horas imputadas que acabaron dentro de bloques válidos, medida desde el inicio del test.
 """
 
@@ -208,6 +209,79 @@ def _save_block_distribution(
         "de entrenamiento y de bloque anfitrión.",
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.86))
+    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
+
+
+def _save_detected_block_distribution(
+    path: Path, blocks: pd.DataFrame, table: pd.DataFrame
+) -> bool:
+    raw = blocks.loc[blocks["arm"] == "raw", "hours"].to_numpy(dtype=float)
+    detected = blocks.loc[blocks["stage"] == "detected"]
+    strategies = list(dict.fromkeys(detected["strategy"].astype(str)))
+    if not len(raw) or not strategies:
+        return False
+    maximum = max(float(blocks["hours"].max()), 2.0)
+    bins = np.geomspace(1, maximum + 1, 45)
+    requirements = (
+        table.loc[table["arm"] == "raw"]
+        .groupby("regime", sort=False)["minimum_hours"]
+        .first()
+    )
+
+    figure, axes = plt.subplots(
+        1,
+        len(strategies),
+        figsize=(5.2 * len(strategies), 6),
+        facecolor=FIGURE_FACE,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    for axis, strategy in zip(axes[0], strategies, strict=True):
+        style_axis(axis)
+        lengths = detected.loc[detected["strategy"] == strategy, "hours"].to_numpy(
+            dtype=float
+        )
+        axis.hist(
+            lengths,
+            bins=bins,
+            color=DETECTED_COLOR,
+            edgecolor="#fffaf2",
+            alpha=0.8,
+            label="Tras detección",
+        )
+        axis.hist(
+            raw,
+            bins=bins,
+            histtype="step",
+            color=RAW_COLOR,
+            linewidth=1.8,
+            label="Raw",
+        )
+        for regime, minimum in requirements.items():
+            axis.axvline(
+                minimum,
+                color=IMPUTED_COLOR if regime == "long" else RECOVERED_COLOR,
+                linestyle="--",
+                label=f"Mínimo {regime}: {int(minimum)} h",
+            )
+        axis.set_xscale("log")
+        axis.set_yscale("log")
+        axis.set_xlabel("Longitud del bloque (h, escala log)")
+        axis.set_title(strategy, loc="left", fontweight="bold", color=TEXT_COLOR)
+        axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
+    axes[0, 0].set_ylabel("Número de bloques (escala log)")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="lower center", ncols=4, fontsize=8)
+    _figure_header(
+        figure,
+        "Distribución de bloques después de retirar anomalías",
+        "Raw se muestra como contorno; más masa en longitudes cortas tras detectar indica "
+        "que las observaciones retiradas fragmentaron el historial.",
+    )
+    figure.tight_layout(rect=(0.02, 0.12, 1, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
@@ -420,10 +494,35 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame) -> bool:
             values = current[column].to_numpy(dtype=float)
             axis.bar(positions, values, bottom=bottom, color=color, edgecolor=EDGE_COLOR, label=label)
             bottom += values
+        for position, (_, row) in zip(positions, current.iterrows(), strict=True):
+            total = float(
+                row["observed_unlocked"]
+                + row["valid_imputed_anomaly_hours"]
+                + row["valid_imputed_preexisting_gap_hours"]
+            )
+            if total <= 0:
+                continue
+            observed_pct = 100.0 * float(row["observed_unlocked"]) / total
+            anomaly_pct = 100.0 * float(row["valid_imputed_anomaly_hours"]) / total
+            gap_pct = 100.0 * float(row["valid_imputed_preexisting_gap_hours"]) / total
+            axis.text(
+                position,
+                total,
+                (
+                    f"{int(total):,} h\n"
+                    f"Obs. {observed_pct:.1f}%\n"
+                    f"Anom. {anomaly_pct:.1f}% | Gap {gap_pct:.1f}%"
+                ).replace(",", "."),
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                color=TEXT_COLOR,
+            )
         axis.set_xticks(positions, current["arm"], rotation=30, ha="right", fontsize=8)
         axis.set_ylabel("Horas validas ganadas")
         axis.set_title(regime.capitalize(), loc="left", fontweight="bold")
         axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.55)
+        axis.margins(y=0.22)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncols=3, fontsize=8)
     _figure_header(
@@ -464,8 +563,8 @@ def _save_detection_summary(path: Path, detection: pd.DataFrame) -> bool:
     _figure_header(
         figure,
         "Cobertura y agresividad de las estrategias de detección",
-        "Cobertura indica qué parte del historial recibió score; observaciones retiradas "
-        "indica qué parte del historial raw se marcó como anomalía.",
+        "Una hora recibe score cuando hay suficientes salidas válidas de detectores para "
+        "clasificarla; gaps, bloques demasiado cortos y fallos quedan sin score.",
     )
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -522,6 +621,10 @@ def render_plots(run_dir: Path) -> list[Path]:
         (
             "block_length_distribution.png",
             lambda p: _save_block_distribution(p, blocks, series),
+        ),
+        (
+            "detected_block_length_distribution.png",
+            lambda p: _save_detected_block_distribution(p, blocks, series),
         ),
         ("support_overview.png", lambda p: _save_support_overview(p, series)),
         (

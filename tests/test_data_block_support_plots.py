@@ -39,7 +39,12 @@ def test_render_plots_reads_training_support_csv(tmp_path) -> None:
     pd.DataFrame(rows).to_csv(tmp_path / "series_summary.csv", index=False)
     pd.DataFrame(
         [
-            {"arm": arm, "hours": hours}
+            {
+                "arm": arm,
+                "hours": hours,
+                "stage": "raw" if arm == "raw" else "detected" if "noimpute" in arm else "imputed",
+                "strategy": "none" if arm == "raw" else "unlabeled",
+            }
             for arm, hours in (
                 ("raw", 150),
                 ("unlabeled+noimpute", 90),
@@ -63,6 +68,7 @@ def test_render_plots_reads_training_support_csv(tmp_path) -> None:
     assert {path.name for path in paths} == {
         "retention_overview.png",
         "block_length_distribution.png",
+        "detected_block_length_distribution.png",
         "support_overview.png",
         "support_by_series.png",
         "valid_blocks_by_series.png",
@@ -109,7 +115,15 @@ def test_render_plots_handles_zero_gain_and_missing_strategy_age(tmp_path) -> No
             )
     pd.DataFrame(rows).to_csv(tmp_path / "series_summary.csv", index=False)
     pd.DataFrame(
-        [{"arm": arm, "hours": 100} for arm in pd.DataFrame(rows)["arm"].unique()]
+        [
+            {
+                "arm": arm,
+                "hours": 100,
+                "stage": "raw" if arm == "raw" else "detected" if "noimpute" in arm else "imputed",
+                "strategy": "none" if arm == "raw" else "unlabeled",
+            }
+            for arm in pd.DataFrame(rows)["arm"].unique()
+        ]
     ).to_csv(tmp_path / "blocks.csv", index=False)
     pd.DataFrame(
         [{"strategy": "unlabeled", "observed_hours": 100, "scored_hours": 100, "flagged_hours_full": 0}]
@@ -120,6 +134,7 @@ def test_render_plots_handles_zero_gain_and_missing_strategy_age(tmp_path) -> No
     assert {path.name for path in paths} == {
         "retention_overview.png",
         "block_length_distribution.png",
+        "detected_block_length_distribution.png",
         "support_overview.png",
         "support_by_series.png",
         "valid_blocks_by_series.png",
