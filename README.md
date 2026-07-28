@@ -274,8 +274,16 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
+- `plot_store.csv.gz`: compressed actual values and per-model predictions used by the plots
 - `plot_images.csv`: manifest of saved plot images
 - `plots/gap_*/...png`: per-series benchmark plots
+
+Regenerate every figure from those saved CSVs without rerunning any model:
+
+```bash
+uv run python -m airquality.imputation.plot_montecarlo_results \
+    reports/benchmark/montecarlo_YYYYMMDD_HHMMSS
+```
 
 ### Fine-tune TSPulse
 
