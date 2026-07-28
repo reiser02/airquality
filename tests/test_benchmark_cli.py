@@ -5,6 +5,10 @@ from pathlib import Path
 import pandas as pd
 
 from airquality.benchmark import main, run_benchmark_from_config
+from airquality.imputation.plot_montecarlo_results import (
+    load_plot_store,
+    main as plot_main,
+)
 
 
 def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
@@ -51,6 +55,8 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     assert (tmp_path / "results_mc.csv").exists()
     assert (tmp_path / "summary_mc.csv").exists()
     assert (tmp_path / "ranking_by_seed.csv").exists()
+    assert artifacts["plot_store_path"] == tmp_path / "plot_store.csv.gz"
+    assert (tmp_path / "plot_store.csv.gz").exists()
     assert (tmp_path / "plot_images.csv").exists()
     assert (tmp_path / "plots" / "gap_1" / "Series_A.png").exists()
     # Aggregated metric-by-gap artifacts (previously never generated).
@@ -64,6 +70,17 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
 
     plot_manifest_df = pd.read_csv(tmp_path / "plot_images.csv")
     assert list(plot_manifest_df["image_path"]) == ["plots/gap_1/Series_A.png"]
+
+    restored = load_plot_store(tmp_path / "plot_store.csv.gz")
+    restored_payload = restored[1]["series"]["Series A"]
+    pd.testing.assert_series_equal(
+        restored_payload["actual"], plot_store[1]["series"]["Series A"]["actual"],
+        check_freq=False, check_names=False,
+    )
+    image_path = tmp_path / "plots" / "gap_1" / "Series_A.png"
+    image_path.unlink()
+    plot_main([str(tmp_path)])
+    assert image_path.exists()
 
 
 def test_main_prints_ranking_summary(monkeypatch, capsys) -> None:
@@ -82,6 +99,7 @@ def test_main_prints_ranking_summary(monkeypatch, capsys) -> None:
             "summary_mc_df": summary,
             "ranking_by_seed_df": pd.DataFrame(),
             "plot_manifest_df": pd.DataFrame(),
+            "plot_store_path": Path("/tmp/bench/plot_store.csv.gz"),
         },
     )
 
