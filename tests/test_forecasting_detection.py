@@ -277,6 +277,69 @@ def test_forecasting_passes_weighted_sub_pca(monkeypatch):
     assert captured["weighted"] is True
     assert list(scores) == ["Sub_PCA"]
 
+
+def test_forecasting_passes_configured_carla_stride(monkeypatch):
+    captured = {}
+    segment = _seasonal_series(n=30)
+
+    monkeypatch.setattr(detection_module, "resolve_model_class", lambda _name: object)
+    monkeypatch.setattr(
+        detection_module,
+        "_filter_model_kwargs",
+        lambda _model_cls, kwargs: captured.update(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(item)) for item in segments],
+    )
+
+    scores = detection_module._score_segments(
+        ["CARLABase"],
+        [segment],
+        seed=13,
+        device="cpu",
+        freq="h",
+        carla_stride=5,
+    )
+
+    assert captured["stride"] == 5
+    assert list(scores) == ["CARLABase"]
+
+
+def test_selection_ranking_passes_configured_carla_stride(monkeypatch):
+    captured = []
+    series = _seasonal_series(n=500)
+    context = SeriesDetectionContext(
+        series, detectors=["CARLABase"], carla_stride=5
+    )
+
+    def fake_fit_segments(*args, **kwargs):
+        captured.append(kwargs["model_kwargs"])
+        return object()
+
+    monkeypatch.setattr(detection_module, "fit_model_segments", fake_fit_segments)
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(segment)) for segment in segments],
+    )
+
+    context.selection_ranking()
+
+    assert captured == [{"device": "cpu", "stride": 5}]
+
+
+def test_context_rejects_non_positive_carla_stride():
+    with pytest.raises(ValueError, match="carla_stride"):
+        SeriesDetectionContext(_seasonal_series(n=30), carla_stride=0)
+
+
 def test_consensus_tracks_partial_finite_coverage():
     n = 30
     scores = _spike_scores(n, [20])
@@ -298,7 +361,7 @@ def test_real_scores_resume_per_detector(tmp_path, monkeypatch):
     names = BASELINE_DETECTORS[:2]
     calls = []
 
-    def fake_score_segments(model_names, segments, *, seed, device, freq):
+    def fake_score_segments(model_names, segments, *, seed, device, freq, carla_stride):
         name = model_names[0]
         calls.append(name)
         if len(calls) == 2:

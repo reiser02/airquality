@@ -120,6 +120,7 @@ def _score_segments(
     seed: int,
     device: str,
     freq: str = "h",
+    carla_stride: int = 1,
 ) -> dict[str, list[np.ndarray | None]]:
     """Score every detector on every segment (``None`` where a detector fails).
 
@@ -137,6 +138,8 @@ def _score_segments(
             requested_kwargs["freq"] = freq
         if name == "Sub_PCA":
             requested_kwargs["weighted"] = True
+        if name in {"CARLABase", "CARLAGenIAS"}:
+            requested_kwargs["stride"] = carla_stride
         kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
         try:
             model = fit_model_segments(
@@ -221,6 +224,7 @@ class SeriesDetectionContext:
         seed: int = DEFAULT_SEED,
         device: str = "cpu",
         freq: str = "h",
+        carla_stride: int = 1,
         injection_variant: str = DEFAULT_INJECTION_VARIANT,
         injection_seed: int = DEFAULT_INJECTION_SEED,
         min_selection_points: int = DEFAULT_MIN_SELECTION_POINTS,
@@ -235,6 +239,9 @@ class SeriesDetectionContext:
         self.seed = seed
         self.device = device
         self.freq = freq
+        if carla_stride < 1:
+            raise ValueError("carla_stride debe ser positivo")
+        self.carla_stride = int(carla_stride)
         self.injection_variant = injection_variant
         self.injection_seed = injection_seed
         self.min_selection_points = min_selection_points
@@ -282,6 +289,7 @@ class SeriesDetectionContext:
                 seed=self.seed,
                 device=self.device,
                 freq=self.freq,
+                carla_stride=self.carla_stride,
             )
             if name in scored:
                 self._real_scores[name] = scored[name]
@@ -356,6 +364,8 @@ class SeriesDetectionContext:
                 requested_kwargs["freq"] = self.freq
             if name == "Sub_PCA":
                 requested_kwargs["weighted"] = True
+            if name in {"CARLABase", "CARLAGenIAS"}:
+                requested_kwargs["stride"] = self.carla_stride
             kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
             try:
                 model = fit_model_segments(

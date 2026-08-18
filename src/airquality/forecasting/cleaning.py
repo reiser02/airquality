@@ -35,12 +35,18 @@ def detect_anomaly_mask(
     seed: int = DEFAULT_SEED,
     device: str = "cpu",
     freq: str = "h",
+    carla_stride: int = 1,
     threshold_k: float = DEFAULT_THRESHOLD_K,
     max_detection_rate: float = DEFAULT_MAX_DETECTION_RATE,
 ) -> DetectionResult:
     """Flag anomalies with the consensus of the detectors that pass the rate filter."""
     context = SeriesDetectionContext(
-        series, detectors=detectors, seed=seed, device=device, freq=freq
+        series,
+        detectors=detectors,
+        seed=seed,
+        device=device,
+        freq=freq,
+        carla_stride=carla_stride,
     )
     strategy = ConsensusDetection(
         threshold_k=threshold_k, max_detection_rate=max_detection_rate

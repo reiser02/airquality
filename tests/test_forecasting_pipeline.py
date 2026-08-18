@@ -523,6 +523,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 ):
     series = _seasonal_series(n=600, name="ST0", seed=8)
     seen_detection_index: list[pd.DatetimeIndex] = []
+    seen_detection_context: dict[str, object] = {}
     test_indices: list[pd.DatetimeIndex] = []
 
     monkeypatch.setattr(
@@ -547,6 +548,8 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
         "cfg_get_int",
         lambda section, option, default, cfg=None: 96
         if (section, option) == ("forecasting", "holdout")
+        else 7
+        if (section, option) == ("forecasting", "carla_stride")
         else default,
     )
     monkeypatch.setattr(
@@ -561,6 +564,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     def fake_detect(full_series, strategies, *_args, **_kwargs):
         seen_detection_index.append(pd.DatetimeIndex(full_series.index))
+        seen_detection_context.update(_kwargs["context_kwargs"])
         out = {}
         for strategy, position in zip(strategies, (500, 550), strict=True):
             mask = pd.Series(False, index=full_series.index)
@@ -598,6 +602,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     assert len(seen_detection_index) == 1
     assert seen_detection_index[0].equals(series.index)
+    assert seen_detection_context["carla_stride"] == 7
     selection = artifacts["selection_df"].iloc[0]
     assert bool(selection["selected"])
     assert selection["split_n_flagged"] == 2
