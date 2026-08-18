@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from airquality.anomaly import benchmark as benchmark_module
@@ -33,6 +34,7 @@ from airquality.anomaly.metrics import (
     mad_threshold,
     normalize_scores,
 )
+from airquality.anomaly import plot_benchmark_results as plot_module
 from airquality.anomaly.plot_benchmark_results import save_benchmark_plots
 from airquality.anomaly.registry import MODEL_REGISTRY, resolve_model_class, resolve_model_names
 
@@ -40,6 +42,22 @@ from airquality.anomaly.registry import MODEL_REGISTRY, resolve_model_class, res
 def _base_series(length: int = 800) -> np.ndarray:
     t = np.linspace(0, 8 * np.pi, length)
     return (10.0 + 3.0 * np.sin(t)).astype(np.float32)
+
+
+def _segment_indices(lengths: tuple[int, ...]) -> tuple[pd.DatetimeIndex, ...]:
+    """Build explicit timestamps for array-only AnomalyCase fixtures."""
+    next_start = pd.Timestamp("2024-01-01")
+    indices = []
+    for length in lengths:
+        index = pd.date_range(next_start, periods=length, freq="h")
+        indices.append(index)
+        next_start = index[-1] + pd.Timedelta(hours=2)
+    return tuple(indices)
+
+
+def test_anomaly_case_requires_segment_timestamps() -> None:
+    with pytest.raises(TypeError):
+        AnomalyCase("Station", np.zeros(10, dtype=np.float32))
 
 
 def _spiky_series(length: int = 800, spike_positions: tuple[int, ...] = (120, 400, 650)) -> np.ndarray:
@@ -417,6 +435,145 @@ def test_build_cases_synthetic_injects_two_independent_seeds(monkeypatch):
     assert not np.array_equal(case.values, case.values_select)
 
 
+def test_build_cases_synthetic_evaluates_short_segments_but_selects_long_ones(monkeypatch):
+    frame = _hourly_5m_frame(340)
+    gap_start = frame.index[320 * 12]
+    gap_end = frame.index[330 * 12]
+    frame = frame.loc[(frame.index < gap_start) | (frame.index >= gap_end)]
+    monkeypatch.setattr(
+        benchmark_module, "load_raw_5m", lambda pollutant, base_dir: [("Station", frame)]
+    )
+
+    cases = benchmark_module.build_cases(
+        AnomalyBenchmarkConfig(mode="synthetic", min_series_points=8)
+    )
+
+    (case,) = cases
+    assert case.segment_lengths == (320, 10)
+    assert case.selection_segment_lengths == (320,)
+    assert case.selection_segment_indices == (0,)
+    assert len(case.values) == 330
+    assert len(case.values_select) == 320
+
+
+def test_build_cases_synthetic_uses_longest_selection_fallback(monkeypatch):
+    frame = _hourly_5m_frame(120)
+    gap_start = frame.index[100 * 12]
+    gap_end = frame.index[110 * 12]
+    frame = frame.loc[(frame.index < gap_start) | (frame.index >= gap_end)]
+    monkeypatch.setattr(
+        benchmark_module, "load_raw_5m", lambda pollutant, base_dir: [("Station", frame)]
+    )
+
+    (case,) = benchmark_module.build_cases(
+        AnomalyBenchmarkConfig(mode="synthetic", min_series_points=8)
+    )
+
+    assert case.segment_lengths == (100, 10)
+    assert case.selection_segment_lengths == (100,)
+    assert case.selection_segment_indices == (0,)
+
+
+def test_score_case_synthetic_inherits_mean_selection_ranking(monkeypatch):
+    lengths = (320, 10, 350)
+    selection_lengths = (320, 350)
+    first_labels = np.zeros(320, dtype=np.int64)
+    first_labels[20:30] = 1
+    last_labels = np.zeros(350, dtype=np.int64)
+    last_labels[40:50] = 1
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(sum(lengths), dtype=np.float32),
+        labels=np.zeros(sum(lengths), dtype=np.int64),
+        values_select=np.zeros(sum(selection_lengths), dtype=np.float32),
+        labels_select=np.concatenate([first_labels, last_labels]),
+        segment_lengths=lengths,
+        segment_indices=_segment_indices(lengths),
+        selection_segment_lengths=selection_lengths,
+        selection_segment_indices=(0, 2),
+    )
+    call_count = 0
+
+    def fake_fit_score(_cls, _kwargs, segments, _seed, _device, **_extra):
+        nonlocal call_count
+        call_count += 1
+        model = type("Model", (), {"training_summary_": {}})()
+        if call_count == 1:
+            return model, [first_labels.astype(float), np.zeros(350)], 1.0, 2.0
+        evaluation_scores = [np.zeros(len(segment)) for segment in segments]
+        evaluation_scores[0][:5] = np.nan
+        evaluation_scores[1] = None
+        return model, evaluation_scores, 3.0, 4.0
+
+    monkeypatch.setattr(benchmark_module, "_fit_score_timed", fake_fit_score)
+
+    result = benchmark_module._score_case_synthetic(
+        object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+    )
+
+    rankings = result["vus_pr_select_by_segment"]
+    assert rankings[0] != rankings[2]
+    assert rankings[1] == pytest.approx((rankings[0] + rankings[2]) / 2.0)
+    assert result["vus_pr_select"] == pytest.approx(rankings[1])
+    assert result["timing"]["selection_fit_seconds"] == 1.0
+    assert result["timing"]["fit_seconds"] == 3.0
+    assert result["timing"]["total_fit_seconds"] == 4.0
+    assert result["scored_segments"] == [True, False, True]
+    assert result["scored_points"] == 665
+
+
+def test_synthetic_ensemble_uses_local_and_inherited_rankings():
+    first = np.zeros(320, dtype=np.float32)
+    short = np.zeros(10, dtype=np.float32)
+    last = np.zeros(350, dtype=np.float32)
+    case = AnomalyCase(
+        name="Station",
+        values=np.concatenate([first, short, last]),
+        labels=np.zeros(680, dtype=np.int64),
+        values_select=np.concatenate([first, last]),
+        labels_select=np.zeros(670, dtype=np.int64),
+        segment_lengths=(320, 10, 350),
+        segment_indices=_segment_indices((320, 10, 350)),
+        selection_segment_lengths=(320, 350),
+        selection_segment_indices=(0, 2),
+    )
+    scores_a = np.zeros(680)
+    scores_a[:5] = np.nan
+    detector_results = {
+        "a": {
+            "per_case": [{
+                "scores": scores_a,
+                "vus_pr_select_by_segment": [0.9, 0.5, 0.1],
+                "scored_segments": [True, True, True],
+                "timing": {"fit_seconds": 1.0, "inference_seconds": 0.0},
+            }]
+        },
+        "b": {
+            "per_case": [{
+                "scores": np.zeros(680),
+                "vus_pr_select_by_segment": [0.1, 0.5, 0.9],
+                "scored_segments": [True, False, True],
+                "timing": {"fit_seconds": 1.0, "inference_seconds": 0.0},
+            }]
+        },
+    }
+
+    (result,) = benchmark_module._build_synthetic_ensemble(
+        AnomalyBenchmarkConfig(mode="synthetic", ensemble_top_k=2),
+        [case],
+        detector_results,
+    )
+
+    assert result["training_summary"]["selected_models_by_segment"] == [
+        ["a", "b"],
+        ["a"],  # short segment inherits the station mean (a wins the tie)
+        ["b", "a"],
+    ]
+    assert result["scored_segments"] == [True, False, True]
+    assert result["scored_points"] == 665
+    assert result["timing"]["fit_seconds"] == 2.0
+
+
 def test_build_cases_keeps_all_observed_segments(monkeypatch):
     frame = _hourly_5m_frame(30)
     gap_start = frame.index.min() + np.timedelta64(10, "h")
@@ -434,6 +591,7 @@ def test_build_cases_keeps_all_observed_segments(monkeypatch):
 
     assert case.segment_lengths == (10, 15)
     assert len(case.values) == 25
+    assert len(case.segment_indices) == 2
 
 
 def test_unlabeled_scores_and_thresholds_each_segment_independently(monkeypatch):
@@ -441,11 +599,12 @@ def test_unlabeled_scores_and_thresholds_each_segment_independently(monkeypatch)
         name="Station",
         values=np.zeros(30, dtype=np.float32),
         segment_lengths=(10, 20),
+        segment_indices=_segment_indices((10, 20)),
     )
 
     fit_calls = 0
 
-    def fake_fit_score(_cls, _kwargs, segments, _seed, _device):
+    def fake_fit_score(_cls, _kwargs, segments, _seed, _device, **_extra):
         nonlocal fit_calls
         fit_calls += 1
         scores = []
@@ -470,9 +629,13 @@ def test_unlabeled_scores_and_thresholds_each_segment_independently(monkeypatch)
 
 
 def test_unlabeled_counts_only_finite_score_coverage(monkeypatch):
-    case = AnomalyCase("Station", np.zeros(10, dtype=np.float32))
+    case = AnomalyCase(
+        "Station",
+        np.zeros(10, dtype=np.float32),
+        segment_indices=_segment_indices((10,)),
+    )
 
-    def fake_fit_score(*_args):
+    def fake_fit_score(*_args, **_kwargs):
         model = type("Model", (), {"training_summary_": {}})()
         return model, [np.array([np.nan] * 5 + [0.0, 0.0, 0.0, 0.0, 10.0])], 0.0, 0.0
 
@@ -488,7 +651,12 @@ def test_unlabeled_counts_only_finite_score_coverage(monkeypatch):
 
 
 def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
-    case = AnomalyCase("Station", np.zeros(6), segment_lengths=(6,))
+    case = AnomalyCase(
+        "Station",
+        np.zeros(6),
+        segment_lengths=(6,),
+        segment_indices=_segment_indices((6,)),
+    )
     scores = np.array([np.nan, np.nan, 0.0, 0.0, 0.0, 10.0])
     detector_results = {
         "model": {
@@ -533,6 +701,7 @@ def test_synthetic_failed_scores_remain_nan(monkeypatch):
         values_select=selected_values,
         labels_select=selected_labels,
         segment_lengths=(len(values),),
+        segment_indices=_segment_indices((len(values),)),
     )
 
     monkeypatch.setattr(
@@ -560,8 +729,8 @@ def test_synthetic_failed_scores_remain_nan(monkeypatch):
 
 def test_unlabeled_selection_is_independent_per_series():
     cases = [
-        AnomalyCase("A", np.zeros(10)),
-        AnomalyCase("B", np.zeros(10)),
+        AnomalyCase("A", np.zeros(10), segment_indices=_segment_indices((10,))),
+        AnomalyCase("B", np.zeros(10), segment_indices=_segment_indices((10,))),
     ]
     detector_results = {
         "left": {
@@ -614,6 +783,7 @@ def test_unlabeled_matches_forecasting_consensus_per_series():
         "Station",
         np.concatenate([segment.to_numpy(dtype=np.float32) for segment in segments]),
         segment_lengths=tuple(map(len, segments)),
+        segment_indices=tuple(pd.DatetimeIndex(segment.index) for segment in segments),
     )
     names = ["ModifiedZScore", "IQR", "Hampel_w24"]
     config = AnomalyBenchmarkConfig(models=names)
@@ -646,8 +816,16 @@ def test_unlabeled_matches_forecasting_consensus_per_series():
 
 def _real_cases() -> list[AnomalyCase]:
     return [
-        AnomalyCase(name="StationA", values=_spiky_series(700)),
-        AnomalyCase(name="StationB", values=_spiky_series(700, spike_positions=(80, 300))),
+        AnomalyCase(
+            name="StationA",
+            values=_spiky_series(700),
+            segment_indices=_segment_indices((700,)),
+        ),
+        AnomalyCase(
+            name="StationB",
+            values=_spiky_series(700, spike_positions=(80, 300)),
+            segment_indices=_segment_indices((700,)),
+        ),
     ]
 
 
@@ -737,6 +915,48 @@ def test_save_benchmark_plots_from_results(tmp_path, monkeypatch):
         assert plot_paths[key].exists()
 
 
+@pytest.mark.parametrize("mode", ["unlabeled", "synthetic"])
+def test_time_plots_exclude_ensemble(tmp_path, monkeypatch, mode):
+    results_path = tmp_path / "results.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "mode": mode,
+                "config": {"max_detection_rate": 0.07},
+                "models": {"Detector": {}, "Ensemble": {}},
+            }
+        )
+    )
+    received = {}
+    monkeypatch.setattr(
+        plot_module,
+        "save_training_time_plot",
+        lambda _path, summaries, *_: received.setdefault("training", set(summaries)),
+    )
+    if mode == "synthetic":
+        monkeypatch.setattr(plot_module, "save_vus_pr_distribution_plot", lambda *_: None)
+        monkeypatch.setattr(
+            plot_module,
+            "save_vus_pr_vs_inference_plot",
+            lambda _path, summaries: received.setdefault("scatter", set(summaries)),
+        )
+    else:
+        monkeypatch.setattr(
+            plot_module, "save_detection_rate_distribution_plot", lambda *_: None
+        )
+        monkeypatch.setattr(
+            plot_module,
+            "save_detection_rate_vs_inference_plot",
+            lambda _path, summaries, _rate: received.setdefault(
+                "scatter", set(summaries)
+            ),
+        )
+
+    save_benchmark_plots(results_path)
+
+    assert received == {"training": {"Detector"}, "scatter": {"Detector"}}
+
+
 def test_recompute_ensemble_matches_saved_run(tmp_path, monkeypatch):
     monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _real_cases())
     config = AnomalyBenchmarkConfig(
@@ -761,6 +981,7 @@ def test_recompute_ensemble_matches_multisegment_run(tmp_path, monkeypatch):
         name="Station",
         values=np.concatenate([first, second]),
         segment_lengths=(len(first), len(second)),
+        segment_indices=_segment_indices((len(first), len(second))),
     )
     monkeypatch.setattr(benchmark_module, "build_cases", lambda config: [case])
     summary = run_benchmark(
@@ -794,9 +1015,33 @@ def _synthetic_cases() -> list[AnomalyCase]:
                 labels=eval_l,
                 values_select=sel_v,
                 labels_select=sel_l,
+                segment_indices=_segment_indices((len(eval_v),)),
             )
         )
     return cases
+
+
+def _synthetic_multisegment_case() -> AnomalyCase:
+    segments = [_base_series(length) for length in (320, 10, 350)]
+    selected = [
+        inject_synthetic_anomalies(segments[index], INJECTION_VARIANT, seed=3 + index)
+        for index in (0, 2)
+    ]
+    evaluated = [
+        inject_synthetic_anomalies(segment, INJECTION_VARIANT, seed=101 + index)
+        for index, segment in enumerate(segments)
+    ]
+    return AnomalyCase(
+        name="Station",
+        values=np.concatenate([values for values, _ in evaluated]),
+        labels=np.concatenate([labels for _, labels in evaluated]),
+        values_select=np.concatenate([values for values, _ in selected]),
+        labels_select=np.concatenate([labels for _, labels in selected]),
+        segment_lengths=(320, 10, 350),
+        segment_indices=_segment_indices((320, 10, 350)),
+        selection_segment_lengths=(320, 350),
+        selection_segment_indices=(0, 2),
+    )
 
 
 def test_run_benchmark_synthetic_end_to_end(tmp_path, monkeypatch):
@@ -846,14 +1091,16 @@ def test_save_benchmark_plots_synthetic_run(tmp_path, monkeypatch):
 
 
 def test_recompute_ensemble_synthetic_run(tmp_path, monkeypatch):
-    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _synthetic_cases())
+    monkeypatch.setattr(
+        benchmark_module, "build_cases", lambda config: [_synthetic_multisegment_case()]
+    )
     config = AnomalyBenchmarkConfig(
         mode="synthetic",
         models=["ModifiedZScore", "IQR", "IsolationForest"],
         device="cpu",
         output_dir=str(tmp_path),
     )
-    run_benchmark(config)
+    summary = run_benchmark(config)
 
     out = recompute_ensemble(tmp_path, top_k=3)
 
@@ -861,3 +1108,6 @@ def test_recompute_ensemble_synthetic_run(tmp_path, monkeypatch):
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())
+    assert out["Ensemble(method=VOTE,top_k=3)"] == pytest.approx(
+        summary["models"]["Ensemble"]["macro_metrics"]["vus_pr"]
+    )

@@ -17,10 +17,11 @@ production (real time, no ground truth):
 is injected **directly into the real series** — the old STL synthetic base was
 removed after ``docs/estudio_inyeccion_stl_2026-07-03.md`` showed it distorts
 per-model metrics. Each station is injected TWICE with independent seeds — a
-*selection* injection (``seed``) and a held-out *evaluation* injection
-(``eval_seed``). The ensemble ranks the top-k detectors on the selection
-injection's VUS-PR and combines their masks by strict-majority vote on the
-held-out evaluation injection. Reported metrics:
+*selection* injection (on segments of at least 300 points, with a longest-
+segment fallback) and a held-out *evaluation* injection (on every segment of
+at least 8 points). The ensemble ranks long segments locally, gives short
+segments the station mean ranking, and combines the selected masks with the
+same default 2-of-3 vote as forecasting's ``inject-vote`` strategy. Reported metrics:
 auroc/aupr/vus_pr/vus_roc/affiliation_f1.
 
 Both modes share the loading (raw 5-minute data → hourly means → all eligible
@@ -35,7 +36,7 @@ rationale and for ranking criteria (consensus centrality) that could be added.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import json
 import logging
@@ -79,6 +80,7 @@ ENSEMBLE_NAME = "Ensemble"
 MODES = ("unlabeled", "synthetic")
 UNLABELED_METRIC_KEYS = ["detection_rate"]
 SYNTHETIC_METRIC_KEYS = ["auroc", "aupr", "vus_pr", "vus_roc", "affiliation_f1"]
+SYNTHETIC_MIN_VOTES = 2
 
 # Synthetic mode injects a single variant: a per-segment mix of the anomaly
 # shapes, applied directly to the real series (see :mod:`.anomalies`).
@@ -261,11 +263,12 @@ class AnomalyCase:
     """One station's evaluation series.
 
     In ``unlabeled`` mode only ``values`` is set (the real series). In
-    ``synthetic`` mode ``values``/``labels`` are the held-out *evaluation*
-    injection and ``values_select``/``labels_select`` the independent
-    *selection* injection used only to rank + weight detectors for the
-    ensemble — keeping them separate stops the ensemble from selecting and
-    evaluating on the same labels (which inflates its VUS-PR).
+    ``synthetic`` mode ``values``/``labels`` contain every evaluation segment
+    while ``values_select``/``labels_select`` contain only the long selection
+    segments (or the longest segment as fallback). The selection arrays are
+    used only to rank detectors for the ensemble — keeping them separate stops
+    the ensemble from selecting and evaluating on the same labels (which
+    inflates its VUS-PR).
     """
 
     name: str
@@ -274,7 +277,9 @@ class AnomalyCase:
     values_select: np.ndarray | None = None
     labels_select: np.ndarray | None = None
     segment_lengths: tuple[int, ...] | None = None
-    segment_indices: tuple[pd.DatetimeIndex, ...] | None = None
+    segment_indices: tuple[pd.DatetimeIndex, ...] = field(kw_only=True)
+    selection_segment_lengths: tuple[int, ...] | None = None
+    selection_segment_indices: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -322,11 +327,10 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
     for station, frame in stations:
         processed, _ = preprocess([frame], config.pollutant)
         hourly = processed[0]
-        minimum = max(
-            MIN_SEGMENT_POINTS,
-            int(config.min_series_points),
-            MIN_SYNTHETIC_SEGMENT_POINTS if mode == "synthetic" else 0,
-        )
+        # Both modes evaluate the same contiguous observed runs. Synthetic
+        # selection applies its 300-point policy below, after these cases are
+        # built, so short runs remain available for held-out evaluation.
+        minimum = max(MIN_SEGMENT_POINTS, int(config.min_series_points))
         segments = contiguous_observed_segments(hourly.iloc[:, 0], min_len=minimum)
         if not segments:
             logging.info(
@@ -340,11 +344,24 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
         segment_indices = tuple(pd.DatetimeIndex(segment.index) for segment in segments)
         values = np.concatenate(segment_values)
         if mode == "synthetic":
+            selection_indices = [
+                position
+                for position, segment in enumerate(segment_values)
+                if len(segment) >= MIN_SYNTHETIC_SEGMENT_POINTS
+            ]
+            if not selection_indices:
+                selection_indices = [
+                    max(
+                        range(len(segment_values)),
+                        key=lambda position: len(segment_values[position]),
+                    )
+                ]
+            selection_segments = [segment_values[position] for position in selection_indices]
             selected = [
                 inject_synthetic_anomalies(
-                    segment, INJECTION_VARIANT, config.seed + position
+                    segment_values[position], INJECTION_VARIANT, config.seed + position
                 )
-                for position, segment in enumerate(segment_values)
+                for position in selection_indices
             ]
             evaluated = [
                 inject_synthetic_anomalies(
@@ -361,6 +378,8 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
                     labels_select=np.concatenate([pair[1] for pair in selected]),
                     segment_lengths=segment_lengths,
                     segment_indices=segment_indices,
+                    selection_segment_lengths=tuple(map(len, selection_segments)),
+                    selection_segment_indices=tuple(selection_indices),
                 )
             )
         else:
@@ -383,6 +402,34 @@ def _case_segment_lengths(case: AnomalyCase) -> tuple[int, ...]:
     return tuple(int(length) for length in lengths)
 
 
+def _case_selection_segment_lengths(case: AnomalyCase) -> tuple[int, ...]:
+    """Return and validate the segment layout used for synthetic selection."""
+    if case.values_select is None:
+        raise ValueError(f"Synthetic case is missing selection values for {case.name}")
+    lengths = case.selection_segment_lengths or _case_segment_lengths(case)
+    if any(length <= 0 for length in lengths) or sum(lengths) != len(case.values_select):
+        raise ValueError(
+            f"Invalid selection segment lengths for {case.name}: {lengths}"
+        )
+    return tuple(int(length) for length in lengths)
+
+
+def _case_selection_segment_indices(
+    case: AnomalyCase, evaluation_count: int, selection_count: int
+) -> tuple[int, ...]:
+    """Return the evaluation segment indexes represented by selection arrays."""
+    indices = case.selection_segment_indices
+    if indices is None:
+        if selection_count != evaluation_count:
+            raise ValueError(f"Missing selection segment indexes for {case.name}")
+        indices = tuple(range(evaluation_count))
+    if len(indices) != selection_count or len(set(indices)) != len(indices):
+        raise ValueError(f"Invalid selection segment indexes for {case.name}: {indices}")
+    if any(index < 0 or index >= evaluation_count for index in indices):
+        raise ValueError(f"Selection segment index out of range for {case.name}: {indices}")
+    return tuple(int(index) for index in indices)
+
+
 def _split_segments(values: np.ndarray, lengths: tuple[int, ...]) -> list[np.ndarray]:
     if sum(lengths) != len(values):
         raise ValueError("Segment lengths do not match array length")
@@ -393,11 +440,9 @@ def _split_segments(values: np.ndarray, lengths: tuple[int, ...]) -> list[np.nda
 def _case_segment_indices(
     case: AnomalyCase,
     lengths: tuple[int, ...],
-) -> list[pd.DatetimeIndex] | None:
-    """Return preserved segment timestamps when a case came from pandas."""
+) -> list[pd.DatetimeIndex]:
+    """Return and validate the required timestamps for every segment."""
 
-    if case.segment_indices is None:
-        return None
     if len(case.segment_indices) != len(lengths):
         raise ValueError("Segment timestamp metadata does not match segment lengths")
     indices = [pd.DatetimeIndex(index) for index in case.segment_indices]
@@ -421,6 +466,32 @@ def _weighted_metrics(
     }
 
 
+def _supported_metrics(
+    labels: np.ndarray, scores: np.ndarray, supported: np.ndarray
+) -> tuple[list[dict[str, float]], list[int]]:
+    """Score contiguous supported runs without joining gaps in detector coverage."""
+    supported = np.asarray(supported, dtype=bool)
+    if labels.shape != scores.shape or labels.shape != supported.shape:
+        raise ValueError("Labels, scores, and support must have matching shapes")
+    boundaries = np.diff(
+        np.concatenate(([0], supported.astype(np.int8), [0]))
+    )
+    starts = np.flatnonzero(boundaries == 1)
+    ends = np.flatnonzero(boundaries == -1)
+    metrics = []
+    lengths = []
+    for start, end in zip(starts, ends, strict=True):
+        run_labels = labels[start:end]
+        run_scores = scores[start:end]
+        metrics.append(
+            compute_metrics(
+                run_labels, run_scores, vus_sliding_window(run_labels)
+            )
+        )
+        lengths.append(int(end - start))
+    return metrics, lengths
+
+
 def _finite_mean(values: list[float]) -> float:
     """Mean over finite values, or NaN when no value is available."""
     finite = [value for value in values if np.isfinite(value)]
@@ -433,7 +504,7 @@ def _fit_score_timed(
     segments: list[np.ndarray],
     seed: int,
     device: str,
-    segment_indices: list[pd.DatetimeIndex] | None = None,
+    segment_indices: list[pd.DatetimeIndex],
 ) -> tuple[object, list[np.ndarray | None], float, float]:
     """Fit one detector on all station segments, then score each segment."""
     synchronize_device(device)
@@ -477,9 +548,7 @@ def _score_case_unlabeled(
     inference_seconds = 0.0
 
     try:
-        fit_kwargs = {}
-        if segment_indices is not None:
-            fit_kwargs["segment_indices"] = segment_indices
+        fit_kwargs = {"segment_indices": segment_indices}
         model, segment_scores, fit_seconds, inference_seconds = _fit_score_timed(
             model_cls,
             model_kwargs,
@@ -550,46 +619,61 @@ def _score_case_synthetic(
     config: AnomalyBenchmarkConfig,
     device: str,
 ) -> dict[str, object]:
-    """Fit selection and held-out models once each across station segments."""
+    """Rank on long segments, then score every eligible evaluation segment."""
     if case.values_select is None or case.labels_select is None or case.labels is None:
         raise ValueError("Synthetic case is missing injected values or labels")
     lengths = _case_segment_lengths(case)
     segment_indices = _case_segment_indices(case, lengths)
-    selected = _split_segments(case.values_select, lengths)
-    selected_labels = _split_segments(case.labels_select, lengths)
+    selection_lengths = _case_selection_segment_lengths(case)
+    selected = _split_segments(case.values_select, selection_lengths)
+    selected_labels = _split_segments(case.labels_select, selection_lengths)
     evaluated = _split_segments(case.values, lengths)
     evaluated_labels = _split_segments(case.labels, lengths)
+    selection_indices = _case_selection_segment_indices(
+        case, len(evaluated), len(selected)
+    )
+    selection_segment_indices = [
+        segment_indices[index] for index in selection_indices
+    ]
     score_parts: list[np.ndarray] = []
     segment_metrics: list[dict[str, float]] = []
-    selection_vus: list[float] = []
+    metric_lengths: list[int] = []
+    selection_vus_by_index: dict[int, float] = {}
     failures: list[dict[str, object]] = []
     summaries: list[dict[str, object]] = []
     fit_seconds = 0.0
     inference_seconds = 0.0
+    selection_fit_seconds = 0.0
+    selection_inference_seconds = 0.0
 
     try:
-        select_model = fit_model_segments(
+        (
+            _select_model,
+            selected_scores,
+            selection_fit_seconds,
+            selection_inference_seconds,
+        ) = _fit_score_timed(
             model_cls,
+            model_kwargs,
             selected,
-            seed=config.seed,
-            model_kwargs=model_kwargs,
-            segment_indices=segment_indices,
+            config.seed,
+            device,
+            segment_indices=selection_segment_indices,
         )
-        selected_scores = score_model_segments(select_model, selected)
-    except Exception:
+    except Exception as exc:
         selected_scores = [None] * len(selected)
+        failures.append(
+            {"phase": "selection", "type": type(exc).__name__, "message": str(exc)}
+        )
 
     try:
-        fit_kwargs = {}
-        if segment_indices is not None:
-            fit_kwargs["segment_indices"] = segment_indices
         model, evaluated_scores, fit_seconds, inference_seconds = _fit_score_timed(
             model_cls,
             model_kwargs,
             evaluated,
             config.seed,
             device,
-            **fit_kwargs,
+            segment_indices=segment_indices,
         )
         summaries.append(getattr(model, "training_summary_", {}))
     except Exception as exc:
@@ -598,65 +682,85 @@ def _score_case_synthetic(
         inference_seconds = 0.0
         failures.append({"type": type(exc).__name__, "message": str(exc)})
 
-    for segment_index, (
-        select_values,
-        select_labels,
-        select_scores,
-        values,
-        labels,
-        scores,
-    ) in enumerate(
-        zip(
-            selected,
-            selected_labels,
-            selected_scores,
-            evaluated,
-            evaluated_labels,
-            evaluated_scores,
-            strict=True,
-        )
+    for segment_index, (select_values, select_labels, select_scores) in zip(
+        selection_indices,
+        zip(selected, selected_labels, selected_scores, strict=True),
+        strict=True,
     ):
         if select_scores is None or np.asarray(select_scores).shape != select_values.shape:
             # Preserve unsupported selection points; do not treat them as normal scores.
             select_scores = np.full(select_values.shape, np.nan, dtype=np.float64)
         else:
             select_scores = np.asarray(select_scores, dtype=np.float64)
-        selection_vus.append(
-            compute_metrics(
-                select_labels, select_scores, vus_sliding_window(select_labels)
-            )["vus_pr"]
-        )
+        selection_vus_by_index[segment_index] = compute_metrics(
+            select_labels, select_scores, vus_sliding_window(select_labels)
+        )["vus_pr"]
 
+    selection_vus = list(selection_vus_by_index.values())
+    selection_mean = _finite_mean(selection_vus)
+    selection_vus_by_segment = [
+        float(selection_vus_by_index.get(index, selection_mean))
+        for index in range(len(evaluated))
+    ]
+    scored_segments: list[bool] = []
+    for values, labels, scores in zip(
+        evaluated, evaluated_labels, evaluated_scores, strict=True
+    ):
         try:
             if scores is None:
                 raise RuntimeError("detector could not score this segment")
             scores = np.asarray(scores, dtype=np.float64)
             if scores.shape != values.shape:
                 raise ValueError("evaluation score length mismatch")
+            if not np.isfinite(scores).any():
+                raise ValueError("detector produced no finite evaluation scores")
+            scored_segments.append(True)
+            supported_metrics, supported_lengths = _supported_metrics(
+                labels, scores, np.isfinite(scores)
+            )
+            segment_metrics.extend(supported_metrics)
+            metric_lengths.extend(supported_lengths)
         except Exception as exc:
             # Preserve unsupported evaluation points in the persisted score array.
             scores = np.full(values.shape, np.nan, dtype=np.float64)
+            scored_segments.append(False)
             failures.append(
                 {
-                    "segment_index": segment_index,
+                    "phase": "evaluation",
+                    "segment_index": len(scored_segments) - 1,
                     "type": type(exc).__name__,
                     "message": str(exc),
                 }
             )
         score_parts.append(np.asarray(scores, dtype=np.float32))
-        segment_metrics.append(
-            compute_metrics(labels, scores, vus_sliding_window(labels))
-        )
 
-    metrics = _weighted_metrics(segment_metrics, lengths)
+    metrics = _weighted_metrics(segment_metrics, tuple(metric_lengths))
+    if not metrics:
+        metrics = {key: float("nan") for key in SYNTHETIC_METRIC_KEYS}
     return {
         "series_name": case.name,
         "series_length": int(case.values.shape[0]),
         "segment_lengths": list(lengths),
         "metrics": metrics,
-        "vus_pr_select": float(np.mean(selection_vus)),
-        "timing": {"fit_seconds": float(fit_seconds), "inference_seconds": float(inference_seconds)},
-        "training_summary": {"segments": summaries},
+        "vus_pr_select": float(selection_mean),
+        "vus_pr_select_by_segment": selection_vus_by_segment,
+        "scored_segments": scored_segments,
+        "scored_points": int(sum(metric_lengths)),
+        "timing": {
+            "fit_seconds": float(fit_seconds),
+            "inference_seconds": float(inference_seconds),
+            "selection_fit_seconds": float(selection_fit_seconds),
+            "selection_inference_seconds": float(selection_inference_seconds),
+            "total_fit_seconds": float(selection_fit_seconds + fit_seconds),
+            "total_inference_seconds": float(
+                selection_inference_seconds + inference_seconds
+            ),
+        },
+        "training_summary": {
+            "segments": summaries,
+            "selection_segment_indices": list(selection_indices),
+            "selection_segment_lengths": list(selection_lengths),
+        },
         "failures": failures,
         "scores": np.concatenate(score_parts),
     }
@@ -718,7 +822,9 @@ def _run_detector(
             total,
             case.name,
             _case_log_snippet(entry),
-            timing["fit_seconds"] + timing["inference_seconds"],
+            timing.get("total_fit_seconds", timing["fit_seconds"])
+            + timing["inference_seconds"]
+            + timing.get("selection_inference_seconds", 0.0),
         )
     headline_key = "vus_pr" if mode == "synthetic" else "detection_rate"
     macro = _finite_mean([entry["metrics"][headline_key] for entry in per_case])
@@ -957,44 +1063,112 @@ def _build_synthetic_ensemble(
     cases: list[AnomalyCase],
     detector_results: dict[str, dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Per case: rank/weight by the SELECTION injection, fuse the EVAL scores, score on EVAL labels."""
+    """Rank locally on long segments and fuse every evaluation segment."""
     ensemble_results = []
     for index, case in enumerate(cases):
-        # Ranking + weights come from the selection injection only (held-out eval labels
-        # are never used to pick or weight detectors) -> unbiased ensemble metric.
-        select_by_model = {name: result["per_case"][index]["vus_pr_select"] for name, result in detector_results.items()}
-        top_models = rank_top_k(select_by_model, config.ensemble_top_k)
         lengths = _case_segment_lengths(case)
         labels_by_segment = _split_segments(case.labels, lengths)
         scores_by_model = {
-            name: _split_segments(
-                detector_results[name]["per_case"][index]["scores"], lengths
-            )
-            for name in top_models
+            name: _split_segments(result["per_case"][index]["scores"], lengths)
+            for name, result in detector_results.items()
         }
         segment_metrics = []
+        metric_lengths: list[int] = []
+        scored_segments: list[bool] = []
+        selected_by_segment: list[list[str]] = []
+        segment_rankings: list[dict[str, float]] = []
         for segment_index, labels in enumerate(labels_by_segment):
-            fused = consensus(
-                [scores_by_model[name][segment_index] for name in top_models],
-                threshold_k=config.threshold_k,
-            )
-            segment_metrics.append(
-                compute_metrics(labels, fused, vus_sliding_window(labels))
-            )
-        metrics = _weighted_metrics(segment_metrics, lengths)
+            # Ranking + weights come only from the selection injection. Long
+            # segments have local scores; short segments inherit each model's
+            # station-level mean, matching inject-vote's policy.
+            ranking = {
+                name: float(
+                    result["per_case"][index]["vus_pr_select_by_segment"][segment_index]
+                )
+                for name, result in detector_results.items()
+            }
+            segment_rankings.append(ranking)
+            ordered = rank_top_k(ranking, len(ranking))
+            available = [
+                name
+                for name in ordered
+                if detector_results[name]["per_case"][index]["scored_segments"][segment_index]
+            ]
+            top_models = available[: config.ensemble_top_k]
+            selected_by_segment.append(top_models)
+            minimum_votes = min(SYNTHETIC_MIN_VOTES, config.ensemble_top_k)
+            if top_models and len(top_models) >= minimum_votes:
+                selected_scores = [
+                    scores_by_model[name][segment_index] for name in top_models
+                ]
+                masks = np.stack(
+                    [
+                        detect_mask(scores, config.threshold_k)
+                        for scores in selected_scores
+                    ]
+                )
+                supported = (
+                    np.stack([np.isfinite(scores) for scores in selected_scores]).sum(
+                        axis=0
+                    )
+                    >= minimum_votes
+                )
+                fused = (masks.sum(axis=0) >= minimum_votes).astype(np.float32)
+                supported_metrics, supported_lengths = _supported_metrics(
+                    labels, fused, supported
+                )
+                segment_metrics.extend(supported_metrics)
+                metric_lengths.extend(supported_lengths)
+                scored_segments.append(bool(supported.any()))
+            else:
+                scored_segments.append(False)
+        metrics = _weighted_metrics(segment_metrics, tuple(metric_lengths))
+        if not metrics:
+            metrics = {key: float("nan") for key in SYNTHETIC_METRIC_KEYS}
 
-        timings = [detector_results[name]["per_case"][index]["timing"] for name in top_models]
+        selected_models = sorted(
+            {name for models in selected_by_segment for name in models}
+        )
+        timings = [
+            detector_results[name]["per_case"][index]["timing"]
+            for name in selected_models
+        ]
+        timing = {
+            "fit_seconds": float(sum(value["fit_seconds"] for value in timings)),
+            "inference_seconds": float(
+                sum(value["inference_seconds"] for value in timings)
+            ),
+        }
+        timing["selection_fit_seconds"] = float(
+            sum(value.get("selection_fit_seconds", 0.0) for value in timings)
+        )
+        timing["selection_inference_seconds"] = float(
+            sum(value.get("selection_inference_seconds", 0.0) for value in timings)
+        )
+        timing["total_fit_seconds"] = float(
+            sum(value.get("total_fit_seconds", value["fit_seconds"]) for value in timings)
+        )
+        timing["total_inference_seconds"] = float(
+            sum(
+                value.get("total_inference_seconds", value["inference_seconds"])
+                for value in timings
+            )
+        )
         ensemble_results.append(
             {
                 "series_name": case.name,
                 "series_length": int(case.values.shape[0]),
                 "segment_lengths": list(lengths),
                 "metrics": metrics,
-                "timing": {
-                    "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
-                    "inference_seconds": float(sum(timing["inference_seconds"] for timing in timings)),
+                "scored_segments": scored_segments,
+                "scored_points": int(sum(metric_lengths)),
+                "timing": timing,
+                "training_summary": {
+                    "selected_models": selected_models,
+                    "selected_models_by_segment": selected_by_segment,
+                    "rankings_by_segment": segment_rankings,
+                    "method": "VOTE",
                 },
-                "training_summary": {"selected_models": top_models, "method": "VOTE"},
             }
         )
     return ensemble_results
@@ -1016,6 +1190,14 @@ def _summarize(series_results: list[dict[str, object]]) -> dict[str, object]:
         "mean_fit_seconds": float(np.mean([entry["timing"]["fit_seconds"] for entry in clean])),
         "mean_inference_seconds": float(np.mean([entry["timing"]["inference_seconds"] for entry in clean])),
     }
+    for key in (
+        "selection_fit_seconds",
+        "selection_inference_seconds",
+        "total_fit_seconds",
+        "total_inference_seconds",
+    ):
+        if clean and all(key in entry["timing"] for entry in clean):
+            timing[f"mean_{key}"] = float(np.mean([entry["timing"][key] for entry in clean]))
     return {"series_results": clean, "macro_metrics": macro_metrics, "timing": timing}
 
 
@@ -1155,7 +1337,7 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
         "discarded_models": discarded_models,
         "selection_scope": "series" if mode == "unlabeled" else "synthetic_top_k",
         "selection_by_series": selection_by_series,
-        "schema_version": 2,
+        "schema_version": 3 if mode == "synthetic" else 2,
         "series_names": sorted({case.name for case in cases}),
         **plot_names,
         "timestamp": time.time(),
@@ -1180,9 +1362,10 @@ def recompute_ensemble(
     Loads ``scores.npz`` + ``results.json`` from ``run_dir`` and rebuilds the
     ensemble according to the run's mode:
 
-    - ``synthetic``: rank/weight the top-``top_k`` detectors by their saved
-      selection VUS-PR, combine by majority vote, score against saved labels;
-      returns macro VUS-PR per detector + new ensemble.
+    - ``synthetic``: use each long segment's saved local selection VUS-PR,
+      give short segments the station mean ranking, backfill unavailable
+      detectors, combine the per-segment top-``top_k`` by majority vote, and
+      score against saved labels; returns macro VUS-PR per detector + ensemble.
     - ``unlabeled``: re-apply the detection-rate filter (``max_detection_rate``
       defaults to the saved value), combine survivors by majority vote; returns
       macro detection rates.
@@ -1196,6 +1379,76 @@ def recompute_ensemble(
     n_cases = len(saved["models"][model_names[0]]["series_results"])
     mode = normalize_mode(saved.get("mode", saved.get("config", {}).get("mode", "unlabeled")))
     schema_version = int(saved.get("schema_version", 1))
+
+    if schema_version >= 3 and mode == "synthetic":
+        ensemble_vus_pr_list = []
+        for i in range(n_cases):
+            first_entry = saved["models"][model_names[0]]["series_results"][i]
+            lengths = tuple(first_entry["segment_lengths"])
+            labels_by_segment = _split_segments(
+                scores_npz[f"__labels__case{i}"], lengths
+            )
+            scores_by_model = {
+                name: _split_segments(scores_npz[f"{name}__case{i}"], lengths)
+                for name in model_names
+            }
+            segment_metrics = []
+            metric_lengths = []
+            for segment_index, labels in enumerate(labels_by_segment):
+                ranking = {
+                    name: float(
+                        saved["models"][name]["series_results"][i][
+                            "vus_pr_select_by_segment"
+                        ][segment_index]
+                    )
+                    for name in model_names
+                }
+                ordered = rank_top_k(ranking, len(ranking))
+                top_models = [
+                    name
+                    for name in ordered
+                    if saved["models"][name]["series_results"][i][
+                        "scored_segments"
+                    ][segment_index]
+                ][:top_k]
+                minimum_votes = min(SYNTHETIC_MIN_VOTES, top_k)
+                if top_models and len(top_models) >= minimum_votes:
+                    selected_scores = [
+                        scores_by_model[name][segment_index] for name in top_models
+                    ]
+                    masks = np.stack(
+                        [
+                            detect_mask(scores, threshold_k)
+                            for scores in selected_scores
+                        ]
+                    )
+                    supported = (
+                        np.stack(
+                            [np.isfinite(scores) for scores in selected_scores]
+                        ).sum(axis=0)
+                        >= minimum_votes
+                    )
+                    fused = (masks.sum(axis=0) >= minimum_votes).astype(np.float32)
+                    supported_metrics, supported_lengths = _supported_metrics(
+                        labels, fused, supported
+                    )
+                    segment_metrics.extend(supported_metrics)
+                    metric_lengths.extend(supported_lengths)
+                else:
+                    continue
+            ensemble_vus_pr_list.append(
+                _weighted_metrics(segment_metrics, tuple(metric_lengths))["vus_pr"]
+                if metric_lengths
+                else float("nan")
+            )
+        out = {
+            name: saved["models"][name]["macro_metrics"]["vus_pr"]
+            for name in model_names
+        }
+        out[f"Ensemble(method=VOTE,top_k={top_k})"] = float(
+            _finite_mean(ensemble_vus_pr_list)
+        )
+        return out
 
     if schema_version >= 2:
         if mode == "synthetic":

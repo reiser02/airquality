@@ -41,6 +41,14 @@ def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None
 
     model_summaries = summary["models"]
     mode = summary.get("mode", summary.get("config", {}).get("mode", "unlabeled"))
+    # The ensemble reuses detector scores and has no independent fit. A sum of
+    # detector times is not an incremental ensemble runtime, so keep it out of
+    # every time-based figure while retaining it in metric distributions.
+    timed_model_summaries = {
+        name: model_summary
+        for name, model_summary in model_summaries.items()
+        if name != "Ensemble"
+    }
 
     if mode == "synthetic":
         plot_paths = {
@@ -49,7 +57,7 @@ def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None
             "training_plot": plot_dir / summary.get("training_plot", "training_time.png"),
         }
         save_vus_pr_distribution_plot(plot_paths["metrics_plot"], model_summaries)
-        save_vus_pr_vs_inference_plot(plot_paths["scatter_plot"], model_summaries)
+        save_vus_pr_vs_inference_plot(plot_paths["scatter_plot"], timed_model_summaries)
     else:
         max_detection_rate = float(summary.get("config", {}).get("max_detection_rate", DEFAULT_MAX_DETECTION_RATE))
         plot_paths = {
@@ -58,8 +66,18 @@ def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None
             "training_plot": plot_dir / summary.get("training_plot", "training_time.png"),
         }
         save_detection_rate_distribution_plot(plot_paths["metrics_plot"], model_summaries, max_detection_rate)
-        save_detection_rate_vs_inference_plot(plot_paths["scatter_plot"], model_summaries, max_detection_rate)
-    save_training_time_plot(plot_paths["training_plot"], model_summaries)
+        save_detection_rate_vs_inference_plot(
+            plot_paths["scatter_plot"], timed_model_summaries, max_detection_rate
+        )
+    save_training_time_plot(
+        plot_paths["training_plot"],
+        timed_model_summaries,
+        (
+            "Held-out evaluation fit only; selection fit is reported separately"
+            if mode == "synthetic"
+            else "Models ordered from lower to higher training time"
+        ),
+    )
     return plot_paths
 
 
