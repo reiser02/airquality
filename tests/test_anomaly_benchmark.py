@@ -15,6 +15,8 @@ from airquality.anomaly.benchmark import (
     UNLABELED_METRIC_KEYS,
     AnomalyBenchmarkConfig,
     AnomalyCase,
+    _expand_model_names,
+    _requested_model_kwargs,
     _filter_model_kwargs,
     _summarize,
     macro_detection_rate,
@@ -322,6 +324,31 @@ def test_filter_model_kwargs_drops_unaccepted():
     assert _filter_model_kwargs(WithKwargs, {"device": "cpu"}) == {"device": "cpu"}
 
 
+def test_sub_pca_benchmark_kwargs_select_components_and_weighting():
+    config = AnomalyBenchmarkConfig(sub_pca_components=4)
+
+    assert _requested_model_kwargs("Sub_PCA", config, "cpu") == {
+        "device": "cpu",
+        "weighted": True,
+        "n_selected_components": 4,
+    }
+    assert _requested_model_kwargs(
+        "Sub_PCA", AnomalyBenchmarkConfig(), "cpu"
+    )["n_selected_components"] is None
+    multi_config = AnomalyBenchmarkConfig(sub_pca_components=(None, 4, 8))
+    assert _expand_model_names(
+        ["IQR", "Sub_PCA"], multi_config.sub_pca_components
+    ) == ["IQR", "Sub_PCA_all", "Sub_PCA_k4", "Sub_PCA_k8"]
+    assert _requested_model_kwargs("Sub_PCA_k8", multi_config, "cpu")[
+        "n_selected_components"
+    ] == 8
+
+
+def test_sub_pca_component_count_must_be_positive_or_all():
+    with pytest.raises(ValueError, match="positive"):
+        AnomalyBenchmarkConfig(sub_pca_components=0)
+
+
 def test_summarize_aggregates_and_drops_scores():
     series_results = [
         {
@@ -491,6 +518,46 @@ def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
     assert result["metrics"]["detection_rate"] == pytest.approx(0.25)
 
 
+def test_synthetic_failed_scores_remain_nan(monkeypatch):
+    values = np.linspace(10.0, 20.0, 40, dtype=np.float32)
+    selected_values, selected_labels = inject_synthetic_anomalies(
+        values, INJECTION_VARIANT, seed=3
+    )
+    evaluated_values, evaluated_labels = inject_synthetic_anomalies(
+        values, INJECTION_VARIANT, seed=101
+    )
+    case = AnomalyCase(
+        "Station",
+        evaluated_values,
+        labels=evaluated_labels,
+        values_select=selected_values,
+        labels_select=selected_labels,
+        segment_lengths=(len(values),),
+    )
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "fit_model_segments",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "score_model_segments",
+        lambda _model, _segments: [None],
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "_fit_score_timed",
+        lambda *args, **kwargs: (object(), [None], 0.0, 0.0),
+    )
+
+    result = benchmark_module._score_case_synthetic(
+        object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+    )
+
+    assert np.isnan(result["scores"]).all()
+
+
 def test_unlabeled_selection_is_independent_per_series():
     cases = [
         AnomalyCase("A", np.zeros(10)),
@@ -615,6 +682,32 @@ def test_run_benchmark_end_to_end(tmp_path, monkeypatch):
     assert (tmp_path / "scores.npz").exists()
     # The benchmark itself does NOT render plots (that is a separate script).
     assert not (tmp_path / "detection_rate_distribution.png").exists()
+
+
+def test_run_benchmark_expands_sub_pca_component_variants(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark_module, "build_cases", lambda config: _real_cases()[:1])
+    config = AnomalyBenchmarkConfig(
+        models=["Sub_PCA"],
+        sub_pca_components=(None, 4, 8),
+        device="cpu",
+        output_dir=str(tmp_path),
+    )
+
+    summary = run_benchmark(config)
+
+    assert summary["model_names"] == [
+        "Sub_PCA_all",
+        "Sub_PCA_k4",
+        "Sub_PCA_k8",
+        "Ensemble",
+    ]
+    assert summary["config"]["sub_pca_components"] == (None, 4, 8)
+    assert all(
+        summary["models"][name]["series_results"][0]["training_summary"]["segments"][0][
+            "weighted"
+        ]
+        for name in ("Sub_PCA_all", "Sub_PCA_k4", "Sub_PCA_k8")
+    )
 
 
 def test_run_benchmark_all_discarded_builds_no_ensemble(tmp_path, monkeypatch):

@@ -45,6 +45,7 @@ import pickle
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
@@ -86,6 +87,98 @@ MIN_SEGMENT_POINTS = 8
 # Combined injection includes a 16..48-point drift. Shorter series make the
 # synthetic labels dominate the signal and do not provide a meaningful ranking.
 MIN_SYNTHETIC_SEGMENT_POINTS = 300
+
+
+def normalize_sub_pca_components(values: object) -> tuple[int | None, ...]:
+    """Normalize ``all``/integer Sub_PCA component selections without duplicates."""
+
+    if values is None:
+        raw_values: tuple[object, ...] = (None,)
+    elif isinstance(values, str):
+        raw_values = tuple(values.split(","))
+    elif isinstance(values, (int, np.integer)) and not isinstance(values, bool):
+        raw_values = (int(values),)
+    else:
+        try:
+            raw_values = tuple(values)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError(
+                "Sub_PCA components must be 'all' or positive integers"
+            ) from exc
+
+    components: list[int | None] = []
+    seen: set[int | None] = set()
+    for raw_value in raw_values:
+        if isinstance(raw_value, str):
+            values_to_add: tuple[object, ...] = tuple(raw_value.split(","))
+        else:
+            values_to_add = (raw_value,)
+        for value in values_to_add:
+            if value is None or str(value).strip().lower() in {"", "all", "none"}:
+                component = None
+            else:
+                if isinstance(value, bool):
+                    raise ValueError(
+                        "Sub_PCA components must be 'all' or positive integers"
+                    )
+                try:
+                    component = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Sub_PCA components must be 'all' or positive integers"
+                    ) from exc
+                if component < 1 or str(value).strip() != str(component):
+                    raise ValueError(
+                        "Sub_PCA components must be 'all' or positive integers"
+                    )
+            if component not in seen:
+                seen.add(component)
+                components.append(component)
+    return tuple(components) or (None,)
+
+
+def _sub_pca_variant_name(component: int | None) -> str:
+    """Return the stable output name for one Sub_PCA component selection."""
+    return "Sub_PCA_all" if component is None else f"Sub_PCA_k{component}"
+
+
+def _expand_model_names(
+    model_names: list[str],
+    sub_pca_components: tuple[int | None, ...],
+) -> list[str]:
+    """Expand one requested ``Sub_PCA`` into its configured benchmark variants."""
+    expanded: list[str] = []
+    for name in model_names:
+        if name != "Sub_PCA":
+            expanded.append(name)
+        elif len(sub_pca_components) == 1 and sub_pca_components[0] is None:
+            # Preserve the historical default result key for the single all-components run.
+            expanded.append(name)
+        else:
+            expanded.extend(_sub_pca_variant_name(component) for component in sub_pca_components)
+    return expanded
+
+
+def _sub_pca_component_for_model(
+    model_name: str,
+    config: "AnomalyBenchmarkConfig",
+) -> int | None:
+    """Resolve the selected component count encoded by a benchmark model name."""
+    if model_name == "Sub_PCA":
+        if len(config.sub_pca_components) != 1:
+            raise ValueError("Multiple Sub_PCA components require expanded model names")
+        return config.sub_pca_components[0]
+    if model_name == "Sub_PCA_all":
+        return None
+    if model_name.startswith("Sub_PCA_k"):
+        try:
+            component = int(model_name.removeprefix("Sub_PCA_k"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid Sub_PCA variant: {model_name}") from exc
+        if component < 1:
+            raise ValueError(f"Invalid Sub_PCA variant: {model_name}")
+        return component
+    raise ValueError(f"Not a Sub_PCA model: {model_name}")
 
 # Detectors that benefit from a GPU (windowed deep models). Everything else is
 # CPU-only. Mirrors genias's ``GPU_MODEL_NAMES``.
@@ -181,6 +274,7 @@ class AnomalyCase:
     values_select: np.ndarray | None = None
     labels_select: np.ndarray | None = None
     segment_lengths: tuple[int, ...] | None = None
+    segment_indices: tuple[pd.DatetimeIndex, ...] | None = None
 
 
 @dataclass
@@ -191,6 +285,8 @@ class AnomalyBenchmarkConfig:
     pollutant: str = "NO2"
     raw_base_dir: str = "data/raw/datos_estaciones_5m"
     models: list[str] | None = None
+    # Sub_PCA score components: None means all fitted components.
+    sub_pca_components: tuple[int | None, ...] = (None,)
     device: str = "cpu"
     seed: int = 13
     carla_stride: int = 1
@@ -203,6 +299,10 @@ class AnomalyBenchmarkConfig:
     min_series_points: int = MIN_SEGMENT_POINTS
     series_limit: int | None = None
     output_dir: str | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize and validate the configured Sub_PCA component variants."""
+        self.sub_pca_components = normalize_sub_pca_components(self.sub_pca_components)
 
 
 def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
@@ -237,6 +337,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
             continue
         segment_values = [segment.to_numpy(dtype=np.float32) for segment in segments]
         segment_lengths = tuple(len(values) for values in segment_values)
+        segment_indices = tuple(pd.DatetimeIndex(segment.index) for segment in segments)
         values = np.concatenate(segment_values)
         if mode == "synthetic":
             selected = [
@@ -259,6 +360,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
                     values_select=np.concatenate([pair[0] for pair in selected]),
                     labels_select=np.concatenate([pair[1] for pair in selected]),
                     segment_lengths=segment_lengths,
+                    segment_indices=segment_indices,
                 )
             )
         else:
@@ -267,6 +369,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
                     name=station,
                     values=values,
                     segment_lengths=segment_lengths,
+                    segment_indices=segment_indices,
                 )
             )
     logging.info("Built %d evaluation cases.", len(cases))
@@ -285,6 +388,22 @@ def _split_segments(values: np.ndarray, lengths: tuple[int, ...]) -> list[np.nda
         raise ValueError("Segment lengths do not match array length")
     boundaries = np.cumsum((0, *lengths))
     return [values[boundaries[i] : boundaries[i + 1]] for i in range(len(lengths))]
+
+
+def _case_segment_indices(
+    case: AnomalyCase,
+    lengths: tuple[int, ...],
+) -> list[pd.DatetimeIndex] | None:
+    """Return preserved segment timestamps when a case came from pandas."""
+
+    if case.segment_indices is None:
+        return None
+    if len(case.segment_indices) != len(lengths):
+        raise ValueError("Segment timestamp metadata does not match segment lengths")
+    indices = [pd.DatetimeIndex(index) for index in case.segment_indices]
+    if any(len(index) != length for index, length in zip(indices, lengths, strict=True)):
+        raise ValueError("Segment timestamps do not match segment lengths")
+    return indices
 
 
 def _weighted_metrics(
@@ -314,12 +433,17 @@ def _fit_score_timed(
     segments: list[np.ndarray],
     seed: int,
     device: str,
+    segment_indices: list[pd.DatetimeIndex] | None = None,
 ) -> tuple[object, list[np.ndarray | None], float, float]:
     """Fit one detector on all station segments, then score each segment."""
     synchronize_device(device)
     fit_started = time.perf_counter()
     model = fit_model_segments(
-        model_cls, segments, seed=seed, model_kwargs=model_kwargs
+        model_cls,
+        segments,
+        seed=seed,
+        model_kwargs=model_kwargs,
+        segment_indices=segment_indices,
     )
     synchronize_device(device)
     fit_seconds = time.perf_counter() - fit_started
@@ -341,6 +465,7 @@ def _score_case_unlabeled(
     """Fit once on a station, then score and MAD-threshold each segment."""
     lengths = _case_segment_lengths(case)
     segments = _split_segments(case.values, lengths)
+    segment_indices = _case_segment_indices(case, lengths)
     score_parts: list[np.ndarray] = []
     thresholds: list[float | None] = []
     scored_segments: list[bool] = []
@@ -352,8 +477,16 @@ def _score_case_unlabeled(
     inference_seconds = 0.0
 
     try:
+        fit_kwargs = {}
+        if segment_indices is not None:
+            fit_kwargs["segment_indices"] = segment_indices
         model, segment_scores, fit_seconds, inference_seconds = _fit_score_timed(
-            model_cls, model_kwargs, segments, config.seed, device
+            model_cls,
+            model_kwargs,
+            segments,
+            config.seed,
+            device,
+            **fit_kwargs,
         )
         summaries.append(getattr(model, "training_summary_", {}))
     except Exception as exc:
@@ -421,6 +554,7 @@ def _score_case_synthetic(
     if case.values_select is None or case.labels_select is None or case.labels is None:
         raise ValueError("Synthetic case is missing injected values or labels")
     lengths = _case_segment_lengths(case)
+    segment_indices = _case_segment_indices(case, lengths)
     selected = _split_segments(case.values_select, lengths)
     selected_labels = _split_segments(case.labels_select, lengths)
     evaluated = _split_segments(case.values, lengths)
@@ -435,15 +569,27 @@ def _score_case_synthetic(
 
     try:
         select_model = fit_model_segments(
-            model_cls, selected, seed=config.seed, model_kwargs=model_kwargs
+            model_cls,
+            selected,
+            seed=config.seed,
+            model_kwargs=model_kwargs,
+            segment_indices=segment_indices,
         )
         selected_scores = score_model_segments(select_model, selected)
     except Exception:
         selected_scores = [None] * len(selected)
 
     try:
+        fit_kwargs = {}
+        if segment_indices is not None:
+            fit_kwargs["segment_indices"] = segment_indices
         model, evaluated_scores, fit_seconds, inference_seconds = _fit_score_timed(
-            model_cls, model_kwargs, evaluated, config.seed, device
+            model_cls,
+            model_kwargs,
+            evaluated,
+            config.seed,
+            device,
+            **fit_kwargs,
         )
         summaries.append(getattr(model, "training_summary_", {}))
     except Exception as exc:
@@ -471,7 +617,8 @@ def _score_case_synthetic(
         )
     ):
         if select_scores is None or np.asarray(select_scores).shape != select_values.shape:
-            select_scores = np.zeros(select_values.shape, dtype=np.float64)
+            # Preserve unsupported selection points; do not treat them as normal scores.
+            select_scores = np.full(select_values.shape, np.nan, dtype=np.float64)
         else:
             select_scores = np.asarray(select_scores, dtype=np.float64)
         selection_vus.append(
@@ -487,7 +634,8 @@ def _score_case_synthetic(
             if scores.shape != values.shape:
                 raise ValueError("evaluation score length mismatch")
         except Exception as exc:
-            scores = np.zeros(values.shape, dtype=np.float64)
+            # Preserve unsupported evaluation points in the persisted score array.
+            scores = np.full(values.shape, np.nan, dtype=np.float64)
             failures.append(
                 {
                     "segment_index": segment_index,
@@ -525,6 +673,22 @@ def _case_log_snippet(entry: dict[str, object]) -> str:
     return f"vus_sel={entry['vus_pr_select']:.3f} vus_eval={metrics['vus_pr']:.3f}"
 
 
+def _requested_model_kwargs(
+    model_name: str,
+    config: AnomalyBenchmarkConfig,
+    device: str,
+) -> dict[str, object]:
+    """Build benchmark-specific detector kwargs before signature filtering."""
+
+    requested: dict[str, object] = {"device": device}
+    if model_name in {"CARLABase", "CARLAGenIAS"}:
+        requested["stride"] = config.carla_stride
+    if model_name == "Sub_PCA" or model_name.startswith("Sub_PCA_"):
+        requested["weighted"] = True
+        requested["n_selected_components"] = _sub_pca_component_for_model(model_name, config)
+    return requested
+
+
 def _run_detector(
     model_name: str,
     config: AnomalyBenchmarkConfig,
@@ -534,10 +698,9 @@ def _run_detector(
     """Fit/score one detector over every case on ``device``; log per-case progress."""
     mode = normalize_mode(config.mode)
     score_case = _score_case_synthetic if mode == "synthetic" else _score_case_unlabeled
-    model_cls = resolve_model_class(model_name)
-    requested_kwargs: dict[str, object] = {"device": device}
-    if model_name in {"CARLABase", "CARLAGenIAS"}:
-        requested_kwargs["stride"] = config.carla_stride
+    base_model_name = "Sub_PCA" if model_name.startswith("Sub_PCA_") else model_name
+    model_cls = resolve_model_class(base_model_name)
+    requested_kwargs = _requested_model_kwargs(model_name, config, device)
     model_kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
 
     per_case = []
@@ -877,7 +1040,9 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
     """
     config = config or AnomalyBenchmarkConfig()
     mode = normalize_mode(config.mode)
-    model_names = resolve_model_names(config.models)
+    model_names = _expand_model_names(
+        resolve_model_names(config.models), config.sub_pca_components
+    )
     cases = build_cases(config)
     if not cases:
         raise RuntimeError(

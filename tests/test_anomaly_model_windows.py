@@ -12,7 +12,7 @@ from airquality.anomaly.models import (
     COUTABase,
     COUTAGenIAS,
     LSTMAD,
-    PCADetector,
+    SubPCADetector,
 )
 from airquality.anomaly.models.carla import PretextLoss
 from airquality.anomaly.models.common import pooled_windows_nd
@@ -29,12 +29,12 @@ def test_couta_and_carla_variants_default_to_80_point_windows(model_cls):
     assert model.minimum_series_length == 80
 
 
-def test_pca_and_lstmad_defaults_report_effective_minimums():
-    pca = PCADetector(device="cpu")
+def test_sub_pca_and_lstmad_report_effective_minimums():
+    sub_pca = SubPCADetector(device="cpu", window_size=80)
     lstmad = LSTMAD(device="cpu")
 
-    assert pca.window_size == 80
-    assert pca.minimum_series_length == 81
+    assert sub_pca.window_size == 80
+    assert sub_pca.minimum_series_length == 81
     assert lstmad.window_size == 65
     assert lstmad.horizon == 8
     assert lstmad.minimum_series_length == 80
@@ -89,8 +89,8 @@ def test_pooled_windows_do_not_cross_segment_boundaries():
     assert all(np.unique(window).size == 1 for window in windows)
 
 
-def test_window_model_abstains_on_short_segments() -> None:
-    model = PCADetector(device="cpu")
+def test_sub_pca_abstains_on_short_segments() -> None:
+    model = SubPCADetector(device="cpu", window_size=80)
     long_segments = [
         np.sin(np.arange(81, dtype=np.float32) / 8.0),
         np.cos(np.arange(80, dtype=np.float32) / 9.0),

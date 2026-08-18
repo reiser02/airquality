@@ -4,6 +4,16 @@ Windowed deep-SVDD-style detector: a TCN maps each window to an embedding and
 the anomaly score is the squared distance to a fixed center, with a
 self-supervised pretext head trained on synthetically corrupted windows
 (native COUTA rules or GenIAS-generated anomalies).
+
+This module is adapted from:
+https://github.com/xuhongzuo/couta
+
+The temporal network, Deep-SVDD losses, native anomaly generation, and core
+training procedure derive from the upstream implementation. Segment handling,
+the local detector API, and GenIAS integration are project-specific changes.
+
+The upstream repository is licensed under the Apache License 2.0. See also:
+https://arxiv.org/abs/2207.12201
 """
 
 from __future__ import annotations

@@ -13,7 +13,11 @@ import json
 
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 
-from .benchmark import AnomalyBenchmarkConfig, run_benchmark
+from .benchmark import (
+    AnomalyBenchmarkConfig,
+    normalize_sub_pca_components,
+    run_benchmark,
+)
 from .ensemble import DEFAULT_TOP_K
 from .metrics import DEFAULT_MAX_DETECTION_RATE, DEFAULT_THRESHOLD_K
 
@@ -24,6 +28,16 @@ def _csv_default(value: str) -> list[str] | None:
     return items or None
 
 
+def _parse_sub_pca_components(value: object) -> tuple[int | None, ...]:
+    """Parse comma-separated or space-separated Sub_PCA component variants."""
+    try:
+        return normalize_sub_pca_components(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "Sub_PCA components must be 'all' or positive integers"
+        ) from exc
+
+
 def build_config_from_args(args: argparse.Namespace) -> AnomalyBenchmarkConfig:
     """Map parsed CLI arguments onto an :class:`AnomalyBenchmarkConfig`."""
     return AnomalyBenchmarkConfig(
@@ -31,6 +45,7 @@ def build_config_from_args(args: argparse.Namespace) -> AnomalyBenchmarkConfig:
         pollutant=args.pollutant,
         raw_base_dir=args.raw_base_dir,
         models=args.models if args.models else _csv_default(cfg_get_str("anomaly", "models", "all")),
+        sub_pca_components=_parse_sub_pca_components(args.sub_pca_components),
         device=args.device,
         seed=args.seed,
         carla_stride=args.carla_stride,
@@ -59,6 +74,13 @@ def main() -> None:
         default=cfg_get_str("data", "raw_base_dir", "data/raw/datos_estaciones_5m"),
     )
     parser.add_argument("--models", nargs="*", default=None, help="Model names, or 'all' (default from config)")
+    parser.add_argument(
+        "--sub-pca-components",
+        nargs="+",
+        default=cfg_get_str("anomaly", "sub_pca_components", "all"),
+        metavar="N|all",
+        help="Sub_PCA score components, e.g. all,4,8 or all 4 8 (default from config)",
+    )
     parser.add_argument("--device", default=cfg_get_str("anomaly", "device", "cpu"))
     parser.add_argument("--seed", type=int, default=cfg_get_int("anomaly", "seed", 13))
     parser.add_argument(
