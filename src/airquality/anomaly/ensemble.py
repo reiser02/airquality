@@ -3,10 +3,10 @@
 In ``unlabeled`` mode there is no label-based metric to rank detectors with,
 so the ensemble combines every detector that survives the detection-rate filter
 (see :func:`airquality.anomaly.benchmark.split_by_detection_rate`). In
-``synthetic`` mode detectors are ranked by their selection-injection VUS-PR and
-the top-k (default 3) vote. Every detector is binarized with its own robust MAD
-threshold and a point is marked when a strict majority agrees (2-of-3 for the
-default synthetic top-k).
+``synthetic`` mode detectors are ranked by selection-injection VUS-PR: long
+segments use local rankings and short segments inherit the station mean. The
+available top-k (default 3) vote per segment, with two required votes by
+default, matching forecasting's ``inject-vote`` strategy.
 """
 
 from __future__ import annotations

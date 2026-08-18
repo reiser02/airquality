@@ -267,11 +267,15 @@ def save_detection_rate_distribution_plot(
     plt.close(figure)
 
 
-def save_training_time_plot(output_path: Path, model_summaries: dict[str, dict[str, object]]) -> None:
+def save_training_time_plot(
+    output_path: Path,
+    model_summaries: dict[str, dict[str, object]],
+    subtitle: str = "Models ordered from lower to higher training time",
+) -> None:
     """Render the mean-training-time bar chart (log scale when all values > 0)."""
     model_names = sorted(model_summaries, key=lambda model_name: _training_time_order_value(model_summaries[model_name]))
     figure, axis = plt.subplots(figsize=(12.5, 7.0), facecolor=FIGURE_FACE)
-    add_plot_header(figure, "Average Training Time by Model", "Models ordered from lower to higher training time")
+    add_plot_header(figure, "Average Training Time by Model", subtitle)
     style_axis(axis)
     positions = np.arange(len(model_names))
     mean_fit_seconds = [_training_time_order_value(model_summaries[model_name]) for model_name in model_names]
@@ -455,7 +459,7 @@ def save_vus_pr_vs_inference_plot(output_path: Path, model_summaries: dict[str, 
             color="#222222",
         )
     axis.set_xscale("log")
-    axis.set_xlabel("Average Inference Time (sec)")
+    axis.set_xlabel("Average Held-Out Evaluation Inference Time (sec)")
     axis.set_ylabel("Average VUS-PR")
     axis.set_title("VUS-PR vs. Inference Time", fontsize=13)
     legend_handles = [
