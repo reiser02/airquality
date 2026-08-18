@@ -44,8 +44,10 @@ import pandas as pd
 #: v10: injected rankings and detector eligibility are resolved per block. v11:
 #: detector coverage is finite-score-aware and failed backtests are not persisted.
 #: v12: test terminology is explicit and the paired synthetic foundation-context
-#: experiment has its own content-keyed payloads.
-CACHE_VERSION = 12
+#: experiment has its own content-keyed payloads. v13: detector semantics use
+#: TSB-AD Sub_PCA, full-window offline Hampel, and timestamp-aware Prophet. v14:
+#: CARLA training stride is an explicit forecasting configuration.
+CACHE_VERSION = 14
 
 
 def series_fingerprint(series: pd.Series) -> str:

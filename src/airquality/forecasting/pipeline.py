@@ -662,6 +662,7 @@ def run_benchmark_from_config(
             "threshold_k": threshold_k,
             "max_detection_rate": max_detection_rate,
             "detectors": sorted(resolved_detectors),
+            "carla_stride": carla_stride,
             "injection_seed": injection_seed,
             "min_selection_points": min_selection_points,
             "vote_top_k": vote_top_k,
@@ -739,6 +740,7 @@ def run_benchmark_from_config(
             "freq": freq,
             "detectors": sorted(resolved_detectors),
             "seed": seed,
+            "carla_stride": carla_stride,
             "injection_seed": injection_seed,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
@@ -765,6 +767,7 @@ def run_benchmark_from_config(
                     "series_fp": series_fp,
                     "freq": freq,
                     "seed": seed,
+                    "carla_stride": carla_stride,
                 },
             },
         )
