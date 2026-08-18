@@ -105,6 +105,20 @@ def test_preprocess_preserves_frozen_hour_as_nan() -> None:
     assert count == 1
 
 
+def test_preprocess_can_keep_frozen_and_repeated_hourly_values() -> None:
+    df = _series_5m([50.0] * 24)
+
+    (out,), (count,) = preprocess(
+        [df],
+        "NO2",
+        exclude_frozen=False,
+        remove_repeated=False,
+    )
+
+    assert out["NO2"].tolist() == [50.0, 50.0]
+    assert count == 0
+
+
 def test_detection_limits_present() -> None:
     assert set(DETECTION_LIMITS) == {"CO", "NO2"}
 
