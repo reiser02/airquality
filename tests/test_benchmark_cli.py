@@ -63,6 +63,30 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     assert artifacts["metric_gap_plot_path"] == tmp_path / "metrics_by_gap.png"
     assert (tmp_path / "metrics_by_gap.csv").exists()
     assert (tmp_path / "metrics_by_gap.png").exists()
+    assert set(artifacts["model_performance_by_gap_plot_paths"]) == {"MAE"}
+    assert set(artifacts["overall_model_performance_plot_paths"]) == {"MAE"}
+    assert set(artifacts["global_station_error_plot_paths"]) == {"MAE"}
+    assert set(artifacts["pairwise_win_rate_plot_paths"]) == {"MAE"}
+    assert set(artifacts["gap_degradation_plot_paths"]) == {"MAE"}
+    assert set(artifacts["tail_risk_plot_paths"]) == {"MAE"}
+    assert set(artifacts["error_correlation_plot_paths"]) == {"MAE"}
+    assert (tmp_path / "model_performance_by_gap_mae.png").exists()
+    assert (tmp_path / "overall_model_performance_mae.png").exists()
+    assert (tmp_path / "global_station_error_mae.png").exists()
+    assert (tmp_path / "pairwise_win_rate_mae.png").exists()
+    assert (tmp_path / "gap_degradation_mae.png").exists()
+    assert (tmp_path / "tail_risk_mae.png").exists()
+    assert (tmp_path / "error_correlation_mae.png").exists()
+    assert (tmp_path / "model_performance_by_gap.csv").exists()
+    assert (tmp_path / "overall_model_performance.csv").exists()
+    assert (tmp_path / "global_rank_summary.csv").exists()
+    assert (tmp_path / "global_rank_frequencies.csv").exists()
+    assert (tmp_path / "global_performance_profiles.csv").exists()
+    assert (tmp_path / "global_station_errors.csv").exists()
+    assert (tmp_path / "pairwise_win_rates.csv").exists()
+    assert (tmp_path / "gap_degradation.csv").exists()
+    assert (tmp_path / "tail_risk.csv").exists()
+    assert (tmp_path / "error_correlations.csv").exists()
 
     metrics_by_gap_df = pd.read_csv(tmp_path / "metrics_by_gap.csv")
     assert list(metrics_by_gap_df["Gap_Size"]) == [1, 2]

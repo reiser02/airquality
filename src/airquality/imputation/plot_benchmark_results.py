@@ -225,6 +225,11 @@ def save_time_vs_error_plot(
 ) -> bool:
     """Cost/accuracy scatter: mean imputation time (x) vs mean ``metric`` (y) per model."""
     metric = metric.upper()
+    metric_label = (
+        f"{metric} escalado"
+        if metric in {"MAE", "RMSE"} and "Scale_Std" in results_df.columns
+        else _metric_label(metric)
+    )
     summary = summarize_timing(results_df)
     if summary.empty or IMPUTE_COL not in summary.columns or metric not in summary.columns:
         return False
@@ -237,7 +242,7 @@ def save_time_vs_error_plot(
     figure, axis = plt.subplots(figsize=(9.5, 6.8), facecolor=FIGURE_FACE)
     add_plot_header(
         figure,
-        f"Coste vs precision — {_metric_label(metric)}",
+        f"Coste vs precision — {metric_label}",
         "Media por modelo: X = tiempo de imputacion, Y = error (abajo-izquierda = mejor).",
     )
     style_axis(axis)
@@ -257,7 +262,7 @@ def save_time_vs_error_plot(
         axis.set_xscale("log")
         axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}s"))
     axis.set_xlabel("tiempo de imputacion (s)")
-    axis.set_ylabel(_metric_label(metric))
+    axis.set_ylabel(metric_label)
     figure.tight_layout(rect=(0, 0, 1, 0.9))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
