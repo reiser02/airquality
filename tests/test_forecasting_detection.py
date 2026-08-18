@@ -249,6 +249,34 @@ def test_context_ignores_detector_scores_without_finite_values(monkeypatch):
     assert context.real_scores(["IQR"]) == {}
 
 
+def test_forecasting_passes_weighted_sub_pca(monkeypatch):
+    captured = {}
+    segment = _seasonal_series(n=30)
+
+    monkeypatch.setattr(detection_module, "resolve_model_class", lambda _name: object)
+    monkeypatch.setattr(
+        detection_module,
+        "_filter_model_kwargs",
+        lambda _model_cls, kwargs: captured.update(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(item)) for item in segments],
+    )
+
+    scores = detection_module._score_segments(
+        ["Sub_PCA"], [segment], seed=13, device="cpu", freq="h"
+    )
+
+    assert captured["weighted"] is True
+    assert list(scores) == ["Sub_PCA"]
+
 def test_consensus_tracks_partial_finite_coverage():
     n = 30
     scores = _spike_scores(n, [20])

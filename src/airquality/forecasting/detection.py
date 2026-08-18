@@ -135,6 +135,8 @@ def _score_segments(
         requested_kwargs = {"device": device}
         if name == "Prophet":
             requested_kwargs["freq"] = freq
+        if name == "Sub_PCA":
+            requested_kwargs["weighted"] = True
         kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
         try:
             model = fit_model_segments(
@@ -352,6 +354,8 @@ class SeriesDetectionContext:
             requested_kwargs = {"device": self.device}
             if name == "Prophet":
                 requested_kwargs["freq"] = self.freq
+            if name == "Sub_PCA":
+                requested_kwargs["weighted"] = True
             kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
             try:
                 model = fit_model_segments(
