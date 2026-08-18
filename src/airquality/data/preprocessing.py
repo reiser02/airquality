@@ -57,20 +57,23 @@ def hourly_mean(
     *,
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
+    exclude_frozen: bool = True,
 ) -> pd.DataFrame:
     """Media horaria a partir de datos de 5 minutos.
 
     Se fija la frecuencia a 5 min (12 ranuras por hora; los huecos pasan a NaN).
-    Una lectura es "util" si supera el umbral y no pertenece a un tramo
-    congelado. Si al menos ``min_useful`` lecturas de la hora son utiles, la
-    media se calcula con ESAS; si no, la hora es NaN.
+    Una lectura es "util" si supera el umbral y, por defecto, no pertenece a
+    un tramo congelado. Si al menos ``min_useful`` lecturas de la hora son
+    utiles, la media se calcula con ESAS; si no, la hora es NaN.
     """
     threshold = DETECTION_LIMITS[pollutant]
     col = df.columns[0]
     series = ensure_datetime_series(df[col], freq=RAW_FREQ, name=col)
 
     hour = series.index.floor(HOURLY_FREQ)
-    is_useful = (series >= threshold) & ~frozen_mask(series, min_run=min_run)
+    is_useful = series >= threshold
+    if exclude_frozen:
+        is_useful &= ~frozen_mask(series, min_run=min_run)
 
     n_useful = is_useful.groupby(hour).sum()
     mean_useful = series.where(is_useful).groupby(hour).mean()
@@ -86,15 +89,19 @@ def preprocess(
     *,
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
+    exclude_frozen: bool = True,
+    remove_repeated: bool = True,
 ):
-    """Pipeline completo: 5 min -> media horaria -> marcado de congelados.
+    """Pipeline completo: 5 min -> media horaria -> filtrado horario opcional.
 
     Para cada estacion calcula la media horaria (:func:`hourly_mean`, que ya
-    garantiza valor >= umbral o NaN) y marca los congelados a nivel horario:
-    toda fila igual a la anterior (repeticion consecutiva) pasa a NaN y se
-    conserva la primera de cada bloque. No hace falta filtrar por umbral (la
-    media nunca queda por debajo) ni los NaN (no estorban al comparar ni aguas
-    abajo, donde se vuelve a re-rejillar).
+    garantiza valor >= umbral o NaN) y, por defecto, marca los congelados a
+    nivel horario: toda fila igual a la anterior (repeticion consecutiva) pasa
+    a NaN y se conserva la primera de cada bloque. ``exclude_frozen`` y
+    ``remove_repeated`` permiten conservar esos valores para comparaciones de
+    sensibilidad. No hace falta filtrar por umbral (la media nunca queda por
+    debajo) ni los NaN (no estorban al comparar ni aguas abajo, donde se vuelve
+    a re-rejillar).
 
     Devuelve las series horarias limpias y el numero de filas congeladas
     marcadas por estacion.
@@ -103,12 +110,21 @@ def preprocess(
     frozen_counts = []
 
     for df in dfs:
-        hourly = hourly_mean(df, pollutant, min_run=min_run, min_useful=min_useful)
+        hourly = hourly_mean(
+            df,
+            pollutant,
+            min_run=min_run,
+            min_useful=min_useful,
+            exclude_frozen=exclude_frozen,
+        )
         col = hourly[hourly.columns[0]]
 
         # Congelado horario: igual a la fila anterior. Los NaN no se marcan
         # (NaN != NaN), asi que solo caen las repeticiones reales de valor.
-        is_frozen = col == col.shift()
+        if remove_repeated:
+            is_frozen = col == col.shift()
+        else:
+            is_frozen = pd.Series(False, index=col.index)
         frozen_counts.append(int(is_frozen.sum()))
         hourly.loc[is_frozen, hourly.columns[0]] = pd.NA
         processed.append(hourly)
