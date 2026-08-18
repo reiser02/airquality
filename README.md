@@ -274,6 +274,14 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
+- `model_performance_by_gap_{mae,rmse,mase}.png`: error, mean rank, and top-three frequency for every gap size
+- `overall_model_performance_{mae,rmse,mase}.png`: compact global scorecards
+- `global_station_error_{mae,rmse,mase}.png`: distributions of gap-averaged error across stations
+- `pairwise_win_rate_{mae,rmse,mase}.png`: matched head-to-head win rates for every model pair
+- `gap_degradation_{mae,rmse,mase}.png`: relative degradation from each model's shortest gap
+- `tail_risk_{mae,rmse,mase}.png`: mean error versus the hardest 10% of stations
+- `error_correlation_{mae,rmse,mase}.png`: similarity of station-level error patterns between models
+- `model_performance_by_gap.csv`, `overall_model_performance.csv`, and the corresponding diagnostic CSVs: data behind the summaries
 - `plot_store.csv.gz`: compressed actual values and per-model predictions used by the plots
 - `plot_images.csv`: manifest of saved plot images
 - `plots/gap_*/...png`: per-series benchmark plots
@@ -284,6 +292,22 @@ Regenerate every figure from those saved CSVs without rerunning any model:
 uv run python -m airquality.imputation.plot_montecarlo_results \
     reports/benchmark/montecarlo_YYYYMMDD_HHMMSS
 ```
+
+Generate reproducible CSV and LaTeX tables with the best models, mean, median,
+station-level standard deviation, rank, and global performance profile:
+
+```bash
+uv run python -m airquality.imputation.latex_tables \
+    reports/benchmark/montecarlo_YYYYMMDD_HHMMSS \
+    --top-k 5
+```
+
+The tables are written to `<run_dir>/latex_tables/`. The standard deviation is
+computed over station-level means after averaging Monte Carlo seeds. The
+per-series `plots/gap_*/` figures show the temporal context and a horizontal
+boxplot of pointwise absolute errors for every model. The boxplot reports the
+interquartile range, median, mean, and outliers for one representative seed,
+avoiding overlapping prediction lines for short gaps.
 
 ### Fine-tune TSPulse
 
