@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 
 import numpy as np
@@ -55,11 +56,13 @@ from airquality.anomaly.registry import (
 )
 from airquality.data.segments import contiguous_observed_segments
 from airquality.data.series import ensure_datetime_series
+from airquality.forecasting.progress import get_progress_logger
 
 if TYPE_CHECKING:
     from airquality.forecasting.cache import BenchmarkCache
 
 DEFAULT_SEED = 13
+PROGRESS_LOGGER = get_progress_logger()
 
 #: Minimum contiguous observed points a segment needs to enter detection.
 MIN_SEGMENT_POINTS = 8
@@ -280,9 +283,31 @@ class SeriesDetectionContext:
             cached = self._cached("detector_scores", {"detector": name})
             if cached is not None:
                 self._real_scores[name] = cached
+                PROGRESS_LOGGER.info(
+                    "[detector][%s][%s] done cache=hit segments=%d",
+                    self.series.name,
+                    name,
+                    len(self.segments),
+                )
                 continue
             if not self.segments:
                 continue
+            cache_state = (
+                "miss"
+                if self.cache is not None
+                and self.cache.enabled
+                and self.cache_key is not None
+                else "off"
+            )
+            started = time.perf_counter()
+            PROGRESS_LOGGER.info(
+                "[detector][%s][%s] start cache=%s segments=%d device=%s",
+                self.series.name,
+                name,
+                cache_state,
+                len(self.segments),
+                self.device,
+            )
             scored = _score_segments(
                 [name],
                 self.segments,
@@ -294,8 +319,18 @@ class SeriesDetectionContext:
             if name in scored:
                 self._real_scores[name] = scored[name]
                 self._store("detector_scores", {"detector": name}, scored[name])
+                status = "ok"
             else:
                 self._real_failed.add(name)
+                status = "failed"
+            PROGRESS_LOGGER.info(
+                "[detector][%s][%s] done cache=%s status=%s elapsed=%.1fs",
+                self.series.name,
+                name,
+                cache_state,
+                status,
+                time.perf_counter() - started,
+            )
         return {name: self._real_scores[name] for name in names if name in self._real_scores}
 
     def selection_segment_indices(self) -> list[int]:
@@ -356,8 +391,31 @@ class SeriesDetectionContext:
             if len(cached_values) == len(selected_indices):
                 for segment_index, value in cached_values.items():
                     local[segment_index][name] = value
+                PROGRESS_LOGGER.info(
+                    "[detector-selection][%s][%s] done cache=hit segments=%d",
+                    self.series.name,
+                    name,
+                    len(selected_indices),
+                )
                 continue
 
+            cache_state = (
+                "miss"
+                if self.cache is not None
+                and self.cache.enabled
+                and self.cache_key is not None
+                else "off"
+            )
+            started = time.perf_counter()
+            PROGRESS_LOGGER.info(
+                "[detector-selection][%s][%s] start cache=%s cached_segments=%d/%d device=%s",
+                self.series.name,
+                name,
+                cache_state,
+                len(cached_values),
+                len(selected_indices),
+                self.device,
+            )
             model_cls = resolve_model_class(name)
             requested_kwargs = {"device": self.device}
             if name == "Prophet":
@@ -403,6 +461,13 @@ class SeriesDetectionContext:
                     },
                     value,
                 )
+            PROGRESS_LOGGER.info(
+                "[detector-selection][%s][%s] done cache=%s elapsed=%.1fs",
+                self.series.name,
+                name,
+                cache_state,
+                time.perf_counter() - started,
+            )
 
         self._ranking = {
             name: float(np.mean([local[index][name] for index in selected_indices]))

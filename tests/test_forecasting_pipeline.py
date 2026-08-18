@@ -509,10 +509,13 @@ def test_gpu_worker_preserves_train_and_inference_timings(monkeypatch):
     expected = {"train_seconds": 1.25, "inference_seconds": 0.5}
     monkeypatch.setattr(cp, "resolve_forecasting_model_configs", fake_configs)
     monkeypatch.setattr(cp, "backtest_forecast", lambda *args, **kwargs: expected)
+    released = []
+    monkeypatch.setattr(cp, "_release_cuda_memory", lambda: released.append(True))
 
     assert cp._run_gpu_backtest(task) is expected
     assert seen["accelerator"] == "gpu"
     assert seen["devices"] == [1]
+    assert released == [True]
 
 
 # --------------------------------------------------------------------------- #
@@ -694,6 +697,13 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
 
     for artifact in ("results.csv", "summary.csv", "detection.csv", "selection.csv"):
         assert (tmp_path / artifact).exists()
+    progress_log = artifacts["log_path"].read_text(encoding="utf-8")
+    assert "[log-guide] elapsed=wall-clock time" in progress_log
+    assert "branch=forecast arm" in progress_log
+    assert "[station 1/1][ST0] start" in progress_log
+    assert "[backtest task=" in progress_log
+    assert "cache=off" in progress_log
+    assert "[run] done" in progress_log
     for col in (
         "rmse_raw",
         "rmse_unlabeled+impute",
@@ -805,7 +815,7 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cp,
         "_create_gpu_executor",
-        lambda _indices: (FakeExecutor(), FakeQueue()),
+        lambda _indices, _log_queue=None: (FakeExecutor(), FakeQueue()),
     )
     monkeypatch.setattr(
         cp,
@@ -852,6 +862,39 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
         "scope",
         "n_observed",
     ]
+
+
+def test_run_benchmark_closes_gpu_resources_on_failure(monkeypatch):
+    calls = []
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append(("executor", wait, cancel_futures))
+
+    class FakeQueue:
+        def close(self):
+            calls.append(("queue-close",))
+
+        def join_thread(self):
+            calls.append(("queue-join",))
+
+    def fail_run(*, mask_transforms):
+        cp._ACTIVE_GPU_EXECUTOR = FakeExecutor()
+        cp._ACTIVE_DEVICE_QUEUE = FakeQueue()
+        raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(cp, "_run_benchmark_from_config", fail_run)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        cp.run_benchmark_from_config()
+
+    assert calls == [
+        ("executor", True, True),
+        ("queue-close",),
+        ("queue-join",),
+    ]
+    assert cp._ACTIVE_GPU_EXECUTOR is None
+    assert cp._ACTIVE_DEVICE_QUEUE is None
 
 
 def test_backtest_mase_matches_mae_over_seasonal_naive_denominator():

@@ -63,6 +63,8 @@ def test_cache_roundtrip_and_key_isolation(tmp_path):
     # A different key never reads another entry's value.
     assert cache.get("backtest", {**key, "model": "TiDE"}) is None
     assert cache.hits == 1 and cache.misses == 2
+    assert cache.stats_by_namespace() == {"backtest": {"hits": 1, "misses": 2}}
+    assert "backtest=1 aciertos/2 fallos" in cache.stats()
 
 
 def test_cache_disabled_is_noop():
