@@ -496,6 +496,7 @@ def run_benchmark_from_config(
     detection_device = "cuda" if gpu_indices else "cpu"
     threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
     max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
+    carla_stride = cfg_get_int("forecasting", "carla_stride", 1)
     detectors = list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
     imputation_model = cfg_get_str("forecasting", "imputation_model", "TSPulse")
     max_imputation_gap = cfg_get_int(
@@ -564,6 +565,8 @@ def run_benchmark_from_config(
     )
     if threshold_k < 0:
         raise ValueError("threshold_k no puede ser negativo")
+    if carla_stride < 1:
+        raise ValueError("carla_stride debe ser positivo")
     if not 0.0 <= max_detection_rate <= 1.0:
         raise ValueError("max_detection_rate debe estar entre 0 y 1")
     if min_selection_points < MIN_SEGMENT_POINTS:
@@ -752,6 +755,7 @@ def run_benchmark_from_config(
                 "seed": seed,
                 "device": detection_device,
                 "freq": freq,
+                "carla_stride": carla_stride,
                 "injection_seed": injection_seed,
                 "min_selection_points": min_selection_points,
                 "cache": cache,
