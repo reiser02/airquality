@@ -282,14 +282,10 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
     assert set(results["condition"]) == {
         CLEAN_REFERENCE,
         CORRUPTED,
-        "unlabeled",
-        "inject-best",
         "inject-vote",
     }
-    assert len(results) == 40
+    assert len(results) == 24
     assert set(results.loc[results["imputation_applied"], "condition"]) == {
-        "unlabeled",
-        "inject-best",
         "inject-vote",
     }
     assert prepare_calls == [8, 48]
@@ -298,6 +294,6 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         for values in target_values.values()
         for candidate in values[1:]
     )
-    assert len(artifacts["foundation_preprocessing_summary_df"]) == 24
+    assert len(artifacts["foundation_preprocessing_summary_df"]) == 8
     assert (tmp_path / "foundation_preprocessing_results.csv").exists()
     assert (tmp_path / "foundation_preprocessing_summary.csv").exists()

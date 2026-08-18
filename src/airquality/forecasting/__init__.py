@@ -8,6 +8,9 @@ synthetic-context experiment measures preprocessing recovery for frozen
 foundation models.
 """
 
+from importlib import import_module
+from typing import Any
+
 from airquality.forecasting.backtest import (
     backtest_forecast,
     get_forecast_model_requirements,
@@ -27,12 +30,23 @@ from airquality.forecasting.detection import (
     common_detection_support,
 )
 from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
-from airquality.forecasting.pipeline import (
-    ForecastArm,
-    ForecastRegime,
-    build_arms,
-    run_benchmark_from_config,
-)
+
+_PIPELINE_EXPORTS = {
+    "ForecastArm",
+    "ForecastRegime",
+    "build_arms",
+    "run_benchmark_from_config",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load pipeline exports lazily so ``python -m ...pipeline`` runs once."""
+    if name in _PIPELINE_EXPORTS:
+        pipeline = import_module("airquality.forecasting.pipeline")
+        value = getattr(pipeline, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "run_benchmark_from_config",

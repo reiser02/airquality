@@ -290,18 +290,23 @@ def _fit_forecast_model(
     val_scaled: list[TimeSeries],
     *,
     size_k: int,
+    cleanup_checkpoints: bool = False,
 ):
     """Fit a trained/global model or register a local/zero-shot model."""
     if config.mode == "local":
         model = config.model_cls(**config.kwargs)
         model.fit(train_scaled[-1], verbose=False)
         return model
+    fit_kwargs = {"verbose": False}
+    if cleanup_checkpoints:
+        fit_kwargs["cleanup_checkpoints"] = True
     return fit_darts_model(
         config.model_cls,
         train_scaled,
         val_scaled,
         size_k,
         config.kwargs,
+        **fit_kwargs,
     )
 
 
@@ -430,6 +435,7 @@ def backtest_forecast(
     forecast_stride: int | None = None,
     context_len: int = 72,
     model_config: ForecastModelConfig | None = None,
+    cleanup_checkpoints: bool = False,
 ) -> dict:
     """Train ``model_name`` on ``train_series`` and backtest over the holdout.
 
@@ -538,6 +544,7 @@ def backtest_forecast(
             train_scaled,
             val_scaled,
             size_k=size_k,
+            cleanup_checkpoints=cleanup_checkpoints,
         )
         result["train_seconds"] = time.perf_counter() - fit_start
         try:

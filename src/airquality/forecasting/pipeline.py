@@ -28,9 +28,9 @@ training portion.
 
 Foundation models remain single zero-shot references in that common test. A
 separate paired experiment injects one synthetic anomaly type into copies of
-clean test contexts and compares ``clean_reference``, ``corrupted`` and each
-detection strategy; imputation is only a compatibility fallback after a NaN
-causes foundation prediction to fail.
+clean test contexts and compares ``clean_reference``, ``corrupted`` and
+``inject-vote``; imputation is only a compatibility fallback after a NaN causes
+foundation prediction to fail.
 
 Detections and backtests are cached on disk (:mod:`airquality.forecasting.cache`,
 ``[forecasting] use_cache`` / ``cache_dir``): an interrupted run resumes where
@@ -52,6 +52,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
 from pathlib import Path
+import time
 from typing import Any, Sequence
 
 import pandas as pd
@@ -94,6 +95,7 @@ from airquality.forecasting.detection import (
     DetectionStrategy,
     MaskTransform,
     SeriesDetectionContext,
+    STRATEGY_INJECT_VOTE,
     apply_mask_transforms,
     build_detection_strategy,
     common_detection_support,
@@ -115,6 +117,11 @@ from airquality.forecasting.foundation_preprocessing import (
 from airquality.forecasting.registry import (
     forecast_model_cache_identity,
     resolve_forecasting_model_configs,
+)
+from airquality.forecasting.progress import (
+    BenchmarkProgress,
+    configure_worker_progress_logging,
+    get_progress_logger,
 )
 from airquality.imputation.registry import (
     DARTS_GLOBAL,
@@ -140,6 +147,10 @@ IMPUTATION_CHOICES = ("both", "impute", "none")
 #: arm's std / naive error and inflating its scaled metric). Multiply ``rmse``
 #: by the persisted ``scale_ref`` column to recover raw units.
 METRIC_COLS = ("rmse", "mase")
+PROGRESS_LOGGER = get_progress_logger()
+_ACTIVE_PROGRESS: BenchmarkProgress | None = None
+_ACTIVE_GPU_EXECUTOR: ProcessPoolExecutor | None = None
+_ACTIVE_DEVICE_QUEUE: Any | None = None
 
 RESULT_COLUMNS = (
     "regime", "horizon", "forecast_stride", "validation_len",
@@ -224,6 +235,11 @@ class _BacktestTask:
     validation_stride: int
     forecast_stride: int
     context_len: int
+    series_name: str = ""
+    arm_name: str = ""
+    regime_name: str = ""
+    ordinal: int = 0
+    total: int = 0
 
 
 _FORECAST_WORKER_GPU: int | None = None
@@ -249,13 +265,27 @@ def resolve_forecasting_devices(requested: str) -> tuple[str, ...]:
     return tuple(f"cuda:{index}" for index in range(count))
 
 
-def _bind_forecast_worker(device_queue: Any) -> None:
+def _bind_forecast_worker(device_queue: Any, log_queue: Any | None = None) -> None:
     """Claim exactly one GPU for the lifetime of a spawned forecast worker."""
     import torch
 
     global _FORECAST_WORKER_GPU
     _FORECAST_WORKER_GPU = int(device_queue.get())
     torch.cuda.set_device(_FORECAST_WORKER_GPU)
+    if log_queue is not None:
+        configure_worker_progress_logging(log_queue)
+
+
+def _release_cuda_memory() -> None:
+    """Release unreachable objects and cached CUDA allocator blocks."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
@@ -269,8 +299,19 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
         accelerator="gpu",
         devices=[_FORECAST_WORKER_GPU],
     )[task.model_name]
+    started = time.perf_counter()
+    PROGRESS_LOGGER.info(
+        "[backtest task=%d/%d][%s][%s][%s][%s] start device=cuda:%d",
+        task.ordinal,
+        task.total,
+        task.series_name,
+        task.regime_name,
+        task.arm_name,
+        task.model_name,
+        _FORECAST_WORKER_GPU,
+    )
     try:
-        return backtest_forecast(
+        result = backtest_forecast(
             task.train_series,
             task.test_series,
             task.model_name,
@@ -283,13 +324,35 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
             validation_stride=task.validation_stride,
             forecast_stride=task.forecast_stride,
             context_len=task.context_len,
+            cleanup_checkpoints=True,
             model_config=model_config,
         )
+    except Exception:
+        PROGRESS_LOGGER.exception(
+            "[backtest task=%d/%d][%s][%s][%s][%s] failed device=cuda:%d",
+            task.ordinal,
+            task.total,
+            task.series_name,
+            task.regime_name,
+            task.arm_name,
+            task.model_name,
+            _FORECAST_WORKER_GPU,
+        )
+        raise
     finally:
-        gc.collect()
-        import torch
-
-        torch.cuda.empty_cache()
+        _release_cuda_memory()
+    PROGRESS_LOGGER.info(
+        "[backtest task=%d/%d][%s][%s][%s][%s] worker-finish device=cuda:%d elapsed=%.1fs",
+        task.ordinal,
+        task.total,
+        task.series_name,
+        task.regime_name,
+        task.arm_name,
+        task.model_name,
+        _FORECAST_WORKER_GPU,
+        time.perf_counter() - started,
+    )
+    return result
 
 
 def _uses_gpu_worker(model_config: Any) -> bool:
@@ -299,6 +362,7 @@ def _uses_gpu_worker(model_config: Any) -> bool:
 
 def _create_gpu_executor(
     gpu_indices: tuple[int, ...],
+    log_queue: Any | None = None,
 ) -> tuple[ProcessPoolExecutor, Any]:
     """Create one spawned, device-bound worker per visible GPU."""
     spawn_context = mp.get_context("spawn")
@@ -309,9 +373,27 @@ def _create_gpu_executor(
         max_workers=len(gpu_indices),
         mp_context=spawn_context,
         initializer=_bind_forecast_worker,
-        initargs=(device_queue,),
+        initargs=(device_queue, log_queue),
     )
     return executor, device_queue
+
+
+def _shutdown_gpu_resources(*, cancel_futures: bool) -> None:
+    """Close GPU workers and their device queue after success or failure."""
+    global _ACTIVE_DEVICE_QUEUE, _ACTIVE_GPU_EXECUTOR
+    executor = _ACTIVE_GPU_EXECUTOR
+    device_queue = _ACTIVE_DEVICE_QUEUE
+    _ACTIVE_GPU_EXECUTOR = None
+    _ACTIVE_DEVICE_QUEUE = None
+    if executor is not None:
+        try:
+            executor.shutdown(wait=True, cancel_futures=cancel_futures)
+        except TypeError:
+            # Keep lightweight test doubles and older executors compatible.
+            executor.shutdown(wait=True)
+    if device_queue is not None:
+        device_queue.close()
+        device_queue.join_thread()
 
 
 def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
@@ -358,12 +440,31 @@ def _detect_for_strategies(
     detections: dict[str, DetectionResult] = {}
     for strategy in strategies:
         key = {**base_key, "stage": "detection", "strategy": asdict(strategy)}
+        started = time.perf_counter()
         detection = cache.get("detection", key)
+        cache_state = (
+            "hit" if detection is not None else ("miss" if cache.enabled else "off")
+        )
         if detection is None:
+            PROGRESS_LOGGER.info(
+                "[detection][%s][%s] start cache=%s",
+                series.name,
+                strategy.name,
+                cache_state,
+            )
             if context is None:
                 context = SeriesDetectionContext(series, **context_kwargs)
             detection = apply_mask_transforms(series, strategy.detect(context), mask_transforms)
             cache.put("detection", key, detection)
+        PROGRESS_LOGGER.info(
+            "[detection][%s][%s] done cache=%s detectors=%d flagged=%d elapsed=%.1fs",
+            series.name,
+            strategy.name,
+            cache_state,
+            len(detection.detectors),
+            detection.n_flagged,
+            time.perf_counter() - started,
+        )
         detections[strategy.name] = detection
     return detections
 
@@ -441,7 +542,7 @@ def _cacheable_foundation_test(result: dict[str, Any], horizon: int) -> bool:
     )
 
 
-def run_benchmark_from_config(
+def _run_benchmark_from_config(
     mask_transforms: Sequence[MaskTransform] | None = None,
 ) -> dict[str, Any]:
     """Run the multi-arm forecasting benchmark defined by the config.
@@ -588,6 +689,9 @@ def run_benchmark_from_config(
     vote_min_votes = cfg_get_int("forecasting", "vote_min_votes", DEFAULT_VOTE_MIN_VOTES)
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
     cache_dir = cfg_get_str("forecasting", "cache_dir", "reports/forecasting/cache")
+    heartbeat_seconds = cfg_get_int("forecasting", "heartbeat_seconds", 60)
+    if heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds debe ser positivo")
     cache = BenchmarkCache((_repo_root() / cache_dir) if use_cache else None)
     foundation_test_enabled = foundation_test_requested and bool(
         foundation_model_configs
@@ -596,11 +700,7 @@ def run_benchmark_from_config(
     arms = build_arms(strategy_specs, imputation)
     if all(not config.uses_training_arms for config in forecast_model_configs.values()):
         arms = arms[:1]
-    active_strategy_specs = (
-        strategy_specs
-        if foundation_test_enabled
-        else [arm.strategy for arm in arms if arm.strategy]
-    )
+    active_strategy_specs = [arm.strategy for arm in arms if arm.strategy]
     strategies = [
         build_detection_strategy(
             spec,
@@ -611,6 +711,19 @@ def run_benchmark_from_config(
         )
         for spec in dict.fromkeys(active_strategy_specs)
     ]
+    foundation_strategies = (
+        [
+            build_detection_strategy(
+                STRATEGY_INJECT_VOTE,
+                threshold_k=threshold_k,
+                max_detection_rate=max_detection_rate,
+                vote_top_k=vote_top_k,
+                vote_min_votes=vote_min_votes,
+            )
+        ]
+        if foundation_test_enabled
+        else []
+    )
 
     series_dfs = _load_raw_hourly_series(
         pollutant=pollutant, raw_base_dir=raw_base_dir, freq=freq
@@ -716,6 +829,45 @@ def run_benchmark_from_config(
                 artifacts["model"] = artifact_fingerprint(local_source)
         imputer_identity = {"config": imputer_config, "artifacts": artifacts}
 
+    global _ACTIVE_DEVICE_QUEUE, _ACTIVE_GPU_EXECUTOR, _ACTIVE_PROGRESS
+    output_dir = _build_output_dir()
+    progress = BenchmarkProgress(
+        output_dir,
+        heartbeat_seconds=heartbeat_seconds,
+    ).start()
+    _ACTIVE_PROGRESS = progress
+    run_started = time.perf_counter()
+    backtests_per_station = len(regimes) * sum(
+        len(arms) if config.uses_training_arms else 1
+        for config in forecast_model_configs.values()
+    )
+    PROGRESS_LOGGER.info(
+        "[run] start stations=%d devices=%s models=%s arms=%s regimes=%s "
+        "backtests_per_station=%d cache=%s output=%s",
+        len(series_dfs),
+        ",".join(forecast_devices),
+        ",".join(forecast_models),
+        ",".join(arm.name for arm in arms),
+        ",".join(regime.name for regime in regimes),
+        backtests_per_station,
+        cache.root if cache.enabled else "off",
+        output_dir,
+    )
+    PROGRESS_LOGGER.info(
+        "[log-guide] elapsed=wall-clock time since the current operation started; "
+        "task=position in the queued task list; completed=finished tasks; "
+        "total=tasks for the current station; pending_gpu=queued GPU tasks"
+    )
+    PROGRESS_LOGGER.info(
+        "[log-guide] backtest identity is [series][regime][branch][model]; "
+        "series=station/series name, regime=short or long, "
+        "branch=forecast arm (raw, unlabeled+impute, etc.), model=model name"
+    )
+    PROGRESS_LOGGER.info(
+        "[log-guide] example: [backtest task=18/146 completed=7/146]"
+        "[AQN1 - Puerto][long][unlabeled+impute][TiDE]"
+    )
+
     rows: list[dict[str, Any]] = []
     foundation_preprocessing_rows: list[dict[str, Any]] = []
     detection_rows: list[dict[str, Any]] = []
@@ -725,11 +877,30 @@ def run_benchmark_from_config(
     if gpu_indices and any(
         _uses_gpu_worker(config) for config in forecast_model_configs.values()
     ):
-        gpu_executor, device_queue = _create_gpu_executor(gpu_indices)
-    print(f"[info] Forecast devices: {','.join(forecast_devices)}")
-    for df in series_dfs:
+        gpu_executor, device_queue = _create_gpu_executor(
+            gpu_indices,
+            progress.log_queue,
+        )
+        _ACTIVE_GPU_EXECUTOR = gpu_executor
+        _ACTIVE_DEVICE_QUEUE = device_queue
+    for station_index, df in enumerate(series_dfs, start=1):
+        station_started = time.perf_counter()
         series = df.iloc[:, 0]
         name = str(series.name)
+        progress.update(
+            stage="detection",
+            detail=f"station={station_index}/{len(series_dfs)} name={name}",
+            completed=0,
+            total=len(strategies),
+            pending=0,
+        )
+        PROGRESS_LOGGER.info(
+            "[station %d/%d][%s] start observed=%d",
+            station_index,
+            len(series_dfs),
+            name,
+            int(series.notna().sum()),
+        )
         series_fp = series_fingerprint(series)
         series_foundation_test_seed = foundation_test_seed + int(series_fp[:8], 16)
         base_key = {
@@ -771,7 +942,9 @@ def run_benchmark_from_config(
                 },
             },
         )
-        for spec, detection in detections.items():
+        for detection_index, (spec, detection) in enumerate(
+            detections.items(), start=1
+        ):
             n_observed = int(series.notna().sum())
             n_scored = (
                 int(
@@ -783,12 +956,18 @@ def run_benchmark_from_config(
                 if detection.scored_mask is not None
                 else n_observed
             )
-            print(
-                f"[info] {name}/{spec}: detectores={','.join(detection.detectors) or 'none'} "
-                f"descartados={','.join(detection.discarded) or 'none'} "
-                f"tasa={detection.detection_rate:.2%} anomalias={detection.n_flagged} "
-                f"cobertura={n_scored / n_observed if n_observed else 0.0:.2%}"
+            PROGRESS_LOGGER.info(
+                "[detection][%s][%s] summary detectors=%s discarded=%s "
+                "rate=%.2f%% flagged=%d coverage=%.2f%%",
+                name,
+                spec,
+                ",".join(detection.detectors) or "none",
+                ",".join(detection.discarded) or "none",
+                100.0 * detection.detection_rate,
+                detection.n_flagged,
+                100.0 * (n_scored / n_observed if n_observed else 0.0),
             )
+            progress.update(completed=detection_index)
             detection_rows.append(
                 {
                     "series": name,
@@ -835,9 +1014,15 @@ def run_benchmark_from_config(
             "split_strategies": ",".join(detections),
         }
         if window is None:
-            print(
-                f"[skip] {name}: no hay soporte comun para train+validacion y "
-                f"{context_requirement} h de contexto + {holdout} h de test"
+            PROGRESS_LOGGER.info(
+                "[station %d/%d][%s] skip reason=no_common_fixed_holdout_and_training_host "
+                "context=%dh holdout=%dh elapsed=%.1fs",
+                station_index,
+                len(series_dfs),
+                name,
+                context_requirement,
+                holdout,
+                time.perf_counter() - station_started,
             )
             selection_rows.append(
                 {
@@ -869,6 +1054,15 @@ def run_benchmark_from_config(
                     / pd.Timedelta(hours=1)
                 ),
             }
+        )
+        PROGRESS_LOGGER.info(
+            "[station %d/%d][%s] selected train_end=%s test=%s..%s",
+            station_index,
+            len(series_dfs),
+            name,
+            window["train_end"],
+            test_target_start,
+            window["test_target_end"],
         )
 
         # One raw scale and MASE history are shared by every arm.
@@ -905,9 +1099,17 @@ def run_benchmark_from_config(
         test_fp = series_fingerprint(test_series)
         series_backtest_rows: dict[int, dict[str, Any]] = {}
         pending_gpu: dict[
-            Any, tuple[int, dict[str, Any], str, str, dict[str, Any]]
+            Any, tuple[int, dict[str, Any], str, str, dict[str, Any], str, float]
         ] = {}
         backtest_ordinal = 0
+        backtest_completed = 0
+        progress.update(
+            stage="backtest",
+            detail=f"station={station_index}/{len(series_dfs)} name={name}",
+            completed=0,
+            total=backtests_per_station,
+            pending=0,
+        )
 
         def store_backtest_row(
             ordinal: int,
@@ -915,7 +1117,11 @@ def run_benchmark_from_config(
             model_name: str,
             model_mode: str,
             result: dict[str, Any],
+            *,
+            cache_state: str,
+            wall_seconds: float,
         ) -> None:
+            nonlocal backtest_completed
             series_backtest_rows[ordinal] = {
                 **common,
                 "model": model_name,
@@ -935,6 +1141,33 @@ def run_benchmark_from_config(
                 "origin_rmse_mean": result.get("origin_rmse_mean", float("nan")),
                 "origin_rmse_std": result.get("origin_rmse_std", float("nan")),
             }
+            backtest_completed += 1
+            status = "ok" if _cacheable_backtest(result) else "incomplete"
+            PROGRESS_LOGGER.info(
+                "[backtest task=%d/%d completed=%d/%d][%s][%s][%s][%s] "
+                "done cache=%s status=%s train=%.1fs inference=%.1fs wall=%.1fs",
+                ordinal + 1,
+                backtests_per_station,
+                backtest_completed,
+                backtests_per_station,
+                common["series"],
+                common["regime"],
+                common["arm"],
+                model_name,
+                cache_state,
+                status,
+                float(result.get("train_seconds", float("nan"))),
+                float(result.get("inference_seconds", float("nan"))),
+                wall_seconds,
+            )
+            progress.update(
+                completed=backtest_completed,
+                pending=len(pending_gpu),
+                detail=(
+                    f"station={station_index}/{len(series_dfs)} name={name} "
+                    f"last={common['regime']}/{common['arm']}/{model_name}"
+                ),
+            )
 
         for regime in regimes:
             for arm in arms:
@@ -1001,12 +1234,43 @@ def run_benchmark_from_config(
                         "test_target_start": str(test_target_start),
                         "test_fp": test_fp,
                     }
+                    task_number = ordinal + 1
+                    task_started = time.perf_counter()
                     res = cache.get("backtest", backtest_key)
+                    cache_state = (
+                        "hit" if res is not None else ("miss" if cache.enabled else "off")
+                    )
                     if res is None:
+                        PROGRESS_LOGGER.info(
+                            "[backtest task=%d/%d][%s][%s][%s][%s] prepare cache=%s",
+                            task_number,
+                            backtests_per_station,
+                            name,
+                            regime.name,
+                            arm.name,
+                            model_name,
+                            cache_state,
+                        )
+                        progress.update(
+                            detail=(
+                                f"station={station_index}/{len(series_dfs)} name={name} "
+                                f"prepare={regime.name}/{arm.name}/{model_name}"
+                            )
+                        )
                         arm_train = train_for(arm)
                         if gpu_executor is not None and _uses_gpu_worker(
                             forecast_model_config
                         ):
+                            PROGRESS_LOGGER.info(
+                                "[backtest task=%d/%d][%s][%s][%s][%s] queued cache=%s",
+                                task_number,
+                                backtests_per_station,
+                                name,
+                                regime.name,
+                                arm.name,
+                                model_name,
+                                cache_state,
+                            )
                             future = gpu_executor.submit(
                                 _run_gpu_backtest,
                                 _BacktestTask(
@@ -1022,6 +1286,11 @@ def run_benchmark_from_config(
                                     validation_stride=regime.stride,
                                     forecast_stride=regime.stride,
                                     context_len=context_len,
+                                    series_name=name,
+                                    arm_name=arm.name,
+                                    regime_name=regime.name,
+                                    ordinal=task_number,
+                                    total=backtests_per_station,
                                 ),
                             )
                             pending_gpu[future] = (
@@ -1030,8 +1299,21 @@ def run_benchmark_from_config(
                                 model_name,
                                 forecast_model_config.mode,
                                 backtest_key,
+                                cache_state,
+                                task_started,
                             )
+                            progress.update(pending=len(pending_gpu))
                             continue
+                        PROGRESS_LOGGER.info(
+                            "[backtest task=%d/%d][%s][%s][%s][%s] start cache=%s device=cpu",
+                            task_number,
+                            backtests_per_station,
+                            name,
+                            regime.name,
+                            arm.name,
+                            model_name,
+                            cache_state,
+                        )
                         res = backtest_forecast(
                             arm_train,
                             test_series,
@@ -1044,6 +1326,7 @@ def run_benchmark_from_config(
                             validation_stride=regime.stride,
                             forecast_stride=regime.stride,
                             context_len=context_len,
+                            cleanup_checkpoints=True,
                             model_config=forecast_model_config,
                             # Shared raw history: every arm's MASE uses the SAME
                             # seasonal-naive denominator (see METRIC_COLS).
@@ -1057,14 +1340,33 @@ def run_benchmark_from_config(
                         model_name,
                         forecast_model_config.mode,
                         res,
+                        cache_state=cache_state,
+                        wall_seconds=time.perf_counter() - task_started,
                     )
 
-        for future in as_completed(pending_gpu):
-            ordinal, common, model_name, model_mode, backtest_key = pending_gpu[future]
+        for gpu_completed, future in enumerate(as_completed(pending_gpu), start=1):
+            (
+                ordinal,
+                common,
+                model_name,
+                model_mode,
+                backtest_key,
+                cache_state,
+                task_started,
+            ) = pending_gpu[future]
             res = future.result()
             if _cacheable_backtest(res):
                 cache.put("backtest", backtest_key, res)
-            store_backtest_row(ordinal, common, model_name, model_mode, res)
+            store_backtest_row(
+                ordinal,
+                common,
+                model_name,
+                model_mode,
+                res,
+                cache_state=cache_state,
+                wall_seconds=time.perf_counter() - task_started,
+            )
+            progress.update(pending=len(pending_gpu) - gpu_completed)
         rows.extend(series_backtest_rows[index] for index in sorted(series_backtest_rows))
 
         if foundation_test_enabled:
@@ -1079,8 +1381,31 @@ def run_benchmark_from_config(
                     test_seed=series_foundation_test_seed,
                     freq=freq,
                 )
+                progress.update(
+                    stage="foundation-prepare",
+                    detail=f"station={name} regime={regime.name}",
+                    completed=0,
+                    total=len(cases),
+                    pending=0,
+                )
+                PROGRESS_LOGGER.info(
+                    "[foundation][%s][%s] prepare-cases start cases=%d",
+                    name,
+                    regime.name,
+                    len(cases),
+                )
                 prepared_cases = []
-                for case in cases:
+                for case_index, case in enumerate(cases, start=1):
+                    case_started = time.perf_counter()
+                    PROGRESS_LOGGER.info(
+                        "[foundation-case %d/%d][%s][%s][%s] start origin=%s",
+                        case_index,
+                        len(cases),
+                        name,
+                        regime.name,
+                        case.anomaly_type,
+                        case.origin,
+                    )
                     history = series.loc[: case.clean_context.index[-1]].copy()
                     history.loc[case.corrupted_context.index] = case.corrupted_context
                     synthetic_fp = series_fingerprint(history)
@@ -1095,7 +1420,7 @@ def run_benchmark_from_config(
                     }
                     synthetic_detections = _detect_for_strategies(
                         history,
-                        strategies,
+                        foundation_strategies,
                         mask_transforms,
                         cache=cache,
                         base_key=synthetic_base_key,
@@ -1125,12 +1450,36 @@ def run_benchmark_from_config(
                             build_preprocessing_contexts(case, synthetic_detections),
                         )
                     )
+                    PROGRESS_LOGGER.info(
+                        "[foundation-case %d/%d][%s][%s][%s] done elapsed=%.1fs",
+                        case_index,
+                        len(cases),
+                        name,
+                        regime.name,
+                        case.anomaly_type,
+                        time.perf_counter() - case_started,
+                    )
+                    progress.update(completed=case_index)
+
+                foundation_total = len(foundation_model_configs) * sum(
+                    len(contexts) for _, _, contexts in prepared_cases
+                )
+                foundation_completed = 0
+                progress.update(
+                    stage="foundation-forecast",
+                    detail=f"station={name} regime={regime.name}",
+                    completed=0,
+                    total=foundation_total,
+                    pending=0,
+                )
 
                 for model_name, model_config in foundation_model_configs.items():
                     prepared_model: tuple[object, Any, pd.Series, float] | None = None
                     prepare_error: str | None = None
                     for case, synthetic_detections, contexts in prepared_cases:
                         for condition, context in contexts.items():
+                            task_number = foundation_completed + 1
+                            task_started = time.perf_counter()
                             detection = synthetic_detections.get(condition)
                             context_mask = (
                                 detection.mask.reindex(context.index, fill_value=False).astype(bool)
@@ -1162,8 +1511,31 @@ def run_benchmark_from_config(
                             result = cache.get(
                                 "foundation_preprocessing", forecast_key
                             )
+                            cache_state = (
+                                "hit"
+                                if result is not None
+                                else ("miss" if cache.enabled else "off")
+                            )
                             if result is None:
+                                PROGRESS_LOGGER.info(
+                                    "[foundation task=%d/%d][%s][%s][%s][%s][%s] "
+                                    "start cache=%s",
+                                    task_number,
+                                    foundation_total,
+                                    name,
+                                    regime.name,
+                                    model_name,
+                                    case.anomaly_type,
+                                    condition,
+                                    cache_state,
+                                )
                                 if prepared_model is None and prepare_error is None:
+                                    PROGRESS_LOGGER.info(
+                                        "[foundation-model][%s][%s][%s] load start",
+                                        name,
+                                        regime.name,
+                                        model_name,
+                                    )
                                     try:
                                         prepared_model = prepare_foundation_model(
                                             train_raw,
@@ -1176,6 +1548,15 @@ def run_benchmark_from_config(
                                         )
                                     except Exception as exc:
                                         prepare_error = f"{type(exc).__name__}: {exc}"
+                                    PROGRESS_LOGGER.info(
+                                        "[foundation-model][%s][%s][%s] load done "
+                                        "status=%s elapsed=%.1fs",
+                                        name,
+                                        regime.name,
+                                        model_name,
+                                        "failed" if prepare_error else "ok",
+                                        time.perf_counter() - task_started,
+                                    )
 
                                 result = {
                                     "rmse": float("nan"),
@@ -1298,17 +1679,66 @@ def run_benchmark_from_config(
                                     ),
                                 }
                             )
+                            foundation_completed += 1
+                            status = (
+                                "ok"
+                                if _cacheable_foundation_test(result, regime.horizon)
+                                else "failed"
+                            )
+                            PROGRESS_LOGGER.info(
+                                "[foundation task=%d/%d completed=%d/%d]"
+                                "[%s][%s][%s][%s][%s] done cache=%s status=%s "
+                                "load=%.1fs inference=%.1fs wall=%.1fs imputed=%s",
+                                task_number,
+                                foundation_total,
+                                foundation_completed,
+                                foundation_total,
+                                name,
+                                regime.name,
+                                model_name,
+                                case.anomaly_type,
+                                condition,
+                                cache_state,
+                                status,
+                                float(result.get("model_load_seconds", float("nan"))),
+                                float(result.get("inference_seconds", float("nan"))),
+                                time.perf_counter() - task_started,
+                                bool(result.get("imputation_applied", False)),
+                            )
+                            progress.update(
+                                completed=foundation_completed,
+                                detail=(
+                                    f"station={name} regime={regime.name} "
+                                    f"last={model_name}/{case.anomaly_type}/{condition}"
+                                ),
+                            )
                     if prepared_model is not None:
                         prepared_model = None
                         del model, scaler, foundation_insample
-                        gc.collect()
+                        _release_cuda_memory()
 
-    if gpu_executor is not None:
-        gpu_executor.shutdown(wait=True)
-    if device_queue is not None:
-        device_queue.close()
-        device_queue.join_thread()
-    print(f"[cache] {cache.stats()}")
+        PROGRESS_LOGGER.info(
+            "[station %d/%d][%s] done backtests=%d foundation_rows=%d elapsed=%.1fs",
+            station_index,
+            len(series_dfs),
+            name,
+            len(series_backtest_rows),
+            sum(1 for row in foundation_preprocessing_rows if row["series"] == name),
+            time.perf_counter() - station_started,
+        )
+
+    _shutdown_gpu_resources(cancel_futures=False)
+    imputer_ref.clear()
+    _release_cuda_memory()
+    progress.update(stage="finalizing", detail="building CSV artifacts", pending=0)
+    PROGRESS_LOGGER.info("[cache] %s", cache.stats())
+    for namespace, counts in cache.stats_by_namespace().items():
+        PROGRESS_LOGGER.info(
+            "[cache][%s] hits=%d misses=%d",
+            namespace,
+            counts["hits"],
+            counts["misses"],
+        )
     results_df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     summary_df = _summarize(results_df)
     detection_df = pd.DataFrame(
@@ -1336,7 +1766,6 @@ def run_benchmark_from_config(
         foundation_preprocessing_df
     )
 
-    output_dir = _build_output_dir()
     results_df.to_csv(output_dir / "results.csv", index=False)
     summary_df.to_csv(output_dir / "summary.csv", index=False)
     detection_df.to_csv(output_dir / "detection.csv", index=False)
@@ -1348,8 +1777,19 @@ def run_benchmark_from_config(
         output_dir / "foundation_preprocessing_summary.csv", index=False
     )
 
+    PROGRESS_LOGGER.info(
+        "[run] done rows=%d selected_stations=%d foundation_rows=%d elapsed=%.1fs artifacts=%s",
+        len(results_df),
+        int(selection_df["selected"].sum()) if not selection_df.empty else 0,
+        len(foundation_preprocessing_df),
+        time.perf_counter() - run_started,
+        output_dir,
+    )
+    progress.close()
+
     return {
         "output_dir": output_dir,
+        "log_path": output_dir / "benchmark.log",
         "arms": arms,
         "results_df": results_df,
         "summary_df": summary_df,
@@ -1358,6 +1798,20 @@ def run_benchmark_from_config(
         "foundation_preprocessing_df": foundation_preprocessing_df,
         "foundation_preprocessing_summary_df": foundation_preprocessing_summary_df,
     }
+
+
+def run_benchmark_from_config(
+    mask_transforms: Sequence[MaskTransform] | None = None,
+) -> dict[str, Any]:
+    """Run the configured benchmark and always stop progress resources."""
+    global _ACTIVE_PROGRESS
+    try:
+        return _run_benchmark_from_config(mask_transforms=mask_transforms)
+    finally:
+        _shutdown_gpu_resources(cancel_futures=True)
+        if _ACTIVE_PROGRESS is not None:
+            _ACTIVE_PROGRESS.close()
+            _ACTIVE_PROGRESS = None
 
 
 def main() -> None:

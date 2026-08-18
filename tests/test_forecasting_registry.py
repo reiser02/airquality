@@ -76,6 +76,29 @@ def test_local_model_fits_only_latest_series() -> None:
     assert calls["fit"] == (latest, False)
 
 
+def test_trained_forecasting_disables_darts_progress(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    expected = object()
+
+    def fake_fit(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr("airquality.forecasting.backtest.fit_darts_model", fake_fit)
+    series = TimeSeries.from_values([1.0, 2.0, 3.0, 4.0])
+
+    result = _fit_forecast_model(
+        ForecastModelConfig(object, {}, "trained"),
+        [series],
+        [series],
+        size_k=2,
+    )
+
+    assert result is expected
+    assert calls["kwargs"] == {"verbose": False}
+
+
 def test_forecasting_registry_overrides_worker_gpu() -> None:
     configs = resolve_forecasting_model_configs(
         ["TiDE", "Chronos2"],

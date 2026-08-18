@@ -23,6 +23,7 @@ import marshal
 import os
 import pickle
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
@@ -118,6 +119,8 @@ class BenchmarkCache:
         self.root = root
         self.hits = 0
         self.misses = 0
+        self.hits_by_namespace: Counter[str] = Counter()
+        self.misses_by_namespace: Counter[str] = Counter()
 
     @property
     def enabled(self) -> bool:
@@ -136,15 +139,19 @@ class BenchmarkCache:
                 entry = pickle.load(handle)
         except FileNotFoundError:
             self.misses += 1
+            self.misses_by_namespace[namespace] += 1
             return None
         except Exception as exc:  # corrupt/stale entry -> recompute
             logging.warning("[cache] entrada ilegible %s (%s); se recalcula", path.name, exc)
             self.misses += 1
+            self.misses_by_namespace[namespace] += 1
             return None
         if entry.get("key") != key:  # hash collision or format drift
             self.misses += 1
+            self.misses_by_namespace[namespace] += 1
             return None
         self.hits += 1
+        self.hits_by_namespace[namespace] += 1
         return entry["value"]
 
     def put(self, namespace: str, key: dict[str, Any], value: Any) -> None:
@@ -166,7 +173,28 @@ class BenchmarkCache:
         """One-line usage summary for logging."""
         if not self.enabled:
             return "cache deshabilitada"
-        return f"{self.hits} aciertos / {self.misses} fallos en {self.root}"
+        details = "; ".join(
+            f"{namespace}={counts['hits']} aciertos/{counts['misses']} fallos"
+            for namespace, counts in self.stats_by_namespace().items()
+        )
+        suffix = f"; {details}" if details else ""
+        return (
+            f"{self.hits} aciertos / {self.misses} fallos en {self.root}"
+            f"{suffix}"
+        )
+
+    def stats_by_namespace(self) -> dict[str, dict[str, int]]:
+        """Return hit/miss counters grouped by cache namespace."""
+        namespaces = sorted(
+            self.hits_by_namespace.keys() | self.misses_by_namespace.keys()
+        )
+        return {
+            namespace: {
+                "hits": self.hits_by_namespace[namespace],
+                "misses": self.misses_by_namespace[namespace],
+            }
+            for namespace in namespaces
+        }
 
 
 def _stable_state(value: Any, seen: set[int] | None = None) -> Any:
