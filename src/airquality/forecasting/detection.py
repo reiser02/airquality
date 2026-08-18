@@ -119,6 +119,7 @@ def _score_segments(
     *,
     seed: int,
     device: str,
+    freq: str = "h",
 ) -> dict[str, list[np.ndarray | None]]:
     """Score every detector on every segment (``None`` where a detector fails).
 
@@ -128,12 +129,20 @@ def _score_segments(
     """
     scores_by_model: dict[str, list[np.ndarray | None]] = {}
     values = [segment.to_numpy(dtype=np.float32) for segment in segments]
+    segment_indices = [pd.DatetimeIndex(segment.index) for segment in segments]
     for name in model_names:
         model_cls = resolve_model_class(name)
-        kwargs = _filter_model_kwargs(model_cls, {"device": device})
+        requested_kwargs = {"device": device}
+        if name == "Prophet":
+            requested_kwargs["freq"] = freq
+        kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
         try:
             model = fit_model_segments(
-                model_cls, values, seed=seed, model_kwargs=kwargs
+                model_cls,
+                values,
+                seed=seed,
+                model_kwargs=kwargs,
+                segment_indices=segment_indices,
             )
             segment_scores = score_model_segments(model, values)
         except Exception as exc:  # pragma: no cover - detector-specific failures
@@ -223,6 +232,7 @@ class SeriesDetectionContext:
         self.model_names = resolve_model_names(detectors if detectors else ["all"])
         self.seed = seed
         self.device = device
+        self.freq = freq
         self.injection_variant = injection_variant
         self.injection_seed = injection_seed
         self.min_selection_points = min_selection_points
@@ -264,7 +274,13 @@ class SeriesDetectionContext:
                 continue
             if not self.segments:
                 continue
-            scored = _score_segments([name], self.segments, seed=self.seed, device=self.device)
+            scored = _score_segments(
+                [name],
+                self.segments,
+                seed=self.seed,
+                device=self.device,
+                freq=self.freq,
+            )
             if name in scored:
                 self._real_scores[name] = scored[name]
                 self._store("detector_scores", {"detector": name}, scored[name])
@@ -303,12 +319,13 @@ class SeriesDetectionContext:
         injected_pairs = []
         for segment_index in selected_indices:
             segment = self.segments[segment_index]
+            injected_values, labels = inject_synthetic_anomalies(
+                segment.to_numpy(dtype=np.float32),
+                self.injection_variant,
+                self.injection_seed + segment_index,
+            )
             injected_pairs.append(
-                inject_synthetic_anomalies(
-                    segment.to_numpy(dtype=np.float32),
-                    self.injection_variant,
-                    self.injection_seed + segment_index,
-                )
+                (injected_values, labels, pd.DatetimeIndex(segment.index))
             )
 
         local = {index: {} for index in selected_indices}
@@ -332,16 +349,20 @@ class SeriesDetectionContext:
                 continue
 
             model_cls = resolve_model_class(name)
-            kwargs = _filter_model_kwargs(model_cls, {"device": self.device})
+            requested_kwargs = {"device": self.device}
+            if name == "Prophet":
+                requested_kwargs["freq"] = self.freq
+            kwargs = _filter_model_kwargs(model_cls, requested_kwargs)
             try:
                 model = fit_model_segments(
                     model_cls,
-                    [injected for injected, _ in injected_pairs],
+                    [injected for injected, _, _ in injected_pairs],
                     seed=self.seed,
                     model_kwargs=kwargs,
+                    segment_indices=[index for _, _, index in injected_pairs],
                 )
                 selected_scores = score_model_segments(
-                    model, [injected for injected, _ in injected_pairs]
+                    model, [injected for injected, _, _ in injected_pairs]
                 )
             except Exception as exc:  # pragma: no cover - detector-specific failures
                 logging.warning(
@@ -349,7 +370,7 @@ class SeriesDetectionContext:
                 )
                 selected_scores = [None] * len(injected_pairs)
 
-            for segment_index, (_, labels), scores in zip(
+            for segment_index, (_, labels, _), scores in zip(
                 selected_indices, injected_pairs, selected_scores, strict=True
             ):
                 if scores is None or np.asarray(scores).shape != labels.shape:

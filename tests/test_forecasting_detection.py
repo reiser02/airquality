@@ -270,7 +270,7 @@ def test_real_scores_resume_per_detector(tmp_path, monkeypatch):
     names = BASELINE_DETECTORS[:2]
     calls = []
 
-    def fake_score_segments(model_names, segments, *, seed, device):
+    def fake_score_segments(model_names, segments, *, seed, device, freq):
         name = model_names[0]
         calls.append(name)
         if len(calls) == 2:
