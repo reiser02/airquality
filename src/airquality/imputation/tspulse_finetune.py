@@ -19,7 +19,11 @@ from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 from airquality.data.io import resolve_device, to_pd_series
 from airquality.data.loaders import load_to_df
 from airquality.data.preprocessing import preprocess
-from airquality.data.segments import get_longest_segment
+from airquality.data.holdout import (
+    build_holdout_manifest,
+    select_retrospective_holdouts,
+    write_holdout_manifest,
+)
 
 try:
     from transformers import Trainer, TrainingArguments, set_seed
@@ -151,7 +155,9 @@ def load_series_list(
         (hourly,), _ = preprocess([df[[value_col]]], pollutant)
         values = to_pd_series(hourly, freq=freq, name=value_col)
 
-        name = build_series_name(csv_path, value_col)
+        # Use the canonical station identifier shared with Darts/benchmark so
+        # both subsystems derive an identical holdout manifest.
+        name = csv_path.parent.name.strip()
         if name in seen_names:
             suffix = 1
             while f"{name}_{suffix}" in seen_names:
@@ -181,28 +187,25 @@ def load_series_list(
 def build_train_long_df_from_series(
     series_dfs: list[pd.DataFrame],
     *,
-    longest_segment: pd.DataFrame,
+    holdouts_by_series: dict[str, pd.Series],
     timestamp_column: str,
     id_column: str,
     target_column: str,
 ) -> tuple[pd.DataFrame, int]:
     """Create long-format train dataframe from list-of-series.
 
-    Any timestamp belonging to `longest_segment` for its selected columns is masked as NaN
-    in train to avoid leakage from the held-out test block.
+    Each station-local holdout is masked as NaN while observations before and
+    after it remain available for retrospective imputation training.
     """
     rows: list[pd.DataFrame] = []
     heldout_points = 0
-
-    heldout_index = longest_segment.index
-    heldout_cols = set(longest_segment.columns)
 
     for series_df in series_dfs:
         col = str(series_df.columns[0])
         s = series_df.iloc[:, 0].astype(float).copy()
 
-        if col in heldout_cols and len(heldout_index) > 0:
-            overlap = s.index.intersection(heldout_index)
+        if col in holdouts_by_series:
+            overlap = s.index.intersection(holdouts_by_series[col].index)
             heldout_points += int(len(overlap))
             s.loc[overlap] = np.nan
 
@@ -404,7 +407,16 @@ def _resolve_run_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 def _load_training_series_and_split(
     args: argparse.Namespace,
     data_root: Path,
-) -> tuple[list[pd.DataFrame], pd.DataFrame, pd.DataFrame, int, pd.DataFrame, pd.DataFrame]:
+) -> tuple[
+    list[pd.DataFrame],
+    dict[str, pd.Series],
+    pd.DataFrame,
+    dict[str, object],
+    pd.DataFrame,
+    int,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
     """Load raw series, hold out the evaluation block, and build train/valid tables."""
     csv_files = discover_csv_files(
         data_root,
@@ -421,16 +433,27 @@ def _load_training_series_and_split(
         min_points=max(args.context_length + 16, args.min_series_points),
     )
 
-    longest_segment = get_longest_segment(
-        series_dfs,
-        verbose=args.verbose_segment,
+    min_train_len = int(args.min_train_len_base + args.size_k)
+    min_train_points = max(min_train_len, int(args.val_context_len)) + int(
+        args.val_size
     )
-    if longest_segment.empty:
-        raise RuntimeError("get_longest_segment devolvio un bloque vacio.")
+    holdouts, holdout_metadata = select_retrospective_holdouts(
+        series_dfs,
+        target_points=args.holdout_target_points,
+        context_points=args.holdout_context_points,
+        min_train_points=min_train_points,
+    )
+    holdout_manifest = build_holdout_manifest(
+        holdout_metadata,
+        target_points=args.holdout_target_points,
+        context_points=args.holdout_context_points,
+        min_train_points=min_train_points,
+        freq=args.freq,
+    )
 
     train_remainder_df, heldout_points = build_train_long_df_from_series(
         series_dfs,
-        longest_segment=longest_segment,
+        holdouts_by_series=holdouts,
         timestamp_column=args.timestamp_column,
         id_column=args.id_column,
         target_column=args.tspulse_target_column,
@@ -438,7 +461,10 @@ def _load_training_series_and_split(
 
     print(f"[info] Files loaded: {len(csv_files)}")
     print(f"[info] Series used: {len(series_dfs)}")
-    print(f"[info] Held-out test block shape (longest_segment): {longest_segment.shape}")
+    print(
+        "[info] Station holdouts: "
+        f"{len(holdouts)} series, {int(holdout_metadata['Test_Block_Points'].sum())} points"
+    )
     print(f"[info] Points masked in train due to held-out test block: {heldout_points}")
     print(f"[info] Remaining long rows before train/valid split: {len(train_remainder_df)}")
 
@@ -450,7 +476,16 @@ def _load_training_series_and_split(
         context_length=args.context_length,
     )
     print(f"[info] Train rows: {len(train_df)} | Valid rows: {len(valid_df)}")
-    return series_dfs, longest_segment, train_remainder_df, heldout_points, train_df, valid_df
+    return (
+        series_dfs,
+        holdouts,
+        holdout_metadata,
+        holdout_manifest,
+        train_remainder_df,
+        heldout_points,
+        train_df,
+        valid_df,
+    )
 
 
 def _build_preprocessor(args: argparse.Namespace) -> TimeSeriesPreprocessor:
@@ -631,6 +666,8 @@ def _save_finetuned_artifacts(
     output_dir: Path,
     trainer: object,
     tsp: TimeSeriesPreprocessor,
+    holdout_manifest: dict[str, object],
+    holdout_metadata: pd.DataFrame,
 ) -> None:
     """Persist the fine-tuned model and preprocessor to the output directory."""
     run_name = f"airquality_tspulse_ft_{args.mask_type}_{args.mask_ratio}"
@@ -638,6 +675,8 @@ def _save_finetuned_artifacts(
     save_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(save_dir))
     tsp.save_pretrained(str(save_dir / "preprocessor"))
+    write_holdout_manifest(holdout_manifest, save_dir / "holdout_manifest.json")
+    holdout_metadata.to_csv(save_dir / "holdouts.csv", index=False)
     print(f"[done] Fine-tuned model saved to: {save_dir}")
 
 
@@ -654,7 +693,7 @@ def run(args: argparse.Namespace) -> None:
     _validate_run_args(args)
 
     data_root, output_dir = _resolve_run_paths(args)
-    _, _, _, _, train_df, valid_df = _load_training_series_and_split(
+    _, _, holdout_metadata, holdout_manifest, _, _, train_df, valid_df = _load_training_series_and_split(
         args,
         data_root,
     )
@@ -711,7 +750,14 @@ def run(args: argparse.Namespace) -> None:
 
     trainer.train()
     _report_best_validation(trainer)
-    _save_finetuned_artifacts(args=args, output_dir=output_dir, trainer=trainer, tsp=tsp)
+    _save_finetuned_artifacts(
+        args=args,
+        output_dir=output_dir,
+        trainer=trainer,
+        tsp=tsp,
+        holdout_manifest=holdout_manifest,
+        holdout_metadata=holdout_metadata,
+    )
 
 
 def _build_parser_defaults() -> dict[str, object]:
@@ -727,6 +773,16 @@ def _build_parser_defaults() -> dict[str, object]:
         "freq": cfg_get_str("data", "freq", "h"),
         "min_non_nan_ratio": cfg_get_float("tspulse", "min_non_nan_ratio", 0.15),
         "min_series_points": cfg_get_int("tspulse", "min_series_points", 600),
+        "size_k": cfg_get_int("benchmark", "size_k", 5),
+        "val_size": cfg_get_int("benchmark", "val_size", 48),
+        "val_context_len": cfg_get_int("benchmark", "val_context_len", 72),
+        "min_train_len_base": cfg_get_int("benchmark", "min_train_len_base", 72),
+        "holdout_target_points": cfg_get_int(
+            "benchmark", "holdout_target_points", 192
+        ),
+        "holdout_context_points": cfg_get_int(
+            "benchmark", "holdout_context_points", 72
+        ),
         "id_column": cfg_get_str("tspulse", "id_column", "series_id"),
         "tspulse_target_column": cfg_get_str("tspulse", "tspulse_target_column", "value"),
         "model_id": cfg_get_str("tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"),
@@ -785,7 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
         config_defaults=defaults,
         description=(
             "Fine-tune TSPulse for imputation using list-of-series loading, "
-            "with held-out test block from get_longest_segment."
+            "with one retrospective held-out block per station."
         )
     )
 

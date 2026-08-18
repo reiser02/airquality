@@ -56,12 +56,12 @@ except Exception as exc:  # pragma: no cover - optional dependency path.
 
 
 try:
-    from darts.models import Prophet as DartsProphet  # Local forecasting model.
+    from prophet import Prophet as NativeProphet
 
     PROPHET_AVAILABLE = True
     PROPHET_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - optional dependency path.
-    DartsProphet = None
+    NativeProphet = None
     PROPHET_AVAILABLE = False
     PROPHET_IMPORT_ERROR = exc
 
@@ -576,17 +576,11 @@ class DartsGlobalGapImputer(_DartsContextImputer):
 
 
 class ProphetGapImputer(_DartsContextImputer):
-    """Adapter for Darts' local Prophet model.
-
-    Prophet is fit fresh on the clean left context of each gap and then forecasts
-    forward. It works in the original scale, so the external `scaler` is ignored.
-    """
+    """Retrospective Prophet imputer fitted once over all gaps in a condition."""
 
     _uses_external_scaler = False
 
-    #: Grab every contiguous clean point before the gap (Prophet fits better with
-    #: more history); ``_build_clean_left_context`` stops at NaN barriers / start.
-    _CONTEXT_WINDOW = 10**9
+    _SIDE_CONTEXT_POINTS = 14 * 24
 
     def __init__(
         self,
@@ -595,19 +589,23 @@ class ProphetGapImputer(_DartsContextImputer):
         min_context: int = 3,
         prophet_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
-        """Validate Prophet availability and store per-gap fitting options."""
+        """Validate Prophet availability and store retrospective fitting options."""
         if not PROPHET_AVAILABLE:
             raise ImportError(
                 "darts.models.Prophet no esta disponible en este entorno"
             ) from PROPHET_IMPORT_ERROR
         super().__init__(model=None, model_name=model_name)
-        # Prophet requires at least 3 observations to fit.
         self._min_required = max(3, int(min_context))
-        self._prophet_kwargs = dict(prophet_kwargs or {})
+        self._prophet_kwargs = {
+            "daily_seasonality": True,
+            "weekly_seasonality": True,
+            "yearly_seasonality": False,
+            **dict(prophet_kwargs or {}),
+        }
 
     def _context_window(self) -> int:
-        """Request all contiguous clean history (capped by ``_CONTEXT_WINDOW``)."""
-        return self._CONTEXT_WINDOW
+        """Return the side-context size used by retrospective fitting."""
+        return self._SIDE_CONTEXT_POINTS
 
     def _min_context(self) -> int:
         """Skip gaps with fewer clean points than Prophet's fitting minimum."""
@@ -621,22 +619,77 @@ class ProphetGapImputer(_DartsContextImputer):
         freq: str,
         config_workers: Mapping[str, Any] | None,
     ) -> pd.Series:
-        """Fit a fresh Prophet on ``context`` and forecast the ``n`` gap steps."""
-        del config_workers
-        context_ts = TimeSeries.from_series(context, freq=freq)
-        model = DartsProphet(**self._prophet_kwargs)
+        """Unused compatibility hook; Prophet predicts internal timestamps in bulk."""
+        raise NotImplementedError
+
+    def impute_gaps(
+        self,
+        *,
+        series_name: str,
+        all_series_map: Mapping[str, pd.Series],
+        gap_windows: Sequence[pd.DatetimeIndex],
+        test_index: pd.DatetimeIndex,
+        scaler: Any | None,
+        freq: str,
+        config_workers: Mapping[str, Any] | None = None,
+    ) -> tuple[pd.Series, list[GapContextFailure]]:
+        """Fit once with observed values on both sides and predict every masked time."""
+        del test_index, scaler, config_workers
+        self._last_train_seconds = 0.0
+        self._last_impute_seconds = 0.0
+        mask_index = _gap_windows_to_mask_index(gap_windows)
+        pred_out = pd.Series(index=mask_index, dtype=float, name=series_name)
+        if len(mask_index) == 0:
+            return pred_out, []
+
+        source = ensure_datetime_series(
+            all_series_map[series_name], freq=freq, name=series_name
+        )
+        offset = to_offset(freq)
+        context_start = pd.Timestamp(mask_index.min()) - self._SIDE_CONTEXT_POINTS * offset
+        context_end = pd.Timestamp(mask_index.max()) + self._SIDE_CONTEXT_POINTS * offset
+        context = source.loc[
+            (source.index >= context_start) & (source.index <= context_end)
+        ].copy()
+        context.loc[context.index.intersection(mask_index)] = np.nan
+        observed = context.dropna()
+
+        if len(observed) < self._min_required:
+            failures = [
+                GapContextFailure(
+                    model_name=self.model_name,
+                    series_name=series_name,
+                    gap_start=pd.Timestamp(gap_idx.min()),
+                    gap_length=int(len(gap_idx)),
+                    required_context=self._min_required,
+                    available_context=int(len(observed)),
+                    reason=_INSUFFICIENT_CONTEXT_REASON,
+                )
+                for gap_idx in gap_windows
+                if len(gap_idx) > 0
+            ]
+            return pred_out, failures
+
+        history = pd.DataFrame(
+            {"ds": observed.index, "y": observed.to_numpy(dtype=float)}
+        )
+        future = pd.DataFrame({"ds": mask_index})
+        model = NativeProphet(**self._prophet_kwargs)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # One timer around the fit (train), another around the predict
-            # (impute); both accumulate across this series' gaps and the
-            # benchmark turns them into per-hole means.
             fit_start = time.perf_counter()
-            model.fit(context_ts)
-            self._last_train_seconds += time.perf_counter() - fit_start
+            model.fit(history)
+            self._last_train_seconds = time.perf_counter() - fit_start
             predict_start = time.perf_counter()
-            pred_ts = model.predict(n=int(n))
-            self._last_impute_seconds += time.perf_counter() - predict_start
-        return pred_ts.to_series().astype(float)
+            forecast = model.predict(future)
+            self._last_impute_seconds = time.perf_counter() - predict_start
+
+        predictions = pd.Series(
+            forecast["yhat"].to_numpy(dtype=float),
+            index=pd.DatetimeIndex(forecast["ds"]),
+            name=series_name,
+        )
+        return predictions.reindex(mask_index), []
 
 
 # --------------------------------------------------------------------------- #

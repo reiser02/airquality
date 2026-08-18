@@ -11,6 +11,7 @@ from darts import TimeSeries
 from airquality.imputation.benchmark import (
     _compute_metrics_on_mask,
     _gap_windows_to_mask_index,
+    _generate_block_gaps,
     _normalize_series_collection,
     _predict_mask_for_model_series,
     execute_complete_pipeline,
@@ -27,6 +28,26 @@ from airquality.modeling.training import build_benchmark_dataset_bundle
 def _series(values: list[float | None], *, name: str = "S", start: str = "2024-01-01") -> pd.Series:
     idx = pd.date_range(start, periods=len(values), freq="h")
     return pd.Series(values, index=idx, name=name, dtype=float)
+
+
+@pytest.mark.parametrize("gap_size", (1, 2, 5, 10))
+def test_block_gaps_always_have_an_observed_point_between_them(gap_size: int) -> None:
+    class OrderedRng:
+        @staticmethod
+        def shuffle(values) -> None:
+            pass
+
+    series = _series([float(value) for value in range(40)])
+    gaps = _generate_block_gaps(
+        series=series,
+        gap_size=gap_size,
+        num_gaps=2,
+        rng=OrderedRng(),
+        freq="h",
+    )
+
+    assert len(gaps) == 2
+    assert gaps[1][0] - gaps[0][-1] >= pd.Timedelta(hours=2)
 
 
 def test_predict_mask_timing_is_per_hole_mean() -> None:
@@ -283,6 +304,15 @@ def test_compute_metrics_on_mask_computes_selected_metrics() -> None:
     assert out["MAE"] == pytest.approx(2 / 3)
     assert out["RMSE"] == pytest.approx(((1.0**2 + 0.0 + 1.0**2) / 3) ** 0.5)
 
+    scaled = _compute_metrics_on_mask(
+        y_true=y_true,
+        y_pred=y_pred,
+        metrics=("mae", "rmse"),
+        scale_std=2.0,
+    )
+    assert scaled["MAE"] == pytest.approx(out["MAE"] / 2.0)
+    assert scaled["RMSE"] == pytest.approx(out["RMSE"] / 2.0)
+
 
 def test_compute_metrics_on_mask_rejects_unknown_metric() -> None:
     pass
@@ -333,7 +363,25 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     )
 
     assert list(results_df.columns) == [
-        "Modelo", "Serie", "Gap_Size", "Train_Seconds", "Impute_Seconds", "MAE", "RMSE", "MASE",
+        "Modelo",
+        "Serie",
+        "Gap_Size",
+        "Train_Seconds",
+        "Impute_Seconds",
+        "Scale_Std",
+        "N_Gaps_Target",
+        "N_Gaps_Scored",
+        "N_Target_Points",
+        "N_Scored_Points",
+        "Support_Fraction",
+        "Test_Start",
+        "Test_End",
+        "Test_Block_Points",
+        "Train_Points_Before",
+        "Train_Points_After",
+        "MAE",
+        "RMSE",
+        "MASE",
     ]
     assert results_df.loc[0, "Modelo"] == "Stub"
     assert results_df.loc[0, "Serie"] == "S"
@@ -342,6 +390,11 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     assert results_df.loc[0, "MAE"] == pytest.approx(20.0)
     assert results_df.loc[0, "RMSE"] == pytest.approx(((20.0**2 + 20.0**2) / 2) ** 0.5)
     assert results_df.loc[0, "MASE"] == pytest.approx(2.0)
+    assert results_df.loc[0, "N_Gaps_Target"] == 1
+    assert results_df.loc[0, "N_Gaps_Scored"] == 1
+    assert results_df.loc[0, "N_Target_Points"] == 2
+    assert results_df.loc[0, "N_Scored_Points"] == 2
+    assert results_df.loc[0, "Support_Fraction"] == 1.0
 
     assert set(plot_store[2]) == {"series"}
     assert set(plot_store[2]["series"]["S"]) == {"actual", "preds", "naive_mase"}

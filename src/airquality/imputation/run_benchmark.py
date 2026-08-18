@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, replace
+import logging
 import os
 from pathlib import Path
 import pickle
 import tempfile
+import time
 from typing import Any, Sequence
 
 import pandas as pd
 from airquality.data.io import configure_warnings, load_and_normalize_series, resolve_device
-from airquality.data.segments import get_longest_segment
+from airquality.data.holdout import (
+    build_holdout_manifest,
+    manifests_match,
+    read_holdout_manifest,
+    select_retrospective_holdouts,
+)
 from airquality.config import cfg_get_bool, cfg_get_csv_list, cfg_get_int, cfg_get_str
 
 from airquality.imputation.benchmark import execute_complete_pipeline
@@ -45,6 +52,10 @@ from airquality.modeling.training_config import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+_PROGRESS_HEARTBEAT_SECONDS = 60.0
+
+
 def _default_model_names() -> tuple[str, ...]:
     """Return the imputation methods configured for direct benchmarking."""
     return cfg_get_csv_list(
@@ -67,6 +78,12 @@ def _default_model_names() -> tuple[str, ...]:
 def _default_gap_sizes() -> tuple[int, ...]:
     """Return the default synthetic gap sizes used during evaluation."""
     return tuple(int(v) for v in cfg_get_csv_list("benchmark", "gap_sizes", ("1", "2", "5", "10")))
+
+
+def _default_gap_counts() -> tuple[int, ...] | None:
+    """Return optional per-size gap counts used to balance evaluated points."""
+    values = cfg_get_csv_list("benchmark", "gap_counts", ())
+    return tuple(int(value) for value in values) if values else None
 
 
 def _default_metrics() -> tuple[str, ...]:
@@ -129,6 +146,17 @@ class BenchmarkRunConfig:
     val_size: int
     val_context_len: int
     min_train_len_base: int
+    gap_counts: tuple[int, ...] | None = None
+    holdout_target_points: int = 192
+    holdout_context_points: int = 72
+
+    def __post_init__(self) -> None:
+        invalid = tuple(gap for gap in self.gap_sizes if not 1 <= gap <= 10)
+        if invalid:
+            raise ValueError(
+                "`gap_sizes` debe contener enteros entre 1 y 10 horas; "
+                f"valores invalidos: {invalid}."
+            )
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> BenchmarkRunConfig:
@@ -153,6 +181,13 @@ class BenchmarkRunConfig:
             val_size=int(raw["val_size"]),
             val_context_len=int(raw["val_context_len"]),
             min_train_len_base=int(raw["min_train_len_base"]),
+            gap_counts=(
+                tuple(int(x) for x in raw["gap_counts"])
+                if raw.get("gap_counts")
+                else None
+            ),
+            holdout_target_points=int(raw.get("holdout_target_points", 192)),
+            holdout_context_points=int(raw.get("holdout_context_points", 72)),
         )
 
 
@@ -208,6 +243,7 @@ def _load_benchmark_run_config(
     tspulse_model_path: str | None = None,
     gap_sizes: Sequence[int] | None = None,
     num_gaps: int | None = None,
+    gap_counts: Sequence[int] | None = None,
     gap_strategy: str | None = None,
     metrics: Sequence[str] | None = None,
     random_seed: int | None = None,
@@ -218,6 +254,22 @@ def _load_benchmark_run_config(
     min_train_len_base: int | None = None,
 ) -> BenchmarkRunConfig:
     """Load the effective benchmark runtime config from the project cfg files."""
+    resolved_gap_sizes = tuple(
+        int(x) for x in (_default_gap_sizes() if gap_sizes is None else gap_sizes)
+    )
+    requested_gap_counts = (
+        _default_gap_counts()
+        if gap_sizes is None and gap_counts is None
+        else gap_counts
+    )
+    resolved_gap_counts = (
+        tuple(int(x) for x in requested_gap_counts)
+        if requested_gap_counts is not None
+        else None
+    )
+    if resolved_gap_counts is not None and len(resolved_gap_counts) != len(resolved_gap_sizes):
+        raise ValueError("`gap_counts` debe tener un valor por cada `gap_sizes`.")
+
     return BenchmarkRunConfig(
         size_k=cfg_get_int("benchmark", "size_k", 5) if size_k is None else int(size_k),
         force_cpu=bool(force_cpu),
@@ -230,7 +282,7 @@ def _load_benchmark_run_config(
             local_files_only=bool(local_files_only),
             hf_token=hf_token,
         ),
-        gap_sizes=tuple(int(x) for x in (_default_gap_sizes() if gap_sizes is None else gap_sizes)),
+        gap_sizes=resolved_gap_sizes,
         num_gaps=cfg_get_int("benchmark", "num_gaps", 3) if num_gaps is None else int(num_gaps),
         gap_strategy=str(
             cfg_get_str("benchmark", "gap_strategy", "hybrid_tspulse")
@@ -244,6 +296,13 @@ def _load_benchmark_run_config(
         val_size=cfg_get_int("benchmark", "val_size", 48) if val_size is None else int(val_size),
         val_context_len=cfg_get_int("benchmark", "val_context_len", 72) if val_context_len is None else int(val_context_len),
         min_train_len_base=cfg_get_int("benchmark", "min_train_len_base", 72) if min_train_len_base is None else int(min_train_len_base),
+        gap_counts=resolved_gap_counts,
+        holdout_target_points=cfg_get_int(
+            "benchmark", "holdout_target_points", 192
+        ),
+        holdout_context_points=cfg_get_int(
+            "benchmark", "holdout_context_points", 72
+        ),
     )
 
 
@@ -255,6 +314,8 @@ def _build_dataset_bundle_from_config(config: BenchmarkRunConfig) -> BenchmarkDa
         val_context_len=config.val_context_len,
         min_train_len_base=config.min_train_len_base,
         freq=config.freq,
+        holdout_target_points=config.holdout_target_points,
+        holdout_context_points=config.holdout_context_points,
     )
 
 
@@ -302,7 +363,7 @@ def _build_tspulse_model_dict(
 
 
 def _build_prophet_model_dict(model_names: Sequence[str]) -> dict[str, ProphetGapImputer]:
-    """Build the requested Prophet imputer variants (Darts local Prophet)."""
+    """Build the requested retrospective Prophet imputer variants."""
     model_dict: dict[str, ProphetGapImputer] = {}
     for model_name in model_names:
         model_dict[model_name] = ProphetGapImputer(model_name=model_name)
@@ -351,6 +412,7 @@ def _execute_benchmark_with_dataset(
         dataset_bundle=dataset_bundle,
         gap_sizes=config.gap_sizes,
         num_gaps=config.num_gaps,
+        gap_counts=config.gap_counts,
         metrics=config.metrics,
         random_seed=config.random_seed,
         freq=config.freq,
@@ -372,6 +434,7 @@ def _build_parallel_task_common(repo_root: Path, config: BenchmarkRunConfig) -> 
         "tspulse_model_path": config.tspulse.model_path,
         "gap_sizes": config.gap_sizes,
         "num_gaps": config.num_gaps,
+        "gap_counts": config.gap_counts,
         "gap_strategy": config.gap_strategy,
         "metrics": config.metrics,
         "random_seed": config.random_seed,
@@ -380,6 +443,8 @@ def _build_parallel_task_common(repo_root: Path, config: BenchmarkRunConfig) -> 
         "val_size": config.val_size,
         "val_context_len": config.val_context_len,
         "min_train_len_base": config.min_train_len_base,
+        "holdout_target_points": config.holdout_target_points,
+        "holdout_context_points": config.holdout_context_points,
     }
 
 
@@ -399,20 +464,37 @@ def build_dataset_bundle_for_imputation(
     val_context_len: int,
     min_train_len_base: int,
     freq: str,
+    holdout_target_points: int = 192,
+    holdout_context_points: int = 72,
 ) -> BenchmarkDatasetBundle:
-    """Build the benchmark dataset bundle from raw files and held-out segments."""
+    """Build the benchmark bundle with one retrospective holdout per station."""
     series_dfs = load_series(
         freq=freq,
     )
-    longest_segment = get_longest_segment(series_dfs, verbose=False)
-    if longest_segment.empty:
-        raise RuntimeError("get_longest_segment devolvio un DataFrame vacio.")
+    min_train_len = int(min_train_len_base + size_k)
+    min_train_points = max(min_train_len, int(val_context_len)) + int(val_size)
+    holdouts, holdout_metadata = select_retrospective_holdouts(
+        series_dfs,
+        target_points=holdout_target_points,
+        context_points=holdout_context_points,
+        min_train_points=min_train_points,
+    )
+    manifest = build_holdout_manifest(
+        holdout_metadata,
+        target_points=holdout_target_points,
+        context_points=holdout_context_points,
+        min_train_points=min_train_points,
+        freq=freq,
+    )
 
     return build_benchmark_dataset_bundle(
         series_dfs=series_dfs,
-        longest_segment=longest_segment,
+        longest_segment=None,
+        holdouts_by_series=holdouts,
+        holdout_metadata=holdout_metadata,
+        holdout_manifest=manifest,
         val_size=val_size,
-        min_train_len=int(min_train_len_base + size_k),
+        min_train_len=min_train_len,
         val_context_len=val_context_len,
     )
 
@@ -637,6 +719,49 @@ def _resolve_finetuned_tspulse_config(
     )
 
 
+def _validate_model_holdout_manifests(
+    *,
+    repo_root: Path,
+    config: BenchmarkRunConfig,
+    dataset_bundle: BenchmarkDatasetBundle,
+    model_names: Sequence[str],
+) -> None:
+    """Reject trained artifacts built with a different retrospective split."""
+    expected = getattr(dataset_bundle, "holdout_manifest", {})
+    if not expected:
+        return
+
+    darts_names = [name for name in model_names if name in build_model_configs()]
+    if darts_names:
+        manifest_path = repo_root / "models" / "imputation_holdout_manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                "Falta el manifiesto de holdout de los modelos Darts. "
+                "Vuelve a ejecutar `uv run python -m airquality.train`."
+            )
+        actual = read_holdout_manifest(manifest_path)
+        trained_names = set(str(name) for name in actual.get("darts_models", ()))
+        if not manifests_match(expected, actual) or not set(darts_names).issubset(
+            trained_names
+        ):
+            raise RuntimeError(
+                "Los modelos Darts no corresponden al holdout retrospectivo actual; "
+                "es necesario reentrenarlos."
+            )
+
+    if TSPULSE_FINETUNED_MODEL_NAME in model_names:
+        model_path = Path(str(config.tspulse.model_path))
+        manifest_path = model_path / "holdout_manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                "Falta el manifiesto del TSPulse fine-tuned; vuelve a entrenarlo."
+            )
+        if not manifests_match(expected, read_holdout_manifest(manifest_path)):
+            raise RuntimeError(
+                "TSPulse_FineTuned no corresponde al holdout retrospectivo actual."
+            )
+
+
 def _merge_plot_stores(
     stores: Sequence[dict[int, dict[str, Any]]],
 ) -> dict[int, dict[str, Any]]:
@@ -786,6 +911,7 @@ def run_imputation_benchmark(
     tspulse_model_path: str | None = None,
     gap_sizes: Sequence[int] | None = None,
     num_gaps: int | None = None,
+    gap_counts: Sequence[int] | None = None,
     gap_strategy: str | None = None,
     metrics: Sequence[str] | None = None,
     random_seed: int | None = None,
@@ -813,6 +939,7 @@ def run_imputation_benchmark(
         tspulse_model_path=tspulse_model_path,
         gap_sizes=gap_sizes,
         num_gaps=num_gaps,
+        gap_counts=gap_counts,
         gap_strategy=gap_strategy,
         metrics=metrics,
         random_seed=random_seed,
@@ -851,6 +978,12 @@ def run_imputation_benchmark(
     )
 
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
+    _validate_model_holdout_manifests(
+        repo_root=resolved_root,
+        config=config,
+        dataset_bundle=dataset_bundle,
+        model_names=[*darts_model_names, *tspulse_model_names],
+    )
     model_dict: dict[str, Any] = {}
     if darts_model_names:
         model_dict.update(
@@ -975,6 +1108,7 @@ def run_imputation_benchmark_parallel(
     tspulse_model_path: str | None = None,
     gap_sizes: Sequence[int] | None = None,
     num_gaps: int | None = None,
+    gap_counts: Sequence[int] | None = None,
     gap_strategy: str | None = None,
     metrics: Sequence[str] | None = None,
     random_seed: int | None = None,
@@ -1003,6 +1137,7 @@ def run_imputation_benchmark_parallel(
         tspulse_model_path=tspulse_model_path,
         gap_sizes=gap_sizes,
         num_gaps=num_gaps,
+        gap_counts=gap_counts,
         gap_strategy=gap_strategy,
         metrics=metrics,
         random_seed=random_seed,
@@ -1032,6 +1167,12 @@ def run_imputation_benchmark_parallel(
     # share it (directly in-process, or as one pickle that each pooled worker
     # loads once) instead of re-reading every raw file in every worker.
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
+    _validate_model_holdout_manifests(
+        repo_root=resolved_root,
+        config=config,
+        dataset_bundle=dataset_bundle,
+        model_names=eval_model_names,
+    )
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
     tasks = [
         {
@@ -1125,6 +1266,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     tspulse_model_path: str | None = None,
     gap_sizes: Sequence[int] | None = None,
     num_gaps: int | None = None,
+    gap_counts: Sequence[int] | None = None,
     gap_strategy: str | None = None,
     metrics: Sequence[str] | None = None,
     seasonality_m: int | None = None,
@@ -1155,8 +1297,8 @@ def run_imputation_benchmark_parallel_montecarlo(
     Devuelve:
     - `results_mc_df`: resultados fila-a-fila con columnas extra `Seed` y `MonteCarlo_Run`.
     - `summary_mc_df`: resumen por modelo sobre rankings por semilla.
-    - `ranking_by_seed_df`: ranking por modelo en cada corrida/semilla (derivado de `results_mc_df`).
-    - `plot_store`: predicciones de la primera semilla, sin una corrida adicional.
+    - `ranking_by_seed_df`: ranking por modelo en cada ejecución/semilla (derivado de `results_mc_df`).
+    - `plot_store`: predicciones de la primera semilla, sin una ejecución adicional.
     """
     seed_list = _build_montecarlo_seed_list(
         seeds=seeds,
@@ -1177,6 +1319,7 @@ def run_imputation_benchmark_parallel_montecarlo(
         tspulse_model_path=tspulse_model_path,
         gap_sizes=gap_sizes,
         num_gaps=num_gaps,
+        gap_counts=gap_counts,
         gap_strategy=gap_strategy,
         metrics=metrics,
         random_seed=int(seed_list[0]),
@@ -1203,6 +1346,20 @@ def run_imputation_benchmark_parallel_montecarlo(
     )
 
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
+    _validate_model_holdout_manifests(
+        repo_root=resolved_root,
+        config=config,
+        dataset_bundle=dataset_bundle,
+        model_names=eval_model_names,
+    )
+    LOGGER.info(
+        "Benchmark initialized: %d models, %d stations, %d seeds, %d workers",
+        len(eval_model_names),
+        len(dataset_bundle.valid_cols),
+        len(seed_list),
+        workers,
+    )
+    LOGGER.info("Models: %s", ", ".join(eval_model_names))
     task_common = _build_parallel_task_common(repo_root=resolved_root, config=config)
     task_common["reuse_loaded_models"] = True
 
@@ -1223,15 +1380,33 @@ def run_imputation_benchmark_parallel_montecarlo(
     total_runs = len(seed_list)
     if workers == 1:
         for run_idx, seed in enumerate(seed_list, start=1):
+            run_started = time.monotonic()
             if progress:
-                print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
-            outputs = [
-                _run_parallel_model_task(task, dataset_bundle)
-                for task in _seed_tasks(seed)
-            ]
+                LOGGER.info("Monte Carlo %d/%d started (seed=%d)", run_idx, total_runs, seed)
+            outputs = []
+            for task in _seed_tasks(seed):
+                model_started = time.monotonic()
+                output = _run_parallel_model_task(task, dataset_bundle)
+                outputs.append(output)
+                if progress:
+                    LOGGER.info(
+                        "Monte Carlo %d/%d: model %s completed in %.1fs (%d rows)",
+                        run_idx,
+                        total_runs,
+                        output[0],
+                        time.monotonic() - model_started,
+                        len(output[1]),
+                    )
             if run_idx == 1:
                 plot_store = _merge_plot_stores([item[2] for item in outputs])
             results_runs.append(_collect_run(run_idx, seed, outputs))
+            if progress:
+                LOGGER.info(
+                    "Monte Carlo %d/%d completed in %.1fs",
+                    run_idx,
+                    total_runs,
+                    time.monotonic() - run_started,
+                )
     else:
         with tempfile.TemporaryDirectory(prefix="airquality_bench_") as tmp_dir:
             bundle_path = Path(tmp_dir) / "dataset_bundle.pkl"
@@ -1240,12 +1415,56 @@ def run_imputation_benchmark_parallel_montecarlo(
             task_common["dataset_bundle_path"] = str(bundle_path)
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 for run_idx, seed in enumerate(seed_list, start=1):
+                    run_started = time.monotonic()
                     if progress:
-                        print(f"[MonteCarlo] {run_idx}/{total_runs} con seed={seed}")
-                    outputs = list(executor.map(_run_parallel_model_task, _seed_tasks(seed)))
+                        LOGGER.info(
+                            "Monte Carlo %d/%d started (seed=%d)", run_idx, total_runs, seed
+                        )
+                    futures = {
+                        executor.submit(_run_parallel_model_task, task): str(task["model_name"])
+                        for task in _seed_tasks(seed)
+                    }
+                    outputs_by_model: dict[str, Any] = {}
+                    pending = set(futures)
+                    while pending:
+                        completed, pending = wait(
+                            pending,
+                            timeout=_PROGRESS_HEARTBEAT_SECONDS,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not completed:
+                            LOGGER.info(
+                                "Monte Carlo %d/%d still running after %.1f min; pending: %s",
+                                run_idx,
+                                total_runs,
+                                (time.monotonic() - run_started) / 60.0,
+                                ", ".join(sorted(futures[future] for future in pending)),
+                            )
+                            continue
+                        for future in completed:
+                            model_name = futures[future]
+                            output = future.result()
+                            outputs_by_model[model_name] = output
+                            if progress:
+                                LOGGER.info(
+                                    "Monte Carlo %d/%d: model %s completed after %.1fs (%d rows)",
+                                    run_idx,
+                                    total_runs,
+                                    model_name,
+                                    time.monotonic() - run_started,
+                                    len(output[1]),
+                                )
+                    outputs = [outputs_by_model[name] for name in eval_model_names]
                     if run_idx == 1:
                         plot_store = _merge_plot_stores([item[2] for item in outputs])
                     results_runs.append(_collect_run(run_idx, seed, outputs))
+                    if progress:
+                        LOGGER.info(
+                            "Monte Carlo %d/%d completed in %.1fs",
+                            run_idx,
+                            total_runs,
+                            time.monotonic() - run_started,
+                        )
 
     results_mc_df = pd.concat(results_runs, ignore_index=True)
     metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in results_mc_df.columns]

@@ -39,11 +39,12 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
         *darts_models,
         "Prophet",
         "TSPulse",
+        "TSPulse_FineTuned",
         "interp",
         "LinearInterp",
     ]
     assert cfg.getboolean("imputation", "strict_artifacts") is True
-    assert cfg.getint("imputation", "max_workers") == 1
+    assert cfg.getint("imputation", "max_workers") == 8
     assert cfg.get("data", "raw_base_dir") == "data/raw/datos_estaciones_5m"
     assert cfg.get("data", "data_root") == "data/raw/datos_estaciones_5m"
     assert not cfg.has_option("data", "base_path_glob")

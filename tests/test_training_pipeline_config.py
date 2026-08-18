@@ -23,6 +23,7 @@ def test_build_lightning_trainer_kwargs_defaults_cpu() -> None:
     kwargs = build_lightning_trainer_kwargs(accelerator="cpu")
     assert kwargs["precision"] == "32-true"
     assert kwargs["devices"] == 1
+    assert kwargs["logger"] is False
     assert "callbacks" in kwargs
 
 

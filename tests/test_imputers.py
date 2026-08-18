@@ -103,6 +103,59 @@ def test_interpolation_gap_imputer_remasks_gap_to_avoid_leakage() -> None:
     assert pred.iloc[0] == pytest.approx(30.0)  # not the 999.0 ground truth
 
 
+def test_prophet_imputer_fits_once_with_both_sides_and_all_gaps_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from airquality.imputation import imputers as imputers_mod
+
+    captured: dict[str, object] = {"fits": 0}
+
+    class StubProphet:
+        def __init__(self, **kwargs: object) -> None:
+            captured["kwargs"] = kwargs
+
+        def fit(self, history: pd.DataFrame) -> StubProphet:
+            captured["fits"] = int(captured["fits"]) + 1
+            captured["history"] = history.copy()
+            return self
+
+        def predict(self, future: pd.DataFrame) -> pd.DataFrame:
+            captured["future"] = future.copy()
+            return future.assign(yhat=12.5)
+
+    monkeypatch.setattr(imputers_mod, "NativeProphet", StubProphet)
+    index = pd.date_range("2024-01-01", periods=20, freq="h")
+    truth = pd.Series(np.arange(20, dtype=float), index=index, name="S")
+    gap_a = pd.DatetimeIndex(index[[5, 6]])
+    gap_b = pd.DatetimeIndex(index[[12, 13]])
+
+    pred, failures = ProphetGapImputer().impute_gaps(
+        series_name="S",
+        all_series_map={"S": truth},
+        gap_windows=[gap_a, gap_b],
+        test_index=index,
+        scaler=None,
+        freq="h",
+    )
+
+    assert failures == []
+    assert captured["fits"] == 1
+    history = captured["history"]
+    assert isinstance(history, pd.DataFrame)
+    assert not history["ds"].isin(gap_a.append(gap_b)).any()
+    assert history["ds"].min() < gap_a.min()
+    assert history["ds"].max() > gap_b.max()
+    future = captured["future"]
+    assert isinstance(future, pd.DataFrame)
+    assert list(future["ds"]) == list(gap_a.append(gap_b))
+    assert pred.to_numpy() == pytest.approx([12.5] * 4)
+    assert captured["kwargs"] == {
+        "daily_seasonality": True,
+        "weekly_seasonality": True,
+        "yearly_seasonality": False,
+    }
+
+
 def test_registry_rejects_unknown_name() -> None:
     with pytest.raises(ValueError, match="desconocido"):
         resolve_imputer_family("NotAModel")

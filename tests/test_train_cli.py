@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from airquality.train import _select_trainable_methods, main
@@ -15,6 +16,8 @@ def test_main_trains_from_config(monkeypatch) -> None:
             ("benchmark", "val_size"): 48,
             ("benchmark", "val_context_len"): 72,
             ("benchmark", "min_train_len_base"): 72,
+            ("benchmark", "holdout_target_points"): 192,
+            ("benchmark", "holdout_context_points"): 72,
         }
         return values[(section, option)]
 
@@ -40,18 +43,33 @@ def test_main_trains_from_config(monkeypatch) -> None:
         fake_load_and_normalize_series,
     )
 
-    class DummySegment:
-        empty = False
-
-    segment = DummySegment()
-
-    def fake_get_longest_segment(series_dfs, verbose=False):
-        calls["segment_kwargs"] = {"series_dfs": series_dfs, "verbose": verbose}
-        return segment
-
+    holdouts = {"S": object()}
+    holdout_metadata = pd.DataFrame(
+        {
+            "Serie": ["S"],
+            "Test_Start": ["2024-01-01"],
+            "Test_End": ["2024-01-08"],
+            "Test_Block_Points": [192],
+        }
+    )
     monkeypatch.setattr(
-        "airquality.train.get_longest_segment",
-        fake_get_longest_segment,
+        "airquality.train.select_retrospective_holdouts",
+        lambda series_dfs, **kwargs: calls.setdefault(
+            "holdout_kwargs", {"series_dfs": series_dfs, **kwargs}
+        )
+        and (holdouts, holdout_metadata),
+    )
+    monkeypatch.setattr(
+        "airquality.train.build_holdout_manifest",
+        lambda metadata, **kwargs: {"split_id": "split", "darts_models": ["TiDE", "NHiTS"]},
+    )
+    monkeypatch.setattr(
+        "airquality.train.write_holdout_manifest",
+        lambda manifest, path: path,
+    )
+    monkeypatch.setattr(
+        "pandas.DataFrame.to_csv",
+        lambda self, path, index=False: None,
     )
 
     def fake_build_training_dataset_bundle(**kwargs):
@@ -75,10 +93,15 @@ def test_main_trains_from_config(monkeypatch) -> None:
     main()
 
     assert calls["series_kwargs"] == {"freq": "h"}
-    assert calls["segment_kwargs"] == {"series_dfs": ["series"], "verbose": False}
+    assert calls["holdout_kwargs"] == {
+        "series_dfs": ["series"],
+        "target_points": 192,
+        "context_points": 72,
+        "min_train_points": 125,
+    }
     assert calls["bundle_kwargs"] == {
         "series_dfs": ["series"],
-        "longest_segment": segment,
+        "holdouts_by_series": holdouts,
         "val_size": 48,
         "min_train_len": 77,
         "val_context_len": 72,
