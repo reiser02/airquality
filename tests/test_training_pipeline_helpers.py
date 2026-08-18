@@ -376,8 +376,12 @@ def test_fit_darts_model_injects_output_chunk_and_validation_fit_kwargs(
 
     assert calls["init"] == {"output_chunk_length": 4, "save_checkpoints": True}
     assert calls["fit"]["val_series"] == [ts]
-    assert calls["fit"]["dataloader_kwargs"] == {"num_workers": 2}
+    assert calls["fit"]["dataloader_kwargs"] == {
+        "num_workers": 4,
+        "persistent_workers": True,
+    }
     assert calls["fit"]["load_best"] is True
+    assert calls["fit"]["verbose"] is True
 
 
 def test_fit_darts_model_passes_stride_only_when_fit_supports_it(

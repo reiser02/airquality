@@ -3,12 +3,13 @@
 import os
 import tempfile
 import gc
+import shutil
 import time
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -137,6 +138,7 @@ def build_scaled_train_val_series(
 def build_training_dataset_bundle(
     series_dfs: Sequence[pd.DataFrame],
     longest_segment: pd.DataFrame | None = None,
+    holdouts_by_series: Mapping[str, pd.Series] | None = None,
     val_size: int = 10,
     min_train_len: int = 82,
     val_context_len: int = 72,
@@ -144,9 +146,13 @@ def build_training_dataset_bundle(
     """
     Construye series de train/val escaladas.
 
-    Para evitar fuga de datos, elimina (pone NaN) el bloque temporal de
-    `longest_segment` (si se provee) dentro de cada serie.
+    Para evitar fuga de datos, elimina (pone NaN) el holdout propio de cada
+    estacion. `longest_segment` se conserva como entrada compatible.
     """
+    holdout_map = _coerce_holdout_map(
+        longest_segment=longest_segment,
+        holdouts_by_series=holdouts_by_series,
+    )
     series_train_input: list[pd.DataFrame] = []
     seen_names: set[str] = set()
 
@@ -165,8 +171,8 @@ def build_training_dataset_bundle(
         series_full.name = col
 
         series_copy = series_full.copy()
-        if longest_segment is not None and col in longest_segment.columns:
-            test_rows = series_copy.index.intersection(longest_segment.index)
+        if col in holdout_map:
+            test_rows = series_copy.index.intersection(holdout_map[col].index)
             series_copy.loc[test_rows] = np.nan
 
         series_train_input.append(series_copy.to_frame())
@@ -184,12 +190,36 @@ def build_training_dataset_bundle(
     )
 
 
+def _coerce_holdout_map(
+    *,
+    longest_segment: pd.DataFrame | None,
+    holdouts_by_series: Mapping[str, pd.Series] | None,
+) -> dict[str, pd.Series]:
+    """Normalize legacy rectangular and station-local holdouts to one mapping."""
+    if longest_segment is not None and holdouts_by_series is not None:
+        raise ValueError("Usa `longest_segment` o `holdouts_by_series`, no ambos.")
+    if holdouts_by_series is not None:
+        return {
+            str(name): series.astype(float).rename(str(name)).copy()
+            for name, series in holdouts_by_series.items()
+        }
+    if longest_segment is None:
+        return {}
+    return {
+        str(col): longest_segment[col].astype(float).rename(str(col)).copy()
+        for col in longest_segment.columns
+    }
+
+
 def build_benchmark_dataset_bundle(
     series_dfs: Sequence[pd.DataFrame],
-    longest_segment: pd.DataFrame,
+    longest_segment: pd.DataFrame | None,
     val_size: int,
     min_train_len: int,
     val_context_len: int = 72,
+    holdouts_by_series: Mapping[str, pd.Series] | None = None,
+    holdout_metadata: pd.DataFrame | None = None,
+    holdout_manifest: Mapping[str, Any] | None = None,
     test_only_series: Sequence[pd.Series] | None = None,
     test_only_train_fraction: float = 0.6,
 ) -> BenchmarkDatasetBundle:
@@ -198,6 +228,13 @@ def build_benchmark_dataset_bundle(
     """
     if not (0.0 < float(test_only_train_fraction) < 1.0):
         raise ValueError("`test_only_train_fraction` debe estar en (0, 1)")
+    holdout_map = _coerce_holdout_map(
+        longest_segment=longest_segment,
+        holdouts_by_series=holdouts_by_series,
+    )
+    test_map = dict(holdout_map)
+    if not holdout_map and not test_only_series:
+        raise ValueError("No hay holdouts para construir el benchmark.")
 
     series_train_input: list[pd.DataFrame] = []
     seen_names: set[str] = set()
@@ -222,8 +259,8 @@ def build_benchmark_dataset_bundle(
         all_series_unscaled[col] = series_full
 
         series_copy = series_full.copy()
-        if col in longest_segment.columns:
-            test_rows = series_copy.index.intersection(longest_segment.index)
+        if col in holdout_map:
+            test_rows = series_copy.index.intersection(holdout_map[col].index)
             series_copy.loc[test_rows] = np.nan
 
         series_train_input.append(series_copy.to_frame())
@@ -235,10 +272,10 @@ def build_benchmark_dataset_bundle(
         val_context_len=val_context_len,
     )
 
-    valid_cols = [c for c in longest_segment.columns if c in dict_scalers]
+    valid_cols = [c for c in holdout_map if c in dict_scalers]
     series_test = [
         dict_scalers[col]
-        .transform(TimeSeries.from_series(longest_segment[col], freq="h"))
+        .transform(TimeSeries.from_series(holdout_map[col], freq="h"))
         .astype(np.float32)
         for col in valid_cols
     ]
@@ -271,6 +308,7 @@ def build_benchmark_dataset_bundle(
             [TimeSeries.from_series(train_prefix, freq="h")]
         )
         dict_scalers[col] = sc
+        test_map[col] = test_suffix
         valid_cols.append(col)
         series_test.append(
             sc.transform(TimeSeries.from_series(test_suffix, freq="h")).astype(np.float32)
@@ -290,6 +328,19 @@ def build_benchmark_dataset_bundle(
             for col in valid_cols
             if col in all_series_unscaled
         },
+        holdout_metadata=(
+            holdout_metadata.copy()
+            if holdout_metadata is not None
+            else pd.DataFrame(
+                {
+                    "Serie": valid_cols,
+                    "Test_Start": [test_map[col].index[0] for col in valid_cols],
+                    "Test_End": [test_map[col].index[-1] for col in valid_cols],
+                    "Test_Block_Points": [len(test_map[col]) for col in valid_cols],
+                }
+            )
+        ),
+        holdout_manifest=dict(holdout_manifest or {}),
     )
 
 
@@ -576,6 +627,9 @@ def fit_darts_model(
     size_k: int,
     model_kwargs: dict[str, Any],
     resume_mode: str | None = None,
+    *,
+    verbose: bool = True,
+    cleanup_checkpoints: bool = False,
 ) -> Any:
     """
     Instancia y entrena un modelo Darts con configuración base + overrides.
@@ -649,7 +703,7 @@ def fit_darts_model(
 
     fit_kwargs: dict[str, Any] = {
         "series": series_train,
-        "verbose": True,
+        "verbose": verbose,
         "max_samples_per_ts": 256,
     }
     # `stride` solo existe en TorchForecastingModel.fit; en los modelos de
@@ -662,10 +716,46 @@ def fit_darts_model(
         fit_kwargs["epochs"] = total_epochs
     if series_val and model_cls is not LinearRegressionModel:
         fit_kwargs["val_series"] = series_val
-        fit_kwargs["dataloader_kwargs"] = {"num_workers": 2}
+        fit_kwargs["dataloader_kwargs"] = {
+            "num_workers": 4,
+            "persistent_workers": True,
+        }
         fit_kwargs["load_best"] = True
 
-    model.fit(**fit_kwargs)
+    try:
+        model.fit(**fit_kwargs)
+
+        # Darts' ``load_best`` does not reliably leave the in-memory model on the
+        # monitored checkpoint. Restore it explicitly before disposable files
+        # are removed; otherwise a late unstable epoch can replace a valid best
+        # model (notably with TiDE).
+        checkpoint_model_name = getattr(model, "model_name", None)
+        checkpoint_work_dir = getattr(model, "work_dir", None)
+        if (
+            series_val
+            and model_cls is not LinearRegressionModel
+            and fit_kwargs.get("load_best")
+            and checkpoint_model_name
+            and checkpoint_work_dir
+            and hasattr(model_cls, "load_from_checkpoint")
+        ):
+            try:
+                model = model_cls.load_from_checkpoint(
+                    model_name=checkpoint_model_name,
+                    work_dir=checkpoint_work_dir,
+                    best=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"No se pudo restaurar el mejor checkpoint de '{checkpoint_model_name}'"
+                ) from exc
+    finally:
+        if cleanup_checkpoints:
+            work_dir = getattr(model, "work_dir", None)
+            model_name = getattr(model, "model_name", None)
+            if work_dir and model_name:
+                shutil.rmtree(Path(work_dir) / str(model_name), ignore_errors=True)
+
     return model
 
 
@@ -677,7 +767,7 @@ def finetune_trained_models(
     enable_finetuning: Any = True,
     model_specific_finetuning: dict[str, Any] | None = None,
     load_best: bool = True,
-    dataloader_num_workers: int = 2,
+    dataloader_num_workers: int = 4,
     verbose: bool = True,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """
@@ -754,7 +844,10 @@ def finetune_trained_models(
 
         if series_val:
             fit_kwargs["val_series"] = series_val
-            fit_kwargs["dataloader_kwargs"] = {"num_workers": dataloader_num_workers}
+            fit_kwargs["dataloader_kwargs"] = {
+                "num_workers": dataloader_num_workers,
+                "persistent_workers": dataloader_num_workers > 0,
+            }
 
         finetune_model.fit(**fit_kwargs)
         trained_models[name] = finetune_model
@@ -770,7 +863,7 @@ def finetune_models_from_data(
     enable_finetuning: Any = True,
     model_specific_finetuning: dict[str, Any] | None = None,
     load_best: bool = True,
-    dataloader_num_workers: int = 2,
+    dataloader_num_workers: int = 4,
     verbose: bool = True,
     val_size: int = 10,
     min_train_len: int = 82,

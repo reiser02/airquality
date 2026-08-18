@@ -326,7 +326,16 @@ def test_run_smoke_executes_refactored_stages(
     monkeypatch.setattr("airquality.imputation.tspulse_finetune.set_seed", lambda seed: calls.setdefault("seed", seed))
     monkeypatch.setattr(
         "airquality.imputation.tspulse_finetune._load_training_series_and_split",
-        lambda args, data_root: ([], pd.DataFrame(), pd.DataFrame(), 0, pd.DataFrame(), pd.DataFrame()),
+        lambda args, data_root: (
+            [],
+            {},
+            pd.DataFrame(),
+            {},
+            pd.DataFrame(),
+            0,
+            pd.DataFrame(),
+            pd.DataFrame(),
+        ),
     )
     monkeypatch.setattr(
         "airquality.imputation.tspulse_finetune._build_preprocessor",
@@ -364,7 +373,7 @@ def test_run_smoke_executes_refactored_stages(
     )
     monkeypatch.setattr(
         "airquality.imputation.tspulse_finetune._save_finetuned_artifacts",
-        lambda args, output_dir, trainer, tsp: calls.setdefault("saved", str(output_dir)),
+        lambda **kwargs: calls.setdefault("saved", str(kwargs["output_dir"])),
     )
 
     run(args)

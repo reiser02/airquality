@@ -43,6 +43,8 @@ class BenchmarkDatasetBundle:
     dict_scalers: dict[str, Scaler]
     valid_cols: list[str]
     all_series_unscaled: dict[str, Any] = field(default_factory=dict)
+    holdout_metadata: Any = None
+    holdout_manifest: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Valida la coherencia columnas/series y la presencia de sus scalers."""
@@ -119,7 +121,7 @@ def build_lightning_trainer_kwargs(
     enable_progress_bar: bool = True,
     enable_checkpointing: bool = True,
     enable_model_summary: bool = True,
-    logger: bool | Any = True,
+    logger: bool | Any = False,
     cfg: ConfigParser | None = None,
 ) -> dict[str, Any]:
     """Genera kwargs de PyTorch Lightning para modelos Darts basados en Torch."""

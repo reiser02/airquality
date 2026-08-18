@@ -16,6 +16,7 @@ from airquality.imputation.run_benchmark import (
     TSPULSE_ORIGINAL_MODEL_NAME,
     _build_parallel_task_common,
     _build_montecarlo_seed_list,
+    _load_benchmark_run_config,
     _merge_plot_stores,
     _normalize_tspulse_model_path,
     _resolve_requested_models,
@@ -27,6 +28,16 @@ from airquality.imputation.run_benchmark import (
     summarize_results_by_model,
     summarize_montecarlo_rankings,
 )
+
+
+def test_benchmark_run_config_rejects_gap_sizes_above_ten() -> None:
+    with pytest.raises(ValueError, match=r"entre 1 y 10"):
+        _load_benchmark_run_config(
+            force_cpu=True,
+            local_files_only=True,
+            hf_token=None,
+            gap_sizes=(11,),
+        )
 
 
 def test_load_series_uses_shared_raw_preprocessing(monkeypatch) -> None:

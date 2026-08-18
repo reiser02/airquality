@@ -307,7 +307,7 @@ def _generate_block_gaps(
         gap_size=int(gap_size),
         num_gaps=int(num_gaps),
         rng=rng,
-        min_gap_points=min_gap_points,
+        min_gap_points=max(1, int(min_gap_points)),
     )
     return [_build_gap_index(series.index[s], gap_size, freq=freq) for s in starts]
 
@@ -464,8 +464,9 @@ def _compute_metrics_on_mask(
     y_true: pd.Series,
     y_pred: pd.Series,
     metrics: Sequence[str],
+    scale_std: float | None = None,
 ) -> dict[str, float]:
-    """Compute selected metrics (MAE, RMSE) only on mask timestamps."""
+    """Compute selected MAE/RMSE on mask timestamps, optionally standardized."""
     idx = y_true.index.intersection(y_pred.index)
     true_vals = y_true.reindex(idx).to_numpy(dtype=float)
     pred_vals = y_pred.reindex(idx).to_numpy(dtype=float)
@@ -475,6 +476,14 @@ def _compute_metrics_on_mask(
         return {m.upper(): float("nan") for m in metrics if m.lower() in ("mae", "rmse")}
 
     err = true_vals[valid] - pred_vals[valid]
+    if scale_std is not None:
+        if not np.isfinite(scale_std) or scale_std <= 0.0:
+            return {
+                m.upper(): float("nan")
+                for m in metrics
+                if m.lower() in ("mae", "rmse")
+            }
+        err = err / float(scale_std)
     out: dict[str, float] = {}
 
     for metric_name in metrics:
@@ -484,6 +493,27 @@ def _compute_metrics_on_mask(
         elif m == "rmse":
             out["RMSE"] = float(np.sqrt(np.mean(np.square(err))))
     return out
+
+
+def _scaler_standard_deviation(scaler: Any | None) -> float:
+    """Recover the train-only standard deviation represented by a Darts scaler."""
+    if scaler is None or not hasattr(scaler, "transform"):
+        return float("nan")
+
+    probe = TimeSeries.from_values(np.asarray([[0.0], [1.0]], dtype=np.float32))
+    try:
+        transformed = scaler.transform(probe).values(copy=False).reshape(-1)
+    except Exception as exc:
+        raise RuntimeError(
+            "No se pudo obtener la escala de entrenamiento para MAE/RMSE"
+        ) from exc
+
+    if len(transformed) != 2:
+        return float("nan")
+    slope = float(transformed[1] - transformed[0])
+    if not np.isfinite(slope) or slope == 0.0:
+        return float("nan")
+    return abs(1.0 / slope)
 
 
 def _build_plot_store_series_payloads(
@@ -531,13 +561,13 @@ def _predict_mask_for_model_series(
     the original scale; scaling/inverse-scaling is internal to each imputer.
 
     Each imputer runs its own two timers during the call — ``_last_train_seconds``
-    (fitting, non-zero only for per-gap fitters like Prophet) and
+    (fitting, non-zero only for local fitters like Prophet) and
     ``_last_impute_seconds`` (prediction/fill) — so we just read them here (no
     external timing, no subtraction). Returns a ``timing`` dict with **per-hole
     means** for this series/gap size (never sums over the holes):
 
     - ``impute_seconds``: prediction time / number of holes.
-    - ``train_seconds``: for per-gap fitters, the fit time / number of holes; else
+    - ``train_seconds``: for local fitters, amortized fit time / number of holes; else
       the model's one-time train cost (TSPulse load, 0 for interpolation, NaN for
       pretrained Darts whose training time is recorded by `train_global_methods`).
 
@@ -564,7 +594,7 @@ def _predict_mask_for_model_series(
 
     impute_mean = impute_total / n_holes if n_holes else float("nan")
     if train_total > 0.0:
-        train_row = train_total / n_holes  # per-hole fit mean (Prophet)
+        train_row = train_total / n_holes  # amortized per-hole fit mean (Prophet)
     else:
         # No per-gap fit: TSPulse reports its one-time load, interpolation 0,
         # Darts leaves it absent -> NaN (its training time is in the train CSV).
@@ -585,6 +615,7 @@ def _build_metric_row(
     metric_list: Sequence[str],
     seasonality_m: int,
     freq: str,
+    metric_scaler: Any | None = None,
     train_seconds: float = float("nan"),
     impute_seconds: float = float("nan"),
 ) -> dict[str, Any]:
@@ -593,7 +624,29 @@ def _build_metric_row(
     ``train_seconds`` / ``impute_seconds`` are the per-hole mean timings for this
     (model, series, gap size); the graphs average them across series.
     """
-    # Compute MAE/RMSE on the pooled mask timestamps
+    mask_index = _gap_windows_to_mask_index(gap_windows)
+    y_true = ts_test_unscaled.reindex(mask_index)
+    y_pred = pred_mask.reindex(mask_index)
+    true_values = y_true.to_numpy(dtype=float)
+    pred_values = y_pred.to_numpy(dtype=float)
+    valid_pairs = np.isfinite(true_values) & np.isfinite(pred_values)
+    complete_gaps = 0
+    for gap_idx in gap_windows:
+        if len(gap_idx) == 0:
+            continue
+        gap_true = ts_test_unscaled.reindex(gap_idx).to_numpy(dtype=float)
+        gap_pred = pred_mask.reindex(gap_idx).to_numpy(dtype=float)
+        if len(gap_true) == len(gap_idx) and np.all(
+            np.isfinite(gap_true) & np.isfinite(gap_pred)
+        ):
+            complete_gaps += 1
+
+    n_target_points = int(len(mask_index))
+    n_scored_points = int(valid_pairs.sum())
+    scale_std = _scaler_standard_deviation(metric_scaler)
+
+    # MAE and RMSE use the station's train-only standard scale. MASE retains
+    # its seasonal-naive scale and remains directly comparable to prior runs.
     mae_rmse_metrics = [m for m in metric_list if m in ("mae", "rmse")]
     row: dict[str, Any] = {
         "Modelo": str(model_name),
@@ -601,17 +654,24 @@ def _build_metric_row(
         "Gap_Size": int(gap_size),
         "Train_Seconds": float(train_seconds),
         "Impute_Seconds": float(impute_seconds),
+        "Scale_Std": scale_std,
+        "N_Gaps_Target": int(sum(len(gap) > 0 for gap in gap_windows)),
+        "N_Gaps_Scored": int(complete_gaps),
+        "N_Target_Points": n_target_points,
+        "N_Scored_Points": n_scored_points,
+        "Support_Fraction": (
+            float(n_scored_points / n_target_points)
+            if n_target_points > 0
+            else float("nan")
+        ),
     }
 
     if mae_rmse_metrics:
-        # Get pooled true values and predictions on mask index
-        mask_index = _gap_windows_to_mask_index(gap_windows)
-        y_true = ts_test_unscaled.reindex(mask_index)
-        y_pred = pred_mask.reindex(mask_index)
         mae_rmse_values = _compute_metrics_on_mask(
             y_true=y_true,
             y_pred=y_pred,
             metrics=mae_rmse_metrics,
+            scale_std=scale_std,
         )
         row.update(mae_rmse_values)
 
@@ -728,6 +788,7 @@ def _execute_gap_size_pipeline(
                     metric_list=metric_list,
                     seasonality_m=seasonality_m,
                     freq=freq,
+                    metric_scaler=bundle_scalers.get(series_name),
                     train_seconds=timing["train_seconds"],
                     impute_seconds=timing["impute_seconds"],
                 )
@@ -741,6 +802,7 @@ def execute_complete_pipeline(
     dataset_bundle: BenchmarkDatasetBundle,
     gap_sizes: Sequence[int] = (1, 2, 5, 10),
     num_gaps: int = 3,
+    gap_counts: Sequence[int] | None = None,
     gap_strategy: str = "block",
     hybrid_random_fraction: float = 0.75,
     gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None = None,
@@ -758,10 +820,11 @@ def execute_complete_pipeline(
     - Receive one dataset bundle and already-loaded models.
     - Generate (or receive) artificial gaps compatible with TSPulse notebook ideas.
     - Impute with TSPulse and Darts.
-    - Evaluate MAE, RMSE, and MASE strictly on missing points.
+    - Evaluate train-standardized MAE/RMSE and MASE strictly on missing points.
     - Scale-sensitive models (those without `requires_unscaled_input`) predict on
-      scaled values and their output is inverse-transformed before scoring; models
-      that require unscaled input consume the original scale directly.
+      scaled values and their output is inverse-transformed before applying the
+      common train-only station scale; models that require unscaled input consume
+      the original scale directly.
     - `dataset_bundle.all_series_unscaled` is required and used as the source of
       pre-test history for context/MASE.
     - Return predictions, metrics, and plotting payload.
@@ -799,7 +862,19 @@ def execute_complete_pipeline(
     plot_store: dict[int, dict[str, Any]] = {}
     failures_by_gap: dict[int, list[GapContextFailure]] = {}
 
-    for gap_size in [int(g) for g in gap_sizes]:
+    normalized_gap_sizes = [int(g) for g in gap_sizes]
+    if gap_counts is None:
+        normalized_gap_counts = [int(num_gaps)] * len(normalized_gap_sizes)
+    else:
+        normalized_gap_counts = [int(count) for count in gap_counts]
+        if len(normalized_gap_counts) != len(normalized_gap_sizes):
+            raise ValueError("`gap_counts` debe tener un valor por cada `gap_sizes`.")
+        if any(count <= 0 for count in normalized_gap_counts):
+            raise ValueError("Todos los `gap_counts` deben ser > 0.")
+
+    for gap_size, gap_count in zip(
+        normalized_gap_sizes, normalized_gap_counts, strict=True
+    ):
         if gap_size <= 0:
             raise ValueError("Todos los `gap_sizes` deben ser > 0")
 
@@ -810,7 +885,7 @@ def execute_complete_pipeline(
             all_series_map=all_series_map,
             bundle_scalers=bundle_scalers,
             strategy=strategy,
-            num_gaps=int(num_gaps),
+            num_gaps=gap_count,
             rng=rng,
             freq=freq,
             hybrid_random_fraction=float(hybrid_random_fraction),
@@ -835,6 +910,19 @@ def execute_complete_pipeline(
 
     results_df = pd.DataFrame(rows)
 
+    holdout_metadata = dataset_bundle.holdout_metadata
+    if isinstance(holdout_metadata, pd.DataFrame) and not holdout_metadata.empty:
+        metadata = holdout_metadata.drop_duplicates("Serie").set_index("Serie")
+        for column in (
+            "Test_Start",
+            "Test_End",
+            "Test_Block_Points",
+            "Train_Points_Before",
+            "Train_Points_After",
+        ):
+            if column in metadata.columns:
+                results_df[column] = results_df["Serie"].map(metadata[column])
+
     # Timing is per row (per-hole means built in `_predict_mask_for_model_series`):
     # `Impute_Seconds` for every model, `Train_Seconds` for the models trained at
     # benchmark time (Prophet's per-hole fit, TSPulse's one-time load, 0 for
@@ -842,7 +930,23 @@ def execute_complete_pipeline(
     # time comes from `train_global_methods`' CSV, merged in only at plot time.
     metric_columns = [m.upper() for m in metric_list]
     ordered_cols = [
-        "Modelo", "Serie", "Gap_Size", "Train_Seconds", "Impute_Seconds", *metric_columns,
+        "Modelo",
+        "Serie",
+        "Gap_Size",
+        "Train_Seconds",
+        "Impute_Seconds",
+        "Scale_Std",
+        "N_Gaps_Target",
+        "N_Gaps_Scored",
+        "N_Target_Points",
+        "N_Scored_Points",
+        "Support_Fraction",
+        "Test_Start",
+        "Test_End",
+        "Test_Block_Points",
+        "Train_Points_Before",
+        "Train_Points_After",
+        *metric_columns,
     ]
     for col in ordered_cols:
         if col not in results_df.columns:
