@@ -4,6 +4,13 @@ The VAE reconstructs normal windows (``x_hat``) and, by widening the latent
 scale with a learned ``psi`` factor, produces perturbed variants (``x_tilde``)
 that :func:`patch_anomalies` splices into the original window. The ``*GenIAS``
 detector variants use these patched windows as synthetic anomalies.
+
+This is a local PyTorch implementation of the GenIAS anomaly generator, based
+on:
+https://arxiv.org/abs/2502.08262
+
+It is an independent implementation of the method described in the paper; it
+does not wrap or copy a public GenIAS software package.
 """
 
 from __future__ import annotations

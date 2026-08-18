@@ -1,6 +1,6 @@
 """Windowing helper shared by the windowed detectors.
 
-The windowed detectors (``PCADetector``, ``CARLA*``) score one value per sliding
+The windowed detectors (``SubPCADetector``, ``CARLA*``) score one value per sliding
 window and then need to fold those per-window scores back onto the per-timestep
 timeline. ``aggregate_window_scores`` does that averaging. It was the only helper
 the kept detectors used from the original genias ``data.py`` (the rest was

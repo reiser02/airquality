@@ -51,7 +51,7 @@ from .couta import (
     DSVDDUncLoss,
 )
 from .lstmad import LSTMAD, LSTMADNet
-from .pca_detector import PCADetector
+from .sub_pca_detector import SubPCADetector
 from .prophet_detector import ProphetDetector
 
 # TSPulse pulls in `tsfm_public` (granite-tsfm). The version pinned by this
@@ -77,7 +77,7 @@ __all__ = [
     "IsolationForestDetector",
     "LOFDetector",
     "ModifiedZScoreDetector",
-    "PCADetector",
+    "SubPCADetector",
     "ProphetDetector",
     "CARLABase",
     "CARLAGenIAS",

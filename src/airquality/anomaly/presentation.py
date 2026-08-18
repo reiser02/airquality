@@ -45,7 +45,14 @@ MODEL_CATEGORY_COLORS = {
     "Deep Learning": "#f28c38",
     "Ensemble": "#9b59b6",
 }
-STATISTICAL_MODELS = {"ModifiedZScore", "IQR", "PCA", "Hampel_w24", "Hampel_w6", "Prophet"}
+STATISTICAL_MODELS = {
+    "ModifiedZScore",
+    "IQR",
+    "Sub_PCA",
+    "Hampel_w24",
+    "Hampel_w6",
+    "Prophet",
+}
 MACHINE_LEARNING_MODELS = {"IsolationForest", "LOF"}
 ENSEMBLE_MODELS = {"Ensemble"}
 
@@ -87,7 +94,7 @@ def model_category(model_name: str) -> str:
     """Classify a model name into Statistical/ML/Deep Learning/Ensemble."""
     if model_name in ENSEMBLE_MODELS:
         return "Ensemble"
-    if model_name in STATISTICAL_MODELS:
+    if model_name in STATISTICAL_MODELS or model_name.startswith("Sub_PCA_"):
         return "Statistical"
     if model_name in MACHINE_LEARNING_MODELS:
         return "Machine Learning"

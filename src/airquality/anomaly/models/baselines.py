@@ -248,7 +248,35 @@ class HampelDetector(BaseGlobalAnomalyDetector):
 
     def __init__(self, *args: Any, window_size: int = 24, mad_epsilon: float = 1e-6, **kwargs: Any) -> None:
         super().__init__(*args, window_size=window_size, **kwargs)
+        self.minimum_series_length = window_size
         self.mad_epsilon = mad_epsilon
+
+    def fit_segments(
+        self, train_segments: list[np.ndarray]
+    ) -> "HampelDetector":
+        """Require one complete offline window before fitting the filter."""
+
+        if not any(len(segment) >= self.window_size for segment in train_segments):
+            raise ValueError(
+                f"Hampel requires at least one segment with {self.window_size} points"
+            )
+        return super().fit_segments(train_segments)
+
+    def score_segments(
+        self, segments: list[np.ndarray]
+    ) -> list[np.ndarray | None]:
+        """Return no score for segments shorter than the full offline window."""
+
+        scores: list[np.ndarray | None] = []
+        for segment in segments:
+            if len(segment) < self.window_size:
+                scores.append(None)
+                continue
+            try:
+                scores.append(self.score(segment))
+            except Exception:
+                scores.append(None)
+        return scores
 
     def _fit_array(self, train_values: np.ndarray) -> None:
         """No-op: Hampel statistics are recomputed on the scored series."""
@@ -262,11 +290,10 @@ class HampelDetector(BaseGlobalAnomalyDetector):
     def _rolling_score(self, series: np.ndarray) -> np.ndarray:
         """Score one feature: |x − rolling median| / (1.4826 · rolling MAD).
 
-        Vectorized over the full interior windows with ``sliding_window_view``;
-        only the truncated edge windows (pandas ``center=True, min_periods=1``
-        semantics: window ``[i - w//2, i + (w-1) - w//2]`` clipped to bounds)
-        fall back to per-position medians. Computed in float64 like pandas'
-        rolling, so scores match the previous ``rolling.apply`` implementation.
+        Vectorized over complete centered windows with ``sliding_window_view``.
+        Edge points are left as NaN because an offline Hampel score requires a
+        full window. For even ``w``, the window is ``[i - w//2,
+        i + (w-1) - w//2]``.
         """
         values = np.asarray(series, dtype=np.float64)
         n = values.size
@@ -274,24 +301,24 @@ class HampelDetector(BaseGlobalAnomalyDetector):
         left = w // 2
         right = w - 1 - left
 
-        median = np.empty(n, dtype=np.float64)
-        mad = np.empty(n, dtype=np.float64)
-        if n >= w:
-            windows = np.lib.stride_tricks.sliding_window_view(values, w)
-            med_full = np.median(windows, axis=1)
-            median[left : n - right] = med_full
-            mad[left : n - right] = np.median(np.abs(windows - med_full[:, None]), axis=1)
-            edge_positions = [*range(left), *range(n - right, n)]
-        else:
-            edge_positions = range(n)
-        for i in edge_positions:
-            chunk = values[max(0, i - left) : min(n, i + right + 1)]
-            center = np.median(chunk)
-            median[i] = center
-            mad[i] = np.median(np.abs(chunk - center))
+        if n < w:
+            raise ValueError(
+                f"Series length {n} is shorter than Hampel window {w}"
+            )
+
+        windows = np.lib.stride_tricks.sliding_window_view(values, w)
+        med_full = np.median(windows, axis=1)
+        mad_full = np.median(np.abs(windows - med_full[:, None]), axis=1)
+        median = np.full(n, np.nan, dtype=np.float64)
+        mad = np.full(n, np.nan, dtype=np.float64)
+        valid = slice(left, n - right)
+        median[valid] = med_full
+        mad[valid] = mad_full
 
         scale = np.maximum(1.4826 * mad, self.mad_epsilon)
-        return (np.abs(values - median) / scale).astype(np.float32)
+        scores = np.full(n, np.nan, dtype=np.float64)
+        scores[valid] = np.abs(values[valid] - median[valid]) / scale[valid]
+        return scores.astype(np.float32)
 
 
 class Hampel6Detector(HampelDetector):

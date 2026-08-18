@@ -4,6 +4,17 @@ Self-supervised windowed detector: a ResNet encoder is pretrained contrastively
 against synthetically corrupted windows (native CARLA rules or GenIAS-generated
 anomalies), then a classification head separates normal from anomalous windows;
 the per-window anomaly probability is folded back onto the timeline.
+
+This module is adapted from the official CARLA implementation:
+https://github.com/zamanzadeh/CARLA
+
+The ResNet backbone, anomaly-generation rules, losses, and feature-repository
+logic are derived from the upstream implementation. Local changes include the
+project-specific detector API, segment handling, training flow, and GenIAS
+integration.
+
+The upstream repository is licensed under the MIT License. See also:
+https://arxiv.org/abs/2308.09296
 """
 
 from __future__ import annotations

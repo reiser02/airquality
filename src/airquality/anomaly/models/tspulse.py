@@ -1,4 +1,11 @@
-"""Zero-shot TSPulse anomaly detector (IBM Granite TSFM wrapper)."""
+"""Zero-shot TSPulse anomaly detector (IBM Granite TSFM wrapper).
+
+The pretrained model is implemented by IBM Granite TSFM:
+https://github.com/ibm-granite/granite-tsfm
+
+This module does not implement the TSPulse backbone. It provides project-specific
+loading, masking, reconstruction-error scoring, smoothing, and aggregation.
+"""
 
 from __future__ import annotations
 

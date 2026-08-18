@@ -9,6 +9,7 @@ detectors sequentially). ``TSPulse`` is registered only when its optional
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
 import warnings
 
 import numpy as np
@@ -25,7 +26,7 @@ from .models import (
     LOFDetector,
     LSTMAD,
     ModifiedZScoreDetector,
-    PCADetector,
+    SubPCADetector,
     ProphetDetector,
 )
 from .models import TSPULSE_AVAILABLE, TSPULSE_IMPORT_ERROR, TSPulse
@@ -35,7 +36,7 @@ MODEL_REGISTRY: dict[str, type] = {
     "IQR": IQRDetector,
     "IsolationForest": IsolationForestDetector,
     "LOF": LOFDetector,
-    "PCA": PCADetector,
+    "Sub_PCA": SubPCADetector,
     "COUTABase": COUTABase,
     "COUTAGenIAS": COUTAGenIAS,
     "CARLABase": CARLABase,
@@ -51,7 +52,7 @@ if TSPULSE_AVAILABLE:
 
 
 def resolve_model_class(model_name: str) -> type:
-    """Return the detector class registered under ``model_name`` (KeyError if unknown)."""
+    """Return the detector class registered under ``model_name``."""
     return MODEL_REGISTRY[model_name]
 
 
@@ -74,10 +75,22 @@ def fit_model_segments(
     *,
     seed: int,
     model_kwargs: dict[str, object] | None = None,
+    segment_indices: Sequence[object] | None = None,
 ):
-    """Create one detector and fit it once on all segments of a station."""
+    """Create one detector and fit it once on all station segments.
+
+    Timestamp metadata is passed only to detectors that explicitly request it,
+    so the common detector API remains array-based for every other model.
+    """
+
     model = model_cls(seed=seed, **(model_kwargs or {}))
-    model.fit_segments(segments)
+    fit_segments = model.fit_segments
+    parameters = inspect.signature(fit_segments).parameters
+    accepts_indices = "segment_indices" in parameters
+    if segment_indices is not None and accepts_indices:
+        fit_segments(segments, segment_indices=segment_indices)
+    else:
+        fit_segments(segments)
     return model
 
 
