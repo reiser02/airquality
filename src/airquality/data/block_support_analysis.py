@@ -27,6 +27,7 @@ from airquality.config import (
     cfg_get_str,
 )
 from airquality.data.block_analysis import classify_blocks
+from airquality.data.preprocessing import DETECTION_LIMITS
 from airquality.data.segments import contiguous_observed_segments, observed_blocks
 from airquality.data.series import ensure_datetime_series
 from airquality.forecasting.backtest import (
@@ -66,13 +67,24 @@ from airquality.forecasting.pipeline import (
     ForecastRegime,
     _detect_for_strategies,
     _load_raw_hourly_series,
+    resolve_forecasting_devices,
 )
 from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
 from airquality.paths import create_run_dir
 
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 REGIME_NAMES = ("short", "long")
+
+
+def _normalize_pollutant(value: str) -> str:
+    pollutant = str(value).strip().upper()
+    if pollutant not in DETECTION_LIMITS:
+        supported = ", ".join(sorted(DETECTION_LIMITS))
+        raise ValueError(
+            f"Contaminante no soportado: {value!r}. Valores validos: {supported}"
+        )
+    return pollutant
 
 
 def _eligible_support(
@@ -465,11 +477,17 @@ def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
 def run_analysis(
     *,
     output_dir: str | Path | None = None,
+    pollutant: str | None = None,
     mask_transforms: Sequence[MaskTransform] | None = None,
 ) -> dict[str, Any]:
     """Run the config-driven support audit and persist tables."""
     freq = cfg_get_str("data", "freq", "h")
-    pollutant = cfg_get_str("forecasting", "pollutant", "NO2")
+    requested_pollutant = (
+        pollutant
+        if pollutant is not None
+        else cfg_get_str("forecasting", "pollutant", "NO2")
+    )
+    pollutant = _normalize_pollutant(requested_pollutant)
     raw_base_dir = cfg_get_str(
         "data", "raw_base_dir", "data/raw/datos_estaciones_5m"
     )
@@ -578,7 +596,9 @@ def run_analysis(
         raise ValueError("No hay estrategias de deteccion configuradas")
 
     seed = cfg_get_int("forecasting", "seed", 13)
-    device = cfg_get_str("forecasting", "device", "cpu")
+    device = resolve_forecasting_devices(
+        cfg_get_str("forecasting", "device", "cpu")
+    )[0]
     injection_seed = cfg_get_int(
         "forecasting", "injection_seed", DEFAULT_INJECTION_SEED
     )
@@ -667,6 +687,7 @@ def run_analysis(
                 "cache": cache,
                 "cache_key": {
                     "version": CACHE_VERSION,
+                    "analysis_version": ANALYSIS_VERSION,
                     "series": name,
                     "series_fp": series_fp,
                     "freq": freq,
@@ -853,7 +874,7 @@ def run_analysis(
         if output_dir is not None
         else create_run_dir(
             _repo_root() / "reports" / "data_blocks",
-            f"forecasting_{datetime.now():%Y%m%d_%H%M%S}",
+            f"forecast_support_{pollutant}_{datetime.now():%Y%m%d_%H%M%S}",
         )
     )
     output.mkdir(parents=True, exist_ok=True)
@@ -885,8 +906,13 @@ def main() -> None:
         description="Compara soporte raw, detectado e imputado para forecasting"
     )
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--pollutant",
+        default=None,
+        help="Contaminante (CO o NO2); por defecto usa [forecasting] pollutant.",
+    )
     args = parser.parse_args()
-    run_analysis(output_dir=args.output_dir)
+    run_analysis(output_dir=args.output_dir, pollutant=args.pollutant)
 
 
 if __name__ == "__main__":
