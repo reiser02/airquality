@@ -1,13 +1,16 @@
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import airquality.data.block_support_analysis as analysis
 from airquality.forecasting.detection import DetectionResult
 from airquality.data.block_support_analysis import (
     _gap_diagnostics,
+    _normalize_pollutant,
     training_support_diagnostics,
 )
 
@@ -64,6 +67,19 @@ def test_gap_diagnostics_keeps_adjacent_gap_over_limit_unfilled() -> None:
     assert mixed["hours"] == 6
     assert not mixed["eligible_for_imputation"]
     assert mixed["filled_hours"] == 0
+
+
+@pytest.mark.parametrize("value, expected", [("co", "CO"), (" NO2 ", "NO2")])
+def test_normalize_pollutant_accepts_supported_case_insensitive_values(
+    value: str, expected: str
+) -> None:
+    assert _normalize_pollutant(value) == expected
+
+
+@pytest.mark.parametrize("value", ["NO*", "../CO", "PM10", ""])
+def test_normalize_pollutant_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(ValueError, match="Contaminante no soportado"):
+        _normalize_pollutant(value)
 
 
 def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypatch) -> None:
@@ -169,7 +185,7 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
             method="time", limit_direction="both"
         ),
     )
-    artifacts = analysis.run_analysis(output_dir=tmp_path)
+    artifacts = analysis.run_analysis(output_dir=tmp_path, pollutant="co")
     results = artifacts["series_summary_df"]
 
     assert len(results) == 6
@@ -183,6 +199,8 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     assert not results["arm"].eq("raw+impute").any()
     assert results.loc[results["stage"] == "imputed", "imputed"].all()
     assert set(results["minimum_hours"]) == {4}
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["pollutant"] == "CO"
     for filename in (
         "summary.csv",
         "series_summary.csv",

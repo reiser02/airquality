@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -66,10 +67,12 @@ def _arm_order(table: pd.DataFrame) -> list[str]:
     return list(dict.fromkeys(table["arm"].astype(str)))
 
 
-def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
+def _figure_header(
+    figure: plt.Figure, title: str, subtitle: str, pollutant: str
+) -> None:
     height = float(figure.get_size_inches()[1])
     figure.suptitle(
-        title,
+        f"{pollutant}: {title}",
         x=0.04,
         y=1.0 - 0.08 / height,
         ha="left",
@@ -88,7 +91,9 @@ def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
     )
 
 
-def _save_retention_overview(path: Path, table: pd.DataFrame) -> bool:
+def _save_retention_overview(
+    path: Path, table: pd.DataFrame, pollutant: str
+) -> bool:
     raw = table.loc[table["arm"] == "raw"]
     if raw.empty:
         return False
@@ -155,6 +160,7 @@ def _save_retention_overview(path: Path, table: pd.DataFrame) -> bool:
         "Retención del historial raw para entrenamiento",
         "Compara cuántos bloques se usan y cuántas horas efectivas conservan short y long; "
         "las horas descuentan la reserva de validación.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.12, 0.98, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -163,7 +169,7 @@ def _save_retention_overview(path: Path, table: pd.DataFrame) -> bool:
 
 
 def _save_block_distribution(
-    path: Path, blocks: pd.DataFrame, table: pd.DataFrame
+    path: Path, blocks: pd.DataFrame, table: pd.DataFrame, pollutant: str
 ) -> bool:
     raw = blocks.loc[blocks["arm"] == "raw", "hours"]
     if raw.empty:
@@ -207,6 +213,7 @@ def _save_block_distribution(
         "Distribución de las longitudes de bloque del historial raw",
         "Cada hueco temporal o valor ausente rompe un bloque; las líneas marcan los mínimos "
         "de entrenamiento y de bloque anfitrión.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -215,7 +222,7 @@ def _save_block_distribution(
 
 
 def _save_detected_block_distribution(
-    path: Path, blocks: pd.DataFrame, table: pd.DataFrame
+    path: Path, blocks: pd.DataFrame, table: pd.DataFrame, pollutant: str
 ) -> bool:
     raw = blocks.loc[blocks["arm"] == "raw", "hours"].to_numpy(dtype=float)
     detected = blocks.loc[blocks["stage"] == "detected"]
@@ -280,6 +287,7 @@ def _save_detected_block_distribution(
         "Distribución de bloques después de retirar anomalías",
         "Raw se muestra como contorno; más masa en longitudes cortas tras detectar indica "
         "que las observaciones retiradas fragmentaron el historial.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.12, 1, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -287,7 +295,9 @@ def _save_detected_block_distribution(
     return True
 
 
-def _save_support_overview(path: Path, table: pd.DataFrame) -> bool:
+def _save_support_overview(
+    path: Path, table: pd.DataFrame, pollutant: str
+) -> bool:
     if table.empty:
         return False
     totals = (
@@ -343,6 +353,7 @@ def _save_support_overview(path: Path, table: pd.DataFrame) -> bool:
         "Soporte válido después de detección e imputación",
         "Horas observadas e imputadas que pertenecen a bloques suficientemente largos; "
         "cada etiqueta añade la cantidad de bloques válidos.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.08, 1, 0.88))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -359,6 +370,7 @@ def _save_matrix(
     label: str,
     fmt: str,
     subtitle: str,
+    pollutant: str,
     exclude_raw: bool = False,
 ) -> bool:
     selected = table.loc[table["arm"] != "raw"] if exclude_raw else table
@@ -407,14 +419,16 @@ def _save_matrix(
         axis.set_facecolor("#fffaf2")
     color_axis = figure.add_axes((0.925, 0.23, 0.015, 0.52))
     figure.colorbar(images[-1], cax=color_axis, label=label)
-    _figure_header(figure, title, subtitle)
+    _figure_header(figure, title, subtitle, pollutant)
     figure.subplots_adjust(left=0.2, right=0.9, bottom=0.2, top=0.84, wspace=0.08)
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
 
-def _save_block_survival(path: Path, blocks: pd.DataFrame, table: pd.DataFrame) -> bool:
+def _save_block_survival(
+    path: Path, blocks: pd.DataFrame, table: pd.DataFrame, pollutant: str
+) -> bool:
     if blocks.empty:
         return False
     regimes = list(dict.fromkeys(table["regime"]))
@@ -451,6 +465,7 @@ def _save_block_survival(path: Path, blocks: pd.DataFrame, table: pd.DataFrame) 
         "Cuántos bloques sobreviven a cada longitud mínima",
         "Cada curva cuenta bloques con al menos la duración del eje X; la línea roja marca "
         "el mínimo exigido por el régimen.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.12, 1, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -458,7 +473,7 @@ def _save_block_survival(path: Path, blocks: pd.DataFrame, table: pd.DataFrame) 
     return True
 
 
-def _save_gap_recovery(path: Path, table: pd.DataFrame) -> bool:
+def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
     selected = table.loc[table["stage"] == "imputed"].copy()
     if selected.empty:
         return False
@@ -530,6 +545,7 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame) -> bool:
         "Cómo la imputación recupera soporte de entrenamiento",
         "Separa las horas ganadas por conectar observaciones de las horas imputadas sobre "
         "anomalías detectadas y huecos que ya existían en raw.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.13, 1, 0.86))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -537,7 +553,9 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame) -> bool:
     return True
 
 
-def _save_detection_summary(path: Path, detection: pd.DataFrame) -> bool:
+def _save_detection_summary(
+    path: Path, detection: pd.DataFrame, pollutant: str
+) -> bool:
     if detection.empty:
         return False
     totals = detection.groupby("strategy", sort=False).agg(
@@ -565,6 +583,7 @@ def _save_detection_summary(path: Path, detection: pd.DataFrame) -> bool:
         "Cobertura y agresividad de las estrategias de detección",
         "Una hora recibe score cuando hay suficientes salidas válidas de detectores para "
         "clasificarla; gaps, bloques demasiado cortos y fallos quedan sin score.",
+        pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -572,7 +591,9 @@ def _save_detection_summary(path: Path, detection: pd.DataFrame) -> bool:
     return True
 
 
-def _save_imputation_age(path: Path, table: pd.DataFrame) -> bool:
+def _save_imputation_age(
+    path: Path, table: pd.DataFrame, pollutant: str
+) -> bool:
     selected = table.loc[
         (table["stage"] == "imputed")
         & table["imputed_valid_age_hours_median"].notna()
@@ -594,6 +615,7 @@ def _save_imputation_age(path: Path, table: pd.DataFrame) -> bool:
         "Antigüedad temporal del soporte imputado",
         "Distribución entre series de los meses que separan las horas imputadas válidas "
         "del inicio del test; la línea central de cada caja es la mediana.",
+        pollutant,
     )
     axis.grid(axis="x", color=GRID_COLOR, linestyle="--", alpha=0.55)
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
@@ -607,9 +629,11 @@ def render_plots(run_dir: Path) -> list[Path]:
     series_path = run_dir / "series_summary.csv"
     blocks_path = run_dir / "blocks.csv"
     detection_path = run_dir / "detection.csv"
-    for path in (series_path, blocks_path, detection_path):
+    manifest_path = run_dir / "manifest.json"
+    for path in (series_path, blocks_path, detection_path, manifest_path):
         if not path.is_file():
             raise FileNotFoundError(f"No existe {path}")
+    pollutant = str(json.loads(manifest_path.read_text(encoding="utf-8"))["pollutant"])
     series = pd.read_csv(series_path)
     missing = sorted(SERIES_REQUIRED - set(series.columns))
     if missing:
@@ -617,16 +641,24 @@ def render_plots(run_dir: Path) -> list[Path]:
     blocks = pd.read_csv(blocks_path)
     detection = pd.read_csv(detection_path)
     builders = (
-        ("retention_overview.png", lambda p: _save_retention_overview(p, series)),
+        (
+            "retention_overview.png",
+            lambda p: _save_retention_overview(p, series, pollutant),
+        ),
         (
             "block_length_distribution.png",
-            lambda p: _save_block_distribution(p, blocks, series),
+            lambda p: _save_block_distribution(p, blocks, series, pollutant),
         ),
         (
             "detected_block_length_distribution.png",
-            lambda p: _save_detected_block_distribution(p, blocks, series),
+            lambda p: _save_detected_block_distribution(
+                p, blocks, series, pollutant
+            ),
         ),
-        ("support_overview.png", lambda p: _save_support_overview(p, series)),
+        (
+            "support_overview.png",
+            lambda p: _save_support_overview(p, series, pollutant),
+        ),
         (
             "support_by_series.png",
             lambda p: _save_matrix(
@@ -635,6 +667,7 @@ def render_plots(run_dir: Path) -> list[Path]:
                 label="Porcentaje de raw", fmt=".0f", exclude_raw=True,
                 subtitle="Cada celda expresa horas válidas como porcentaje de raw: 100 conserva "
                 "el soporte, menos de 100 lo pierde y más de 100 lo amplía.",
+                pollutant=pollutant,
             ),
         ),
         (
@@ -645,12 +678,19 @@ def render_plots(run_dir: Path) -> list[Path]:
                 label="Bloques", fmt=".0f",
                 subtitle="Cantidad absoluta de bloques que alcanzan el mínimo short o long; "
                 "el número de bloques no representa su longitud total.",
+                pollutant=pollutant,
             ),
         ),
-        ("block_length_survival.png", lambda p: _save_block_survival(p, blocks, series)),
-        ("gap_recovery.png", lambda p: _save_gap_recovery(p, series)),
-        ("detection_strategy_summary.png", lambda p: _save_detection_summary(p, detection)),
-        ("imputation_age.png", lambda p: _save_imputation_age(p, series)),
+        (
+            "block_length_survival.png",
+            lambda p: _save_block_survival(p, blocks, series, pollutant),
+        ),
+        ("gap_recovery.png", lambda p: _save_gap_recovery(p, series, pollutant)),
+        (
+            "detection_strategy_summary.png",
+            lambda p: _save_detection_summary(p, detection, pollutant),
+        ),
+        ("imputation_age.png", lambda p: _save_imputation_age(p, series, pollutant)),
     )
     written = []
     for filename, builder in builders:
@@ -666,9 +706,14 @@ def render_plots(run_dir: Path) -> list[Path]:
 
 def _latest_run() -> Path:
     root = _repo_root() / "reports" / "data_blocks"
-    runs = [path for path in root.glob("forecasting_*") if (path / "series_summary.csv").is_file()]
+    runs = [
+        path
+        for pattern in ("forecast_support_*", "forecasting_*")
+        for path in root.glob(pattern)
+        if (path / "series_summary.csv").is_file()
+    ]
     if not runs:
-        raise FileNotFoundError(f"No hay informes de forecasting bajo {root}")
+        raise FileNotFoundError(f"No hay informes de soporte de forecasting bajo {root}")
     return max(runs, key=lambda path: path.stat().st_mtime_ns)
 
 

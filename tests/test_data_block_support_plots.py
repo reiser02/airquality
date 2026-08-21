@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -62,6 +64,9 @@ def test_render_plots_reads_training_support_csv(tmp_path) -> None:
             }
         ]
     ).to_csv(tmp_path / "detection.csv", index=False)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"pollutant": "NO2"}), encoding="utf-8"
+    )
 
     paths = render_plots(tmp_path)
 
@@ -128,6 +133,9 @@ def test_render_plots_handles_zero_gain_and_missing_strategy_age(tmp_path) -> No
     pd.DataFrame(
         [{"strategy": "unlabeled", "observed_hours": 100, "scored_hours": 100, "flagged_hours_full": 0}]
     ).to_csv(tmp_path / "detection.csv", index=False)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"pollutant": "CO"}), encoding="utf-8"
+    )
 
     paths = render_plots(tmp_path)
 

@@ -189,6 +189,13 @@ uv run python -m airquality.data.block_support_analysis
 ```
 
 This is the canonical support report for the configured forecasting protocol.
+It uses `[forecasting] pollutant` by default. Override it with the
+case-insensitive `--pollutant` option, currently `CO` or `NO2`:
+
+```bash
+uv run python -m airquality.data.block_support_analysis --pollutant CO
+```
+
 It compares the same training prefix in the real benchmark states:
 
 - `raw`
@@ -204,8 +211,11 @@ selection but do not distort the training-arm comparison.
 The command reuses the forecasting cache and writes under:
 
 ```text
-reports/data_blocks/forecasting_YYYYMMDD_HHMMSS/
+reports/data_blocks/forecast_support_<POLLUTANT>_YYYYMMDD_HHMMSS/
 ```
+
+With the current configuration, `<POLLUTANT>` is `NO2` unless overridden by
+`--pollutant`.
 
 The persisted report contains:
 
@@ -221,7 +231,7 @@ Render all figures without rerunning detection or imputation:
 
 ```bash
 uv run python -m airquality.data.plot_block_support_analysis \
-  reports/data_blocks/forecasting_YYYYMMDD_HHMMSS
+  reports/data_blocks/forecast_support_NO2_YYYYMMDD_HHMMSS
 ```
 
 Omit the directory to render the newest run. The figures cover aggregate
