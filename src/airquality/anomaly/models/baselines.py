@@ -248,17 +248,28 @@ class HampelDetector(BaseGlobalAnomalyDetector):
 
     def __init__(self, *args: Any, window_size: int = 24, mad_epsilon: float = 1e-6, **kwargs: Any) -> None:
         super().__init__(*args, window_size=window_size, **kwargs)
-        self.minimum_series_length = window_size
+        self.minimum_series_length = self.effective_window_size
         self.mad_epsilon = mad_epsilon
+
+    @property
+    def effective_window_size(self) -> int:
+        """Return the odd sample count for a centered Hampel window.
+
+        Even hourly spans need one extra endpoint sample to keep the scored
+        point centered: a nominal 24-hour span uses 25 samples (12 on each
+        side), and a nominal 6-hour span uses 7.
+        """
+        window_size = int(self.window_size)
+        return window_size if window_size % 2 else window_size + 1
 
     def fit_segments(
         self, train_segments: list[np.ndarray]
     ) -> "HampelDetector":
         """Require one complete offline window before fitting the filter."""
 
-        if not any(len(segment) >= self.window_size for segment in train_segments):
+        if not any(len(segment) >= self.effective_window_size for segment in train_segments):
             raise ValueError(
-                f"Hampel requires at least one segment with {self.window_size} points"
+                f"Hampel requires at least one segment with {self.effective_window_size} points"
             )
         return super().fit_segments(train_segments)
 
@@ -269,7 +280,7 @@ class HampelDetector(BaseGlobalAnomalyDetector):
 
         scores: list[np.ndarray | None] = []
         for segment in segments:
-            if len(segment) < self.window_size:
+            if len(segment) < self.effective_window_size:
                 scores.append(None)
                 continue
             try:
@@ -280,7 +291,10 @@ class HampelDetector(BaseGlobalAnomalyDetector):
 
     def _fit_array(self, train_values: np.ndarray) -> None:
         """No-op: Hampel statistics are recomputed on the scored series."""
-        self.training_summary_ = {"window_size": self.window_size}
+        self.training_summary_ = {
+            "window_size": self.window_size,
+            "effective_window_size": self.effective_window_size,
+        }
 
     def _score_array(self, values: np.ndarray) -> np.ndarray:
         """Return the max rolling Hampel score across features per timestep."""
@@ -292,14 +306,14 @@ class HampelDetector(BaseGlobalAnomalyDetector):
 
         Vectorized over complete centered windows with ``sliding_window_view``.
         Edge points are left as NaN because an offline Hampel score requires a
-        full window. For even ``w``, the window is ``[i - w//2,
-        i + (w-1) - w//2]``.
+        full window. Even nominal windows are promoted to the next odd sample
+        count so the scored point has the same number of samples on each side.
         """
         values = np.asarray(series, dtype=np.float64)
         n = values.size
-        w = int(self.window_size)
+        w = self.effective_window_size
         left = w // 2
-        right = w - 1 - left
+        right = left
 
         if n < w:
             raise ValueError(
