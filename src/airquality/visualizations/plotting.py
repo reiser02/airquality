@@ -1,4 +1,4 @@
-"""Plotting helpers for benchmark predictions, gaps, and model comparisons."""
+"""Show interactive benchmark predictions, gaps, and model comparisons."""
 
 from __future__ import annotations
 

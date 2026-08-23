@@ -1,4 +1,4 @@
-"""Timing figures for the imputation benchmark.
+"""Render timing and cost figures for the imputation benchmark.
 
 Two per-model figures summarize the *cost* of each imputer. They are fed by
 **two files**, because training costs live in different places:
@@ -26,7 +26,7 @@ recomputing anything.
 
 Run with::
 
-    uv run python -m airquality.imputation.plot_benchmark_results results.csv \\
+    uv run python -m airquality.visualizations.imputation results.csv \\
         [--darts-train-csv reports/metrics/training_curves_and_times.csv]
 """
 
@@ -41,7 +41,7 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
-from airquality.anomaly.presentation import (
+from airquality.visualizations.anomaly import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,

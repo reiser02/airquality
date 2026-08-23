@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from airquality.data.plot_station_coverage import (
+from airquality.visualizations.station_coverage import (
     _coverage_summary,
     save_combined_station_coverage,
     save_comparison_station_coverage,

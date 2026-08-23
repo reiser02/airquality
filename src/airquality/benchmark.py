@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from airquality.imputation.plot_montecarlo_results import (
+from airquality.visualizations.montecarlo import (
     render_run_figures,
     save_plot_store,
 )

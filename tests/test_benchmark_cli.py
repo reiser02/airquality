@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from airquality.benchmark import main, run_benchmark_from_config
-from airquality.imputation.plot_montecarlo_results import (
+from airquality.visualizations.montecarlo import (
     load_plot_store,
     main as plot_main,
 )

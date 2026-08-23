@@ -1299,7 +1299,7 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
     """Run the full benchmark and persist ``results.json`` + ``scores.npz``.
 
     Plots are intentionally *not* rendered here; use the separate
-    ``airquality.anomaly.plot_benchmark_results`` script on the produced
+    ``airquality.visualizations.anomaly_benchmark`` script on the produced
     ``results.json`` to generate them.
     """
     config = config or AnomalyBenchmarkConfig()

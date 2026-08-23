@@ -1,4 +1,4 @@
-"""Plot styling and figure builders for the anomaly benchmark reports.
+"""Render and style the figures used by anomaly benchmark reports.
 
 Defines the shared cream/base palette, per-category model colours, and the
 benchmark figures rendered by ``plot_benchmark_results`` from a saved
@@ -15,8 +15,13 @@ from matplotlib.ticker import FuncFormatter
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .anomalies import ANOMALY_PROFILE, ANOMALY_TYPES, apply_anomaly_segment, inject_synthetic_anomalies
-from .metrics import DEFAULT_MAX_DETECTION_RATE
+from airquality.anomaly.anomalies import (
+    ANOMALY_PROFILE,
+    ANOMALY_TYPES,
+    apply_anomaly_segment,
+    inject_synthetic_anomalies,
+)
+from airquality.anomaly.metrics import DEFAULT_MAX_DETECTION_RATE
 
 plt.rcParams.update(
     {

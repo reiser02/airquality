@@ -1,4 +1,4 @@
-"""Standalone plot generator for anomaly-benchmark runs (genias-style).
+"""Render anomaly benchmark figures from a persisted ``results.json``.
 
 The benchmark (:mod:`airquality.anomaly.benchmark`) only persists ``results.json``
 + ``scores.npz``; this separate script renders the benchmark plots from a saved
@@ -8,7 +8,7 @@ and adjusted VUS-PR plus raw-versus-coverage diagnostics for ``synthetic`` runs.
 
 Run::
 
-    uv run python -m airquality.anomaly.plot_benchmark_results reports/anomaly/<run>/results.json
+    uv run python -m airquality.visualizations.anomaly_benchmark reports/anomaly/<run>/results.json
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ import argparse
 import json
 from pathlib import Path
 
-from .metrics import DEFAULT_MAX_DETECTION_RATE
-from .presentation import (
+from airquality.anomaly.metrics import DEFAULT_MAX_DETECTION_RATE
+from airquality.visualizations.anomaly import (
     save_detection_rate_distribution_plot,
     save_detection_rate_vs_inference_plot,
     save_training_time_plot,

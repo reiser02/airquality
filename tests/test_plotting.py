@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pytest
 
-from airquality.visualization import plotting
-from airquality.visualization.plotting import (
+from airquality.visualizations import plotting
+from airquality.visualizations.plotting import (
     get_prediction_time_window,
     plot_predictions_by_gap,
     plot_predictions_by_method_grid,

@@ -1,4 +1,4 @@
-"""Render the raw/detection/imputation block-support report from persisted CSVs."""
+"""Render raw, detection, and imputation block-support reports from CSVs."""
 
 from __future__ import annotations
 
@@ -10,14 +10,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from airquality.anomaly.presentation import (
+from airquality.visualizations.anomaly import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
     TEXT_COLOR,
     style_axis,
 )
-from airquality.forecasting.fill import _repo_root
+
+
+def _repo_root() -> Path:
+    """Return the repository root used to discover persisted report runs."""
+    return Path(__file__).resolve().parents[3]
 
 RAW_COLOR = "#6d6258"
 DETECTED_COLOR = "#3d7ab5"

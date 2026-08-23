@@ -1,4 +1,4 @@
-"""Figure builders + CLI for the forecasting-benchmark reports.
+"""Render forecasting benchmark figures from persisted run tables.
 
 Reads the CSVs persisted by :mod:`airquality.forecasting.pipeline`
 (``results.csv``, ``detection.csv`` and the optional paired-foundation summary)
@@ -32,7 +32,7 @@ Arm colors follow the strategy *family* and stay fixed across figures
 
 Run with::
 
-    uv run python -m airquality.forecasting.plot_benchmark_results [run_dir]
+    uv run python -m airquality.visualizations.forecasting [run_dir]
 
 ``run_dir`` defaults to the newest stamped run under ``reports/forecasting``.
 """
@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from airquality.anomaly.presentation import (
+from airquality.visualizations.anomaly import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
@@ -94,7 +94,7 @@ def _metric_label(metric: str) -> str:
 def _add_header(figure: plt.Figure, title: str, subtitle: str) -> float:
     """Left-aligned title + (multi-line) subtitle sized in inches, not fractions.
 
-    Unlike :func:`airquality.anomaly.presentation.add_plot_header` (tuned for
+    Unlike :func:`airquality.visualizations.anomaly.add_plot_header` (tuned for
     7-inch figures), the gap is computed from the figure height so short
     figures don't overlap title and subtitle. Returns the top figure fraction
     to reserve for the axes (pass it to ``tight_layout``/``subplots_adjust``).

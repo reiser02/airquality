@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from airquality.forecasting.plot_benchmark_results import (
+from airquality.visualizations.forecasting import (
     family_colors,
     improvement_table,
     imputation_pairs,
