@@ -38,7 +38,12 @@ import numpy as np
 import pandas as pd
 
 from airquality.anomaly._vendor.vus_volume import vus_roc_pr
-from airquality.anomaly.anomalies import inject_synthetic_anomalies
+from airquality.anomaly.anomalies import (
+    DEFAULT_INJECTION_VARIANT,
+    INJECTION_POLICY_VERSION,
+    inject_synthetic_anomaly_segments,
+    normalize_injection_variant,
+)
 from airquality.anomaly.ensemble import rank_top_k
 from airquality.anomaly.metrics import (
     DEFAULT_MAX_DETECTION_RATE,
@@ -70,11 +75,8 @@ MIN_SEGMENT_POINTS = 8
 #: Selection-injection defaults. The variant matches the anomaly benchmark's
 #: ``synthetic`` mode; the seed is independent of the detector seed so the
 #: injected shapes do not covary with the models' own randomness. Only
-#: segments with at least ``DEFAULT_MIN_SELECTION_POINTS`` points are injected:
-#: on short segments the fixed per-type rates of ``ANOMALY_PROFILE`` (notably
-#: the 16..48-point drift span) would cover most of the segment and make the
-#: VUS-PR ranking meaningless.
-DEFAULT_INJECTION_VARIANT = "combined"
+#: segments with at least ``DEFAULT_MIN_SELECTION_POINTS`` points establish the
+#: local ranking; short segments inherit the station-level result.
 DEFAULT_INJECTION_SEED = 101
 DEFAULT_MIN_SELECTION_POINTS = 300
 
@@ -245,7 +247,7 @@ class SeriesDetectionContext:
         if carla_stride < 1:
             raise ValueError("carla_stride debe ser positivo")
         self.carla_stride = int(carla_stride)
-        self.injection_variant = injection_variant
+        self.injection_variant = normalize_injection_variant(injection_variant)
         self.injection_seed = injection_seed
         self.min_selection_points = min_selection_points
         self.cache = cache
@@ -361,14 +363,16 @@ class SeriesDetectionContext:
             self._segment_rankings = []
             return self._segment_rankings
 
+        selected_segments = [self.segments[index] for index in selected_indices]
         injected_pairs = []
-        for segment_index in selected_indices:
-            segment = self.segments[segment_index]
-            injected_values, labels = inject_synthetic_anomalies(
-                segment.to_numpy(dtype=np.float32),
-                self.injection_variant,
-                self.injection_seed + segment_index,
-            )
+        injected = inject_synthetic_anomaly_segments(
+            [segment.to_numpy(dtype=np.float32) for segment in selected_segments],
+            self.injection_variant,
+            self.injection_seed,
+        )
+        for segment, (injected_values, labels) in zip(
+            selected_segments, injected, strict=True
+        ):
             injected_pairs.append(
                 (injected_values, labels, pd.DatetimeIndex(segment.index))
             )
@@ -381,6 +385,7 @@ class SeriesDetectionContext:
                     "detector": name,
                     "segment_index": segment_index,
                     "ranking_policy": "local-long-fallback-v1",
+                    "injection_policy": INJECTION_POLICY_VERSION,
                     "injection_variant": self.injection_variant,
                     "injection_seed": self.injection_seed,
                     "min_selection_points": self.min_selection_points,
@@ -455,6 +460,7 @@ class SeriesDetectionContext:
                         "detector": name,
                         "segment_index": segment_index,
                         "ranking_policy": "local-long-fallback-v1",
+                        "injection_policy": INJECTION_POLICY_VERSION,
                         "injection_variant": self.injection_variant,
                         "injection_seed": self.injection_seed,
                         "min_selection_points": self.min_selection_points,
@@ -749,6 +755,7 @@ def common_detection_support(
 __all__ = [
     "DEFAULT_INJECTION_SEED",
     "DEFAULT_INJECTION_VARIANT",
+    "INJECTION_POLICY_VERSION",
     "DEFAULT_MIN_SELECTION_POINTS",
     "DEFAULT_SEED",
     "DEFAULT_VOTE_MIN_VOTES",
@@ -767,4 +774,5 @@ __all__ = [
     "apply_mask_transforms",
     "build_detection_strategy",
     "common_detection_support",
+    "normalize_injection_variant",
 ]

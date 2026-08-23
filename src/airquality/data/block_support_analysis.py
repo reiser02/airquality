@@ -44,15 +44,18 @@ from airquality.forecasting.cache import (
 )
 from airquality.forecasting.cleaning import remove_anomalies
 from airquality.forecasting.detection import (
+    DEFAULT_INJECTION_VARIANT,
     DEFAULT_INJECTION_SEED,
     DEFAULT_MIN_SELECTION_POINTS,
     DEFAULT_VOTE_MIN_VOTES,
     DEFAULT_VOTE_TOP_K,
+    INJECTION_POLICY_VERSION,
     MIN_SEGMENT_POINTS,
     DetectionResult,
     MaskTransform,
     build_detection_strategy,
     common_detection_support,
+    normalize_injection_variant,
 )
 from airquality.forecasting.fill import (
     DEFAULT_MAX_GAP_SIZE,
@@ -73,7 +76,7 @@ from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
 from airquality.paths import create_run_dir
 
-ANALYSIS_VERSION = 3
+ANALYSIS_VERSION = 4
 REGIME_NAMES = ("short", "long")
 
 
@@ -602,6 +605,9 @@ def run_analysis(
     injection_seed = cfg_get_int(
         "forecasting", "injection_seed", DEFAULT_INJECTION_SEED
     )
+    injection_variant = normalize_injection_variant(
+        cfg_get_str("synthetic", "injection_variant", DEFAULT_INJECTION_VARIANT)
+    )
     min_selection_points = cfg_get_int(
         "forecasting", "min_selection_points", DEFAULT_MIN_SELECTION_POINTS
     )
@@ -668,6 +674,8 @@ def run_analysis(
             "detectors": sorted(detectors),
             "seed": seed,
             "injection_seed": injection_seed,
+            "injection_variant": injection_variant,
+            "injection_policy": INJECTION_POLICY_VERSION,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
         }
@@ -683,6 +691,7 @@ def run_analysis(
                 "device": device,
                 "freq": freq,
                 "injection_seed": injection_seed,
+                "injection_variant": injection_variant,
                 "min_selection_points": min_selection_points,
                 "cache": cache,
                 "cache_key": {
@@ -861,6 +870,9 @@ def run_analysis(
         "forecast_models": model_names,
         "strategies": [strategy.name for strategy in strategies],
         "detectors": detectors,
+        "injection_seed": injection_seed,
+        "injection_variant": injection_variant,
+        "injection_policy": INJECTION_POLICY_VERSION,
         "imputation_model": imputation_model,
         "max_imputation_gap": max_imputation_gap,
         "holdout": holdout,

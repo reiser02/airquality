@@ -86,7 +86,9 @@ from airquality.forecasting.cache import (
 )
 from airquality.forecasting.cleaning import remove_anomalies
 from airquality.forecasting.detection import (
+    DEFAULT_INJECTION_VARIANT,
     DEFAULT_INJECTION_SEED,
+    INJECTION_POLICY_VERSION,
     DEFAULT_MIN_SELECTION_POINTS,
     DEFAULT_VOTE_MIN_VOTES,
     DEFAULT_VOTE_TOP_K,
@@ -99,6 +101,7 @@ from airquality.forecasting.detection import (
     apply_mask_transforms,
     build_detection_strategy,
     common_detection_support,
+    normalize_injection_variant,
 )
 from airquality.forecasting.fill import (
     DEFAULT_MAX_GAP_SIZE,
@@ -652,6 +655,9 @@ def _run_benchmark_from_config(
     ]
     imputation = cfg_get_str("forecasting", "imputation", "both").strip().lower()
     injection_seed = cfg_get_int("forecasting", "injection_seed", DEFAULT_INJECTION_SEED)
+    injection_variant = normalize_injection_variant(
+        cfg_get_str("synthetic", "injection_variant", DEFAULT_INJECTION_VARIANT)
+    )
     foundation_test_requested = cfg_get_bool(
         "forecasting", "foundation_preprocessing_test", True
     )
@@ -777,6 +783,8 @@ def _run_benchmark_from_config(
             "detectors": sorted(resolved_detectors),
             "carla_stride": carla_stride,
             "injection_seed": injection_seed,
+            "injection_variant": injection_variant,
+            "injection_policy": INJECTION_POLICY_VERSION,
             "min_selection_points": min_selection_points,
             "vote_top_k": vote_top_k,
             "vote_min_votes": vote_min_votes,
@@ -913,6 +921,8 @@ def _run_benchmark_from_config(
             "seed": seed,
             "carla_stride": carla_stride,
             "injection_seed": injection_seed,
+            "injection_variant": injection_variant,
+            "injection_policy": INJECTION_POLICY_VERSION,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
             "regimes": [asdict(regime) for regime in regimes],
@@ -930,6 +940,7 @@ def _run_benchmark_from_config(
                 "freq": freq,
                 "carla_stride": carla_stride,
                 "injection_seed": injection_seed,
+                "injection_variant": injection_variant,
                 "min_selection_points": min_selection_points,
                 "cache": cache,
                 "cache_key": {

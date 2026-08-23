@@ -47,6 +47,7 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.getint("imputation", "max_workers") == 8
     assert cfg.get("data", "raw_base_dir") == "data/raw/datos_estaciones_5m"
     assert cfg.get("data", "data_root") == "data/raw/datos_estaciones_5m"
+    assert cfg.get("synthetic", "injection_variant") == "combined"
     assert not cfg.has_option("data", "base_path_glob")
     assert cfg.getint("anomaly", "min_series_points") == 8
     assert not cfg.has_option("anomaly", "raw_base_dir")
