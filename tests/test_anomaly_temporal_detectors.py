@@ -66,24 +66,28 @@ def test_sub_pca_is_the_canonical_registry_name() -> None:
 
 
 def test_hampel_offline_requires_a_complete_window() -> None:
-    values = np.arange(24, dtype=np.float32)
+    values = np.arange(25, dtype=np.float32)
     model = HampelDetector(device="cpu")
 
     scores = model.fit(values).score(values)
 
+    assert model.effective_window_size == 25
+    assert model.minimum_series_length == 25
     assert np.isnan(scores[:12]).all()
-    assert np.isnan(scores[-11:]).all()
+    assert np.isnan(scores[-12:]).all()
     assert np.isfinite(scores[12])
-    assert model.score_segments([np.arange(23, dtype=np.float32)]) == [None]
+    assert model.score_segments([np.arange(24, dtype=np.float32)]) == [None]
 
 
 def test_hampel_short_variant_has_expected_complete_support() -> None:
     values = np.arange(10, dtype=np.float32)
-    scores = Hampel6Detector(device="cpu").fit(values).score(values)
+    model = Hampel6Detector(device="cpu")
+    scores = model.fit(values).score(values)
 
+    assert model.effective_window_size == 7
     assert np.isnan(scores[:3]).all()
-    assert np.isnan(scores[-2:]).all()
-    assert np.isfinite(scores[3:8]).all()
+    assert np.isnan(scores[-3:]).all()
+    assert np.isfinite(scores[3:7]).all()
 
 
 class _FakeProphet:

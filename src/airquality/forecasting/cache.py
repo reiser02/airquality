@@ -46,9 +46,10 @@ import pandas as pd
 #: detector coverage is finite-score-aware and failed backtests are not persisted.
 #: v12: test terminology is explicit and the paired synthetic foundation-context
 #: experiment has its own content-keyed payloads. v13: detector semantics use
-#: TSB-AD Sub_PCA, full-window offline Hampel, and timestamp-aware Prophet. v14:
-#: CARLA training stride is an explicit forecasting configuration.
-CACHE_VERSION = 14
+#: TSB-AD Sub_PCA, full-window Hampel, and timestamp-aware Prophet. v14: CARLA
+#: training stride is an explicit forecasting configuration. v15: centered
+#: Hampel uses an odd effective window for even nominal hourly spans.
+CACHE_VERSION = 15
 
 
 def series_fingerprint(series: pd.Series) -> str:
