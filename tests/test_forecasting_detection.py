@@ -453,6 +453,14 @@ def test_selection_ranking_scores_every_detector():
     assert all(0.0 <= value <= 1.0 for value in ranking.values())
 
 
+def test_context_normalizes_injection_variant():
+    context = SeriesDetectionContext(
+        _seasonal_series(n=30), detectors=["IQR"], injection_variant="DRIFT"
+    )
+
+    assert context.injection_variant == "drift"
+
+
 def test_selection_ranking_scores_failed_segment_as_no_detections(monkeypatch):
     series = _seasonal_series(n=610, seed=5)
     series.iloc[300] = np.nan  # two eligible segments: 300 and 309 points

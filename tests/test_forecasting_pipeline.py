@@ -558,9 +558,13 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     monkeypatch.setattr(
         cp,
         "cfg_get_str",
-        lambda section, option, default, cfg=None: "none"
-        if (section, option) == ("forecasting", "imputation")
-        else default,
+        lambda section, option, default, cfg=None: (
+            "none"
+            if (section, option) == ("forecasting", "imputation")
+            else "drift"
+            if (section, option) == ("synthetic", "injection_variant")
+            else default
+        ),
     )
     monkeypatch.setattr(cp, "cfg_get_bool", lambda *args, **kwargs: False)
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
@@ -606,6 +610,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     assert len(seen_detection_index) == 1
     assert seen_detection_index[0].equals(series.index)
     assert seen_detection_context["carla_stride"] == 7
+    assert seen_detection_context["injection_variant"] == "drift"
     selection = artifacts["selection_df"].iloc[0]
     assert bool(selection["selected"])
     assert selection["split_n_flagged"] == 2
