@@ -28,7 +28,7 @@ ANOMALY_TYPES = ["spikes", "scale", "noise", "drift"]
 DEFAULT_INJECTION_VARIANT = "combined"
 INJECTION_VARIANTS = (DEFAULT_INJECTION_VARIANT, *ANOMALY_TYPES)
 INJECTION_REFERENCE_WINDOW = 80
-INJECTION_POLICY_VERSION = "combined-series-w80-type-quotas-minimum-v2"
+INJECTION_POLICY_VERSION = "combined-series-w80-7to8pct-v3"
 
 # Per-type injection profile (tunable). The historical ``points_per_segment``
 # field is now applied to the station-wide observed point count; ``span`` is the
@@ -39,9 +39,9 @@ INJECTION_POLICY_VERSION = "combined-series-w80-type-quotas-minimum-v2"
 # anomaly-types plot read these, so the frequencies/spans stay consistent.
 ANOMALY_PROFILE = {
     "spikes": {"points_per_segment": 150, "span": (1, 1)},
-    "scale": {"points_per_segment": 300, "span": (2, 16)},
-    "noise": {"points_per_segment": 300, "span": (2, 16)},
-    "drift": {"points_per_segment": 900, "span": (16, 48)},
+    "scale": {"points_per_segment": 300, "span": (2, 11)},
+    "noise": {"points_per_segment": 300, "span": (2, 11)},
+    "drift": {"points_per_segment": 900, "span": (16, 36)},
 }
 
 
@@ -287,24 +287,33 @@ def _plan_synthetic_anomalies(
             if not made_progress:
                 break
 
-        selected_level_four = [
-            index
-            for index in active
-            if segment_lengths[index] >= 3 * INJECTION_REFERENCE_WINDOW
-        ]
+        compatible = {
+            name: [
+                index
+                for index in order
+                if name != "drift"
+                or segment_lengths[index] >= 2 * INJECTION_REFERENCE_WINDOW
+            ]
+            for name in ANOMALY_TYPES
+        }
 
-        # Large selected segments may receive extra copies, but only up to the
-        # station-wide per-type rates. Drift therefore remains the rarest type.
-        extra_index = 0
-        failed_attempts = 0
-        while selected_level_four and any(remaining.values()):
-            candidates = [name for name, quota in remaining.items() if quota]
+        # Spend remaining station-wide quotas wherever each type can fit. This
+        # keeps coverage stable when a station is split into many short blocks.
+        extra_indices = dict.fromkeys(ANOMALY_TYPES, 0)
+        failed_attempts = dict.fromkeys(ANOMALY_TYPES, 0)
+        while any(remaining.values()):
+            candidates = [
+                name
+                for name, quota in remaining.items()
+                if quota and failed_attempts[name] < len(compatible[name])
+            ]
             if not candidates:
                 break
             weights = np.asarray([remaining[name] for name in candidates], dtype=float)
             event_type = str(rng.choice(candidates, p=weights / weights.sum()))
-            segment_index = selected_level_four[extra_index % len(selected_level_four)]
-            extra_index += 1
+            segments = compatible[event_type]
+            segment_index = segments[extra_indices[event_type] % len(segments)]
+            extra_indices[event_type] += 1
             plan = _place_event(
                 segment_index,
                 segment_lengths[segment_index],
@@ -313,13 +322,11 @@ def _plan_synthetic_anomalies(
                 rng,
             )
             if plan is None:
-                failed_attempts += 1
-                if failed_attempts >= len(selected_level_four):
-                    break
+                failed_attempts[event_type] += 1
                 continue
             plans.append(plan)
             remaining[event_type] -= 1
-            failed_attempts = 0
+            failed_attempts[event_type] = 0
     else:
         target_events = max(
             1,

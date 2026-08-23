@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 
 import numpy as np
@@ -207,8 +208,20 @@ def test_combined_respects_every_type_quota_across_segments(seed):
 @pytest.mark.parametrize("seed", range(10))
 def test_combined_guarantees_every_type_when_station_can_fit_them(seed):
     plans = _plan_synthetic_anomalies([200] * 10, "combined", seed=seed)
+    counts = Counter(plan[3] for plan in plans)
 
-    assert {plan[3] for plan in plans} == set(ANOMALY_TYPES)
+    assert counts == {"spikes": 13, "scale": 6, "noise": 6, "drift": 2}
+
+
+def test_combined_spends_compatible_quotas_across_mixed_segment_levels():
+    plans = _plan_synthetic_anomalies([200] + [100] * 18, "combined", seed=7)
+
+    assert Counter(plan[3] for plan in plans) == {
+        "spikes": 13,
+        "scale": 6,
+        "noise": 6,
+        "drift": 2,
+    }
 
 
 def test_combined_reservations_preserve_first_round_segment_coverage():
