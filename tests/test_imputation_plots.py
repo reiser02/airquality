@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from airquality.imputation.plot_benchmark_results import (
+from airquality.visualizations.imputation import (
     load_darts_train_seconds,
     render_timing_figures,
     save_time_by_model_plot,

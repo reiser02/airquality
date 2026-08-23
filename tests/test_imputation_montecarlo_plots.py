@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from airquality.imputation.plot_montecarlo_results import (
+from airquality.visualizations.montecarlo import (
     _aggregate_metrics_by_gap,
     _error_correlation_table,
     _gap_degradation_table,

@@ -1,8 +1,8 @@
-"""Persist and render figures for a completed Monte Carlo imputation run.
+"""Persist plot data and render a completed Monte Carlo imputation run.
 
 Run again without executing any model::
 
-    uv run python -m airquality.imputation.plot_montecarlo_results \
+    uv run python -m airquality.visualizations.montecarlo \
         reports/benchmark/montecarlo_<stamp>
 """
 
@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# Base palette mirrored from `airquality.anomaly.presentation` (same "base color"
+# Base palette mirrored from `airquality.visualizations.anomaly` (same "base color"
 # the anomaly benchmark plots use). Copied verbatim on purpose: importing that
 # module would drag in the heavy STL/anomaly stack just for a handful of colours.
 FIGURE_FACE = "#f6f1e8"

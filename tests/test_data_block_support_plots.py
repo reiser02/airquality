@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from airquality.data.plot_block_support_analysis import render_plots
+from airquality.visualizations.block_support import render_plots
 
 
 def test_render_plots_reads_training_support_csv(tmp_path) -> None:

@@ -230,7 +230,7 @@ The persisted report contains:
 Render all figures without rerunning detection or imputation:
 
 ```bash
-uv run python -m airquality.data.plot_block_support_analysis \
+uv run python -m airquality.visualizations.block_support \
   reports/data_blocks/forecast_support_NO2_YYYYMMDD_HHMMSS
 ```
 
@@ -299,7 +299,7 @@ Typical files inside that directory:
 Regenerate every figure from those saved CSVs without rerunning any model:
 
 ```bash
-uv run python -m airquality.imputation.plot_montecarlo_results \
+uv run python -m airquality.visualizations.montecarlo \
     reports/benchmark/montecarlo_YYYYMMDD_HHMMSS
 ```
 

@@ -43,10 +43,10 @@ from airquality.anomaly.metrics import (
     mad_threshold,
     normalize_scores,
 )
-from airquality.anomaly import plot_benchmark_results as plot_module
-from airquality.anomaly import presentation as presentation_module
-from airquality.anomaly.plot_benchmark_results import save_benchmark_plots
 from airquality.anomaly.registry import MODEL_REGISTRY, resolve_model_class, resolve_model_names
+from airquality.visualizations import anomaly as presentation_module
+from airquality.visualizations import anomaly_benchmark as plot_module
+from airquality.visualizations.anomaly_benchmark import save_benchmark_plots
 
 
 def _base_series(length: int = 800) -> np.ndarray:

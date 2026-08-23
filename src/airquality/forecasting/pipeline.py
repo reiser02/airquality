@@ -40,7 +40,7 @@ separately from the persisted CSVs, so they never trigger recomputation.
 Run with::
 
     uv run python -m airquality.forecasting.pipeline
-    uv run python -m airquality.forecasting.plot_benchmark_results [run_dir]
+    uv run python -m airquality.visualizations.forecasting [run_dir]
 """
 
 from __future__ import annotations

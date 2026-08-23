@@ -1,4 +1,4 @@
-"""Render hourly pollutant availability after the shared preprocessing."""
+"""Render hourly station coverage after the shared preprocessing pipeline."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from airquality.anomaly.presentation import (
+from airquality.visualizations.anomaly import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
