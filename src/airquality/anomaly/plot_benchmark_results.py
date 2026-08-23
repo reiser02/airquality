@@ -1,10 +1,10 @@
 """Standalone plot generator for anomaly-benchmark runs (genias-style).
 
 The benchmark (:mod:`airquality.anomaly.benchmark`) only persists ``results.json``
-+ ``scores.npz``; this separate script renders the three benchmark plots from a
-saved ``results.json`` so plotting is decoupled from the (expensive) run. The
++ ``scores.npz``; this separate script renders the benchmark plots from a saved
+``results.json`` so plotting is decoupled from the (expensive) run. The
 figure set follows the run's mode: detection-rate plots for ``unlabeled`` runs,
-VUS-PR plots for ``synthetic`` runs.
+and adjusted VUS-PR plus raw-versus-coverage diagnostics for ``synthetic`` runs.
 
 Run::
 
@@ -23,12 +23,13 @@ from .presentation import (
     save_detection_rate_vs_inference_plot,
     save_training_time_plot,
     save_vus_pr_distribution_plot,
+    save_vus_pr_raw_vs_coverage_plot,
     save_vus_pr_vs_inference_plot,
 )
 
 
 def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None = None) -> dict[str, Path]:
-    """Render the three benchmark plots from a benchmark ``results.json``.
+    """Render the benchmark plots from a benchmark ``results.json``.
 
     Plots are written next to ``results.json`` unless ``output_dir`` is given.
     """
@@ -53,11 +54,15 @@ def save_benchmark_plots(results_path: str | Path, output_dir: str | Path | None
     if mode == "synthetic":
         plot_paths = {
             "metrics_plot": plot_dir / summary.get("metrics_plot", "vus_pr_distribution.png"),
+            "coverage_plot": plot_dir / summary.get(
+                "coverage_plot", "vus_pr_raw_vs_coverage.png"
+            ),
             "scatter_plot": plot_dir / summary.get("scatter_plot", "vus_pr_vs_inference.png"),
             "training_plot": plot_dir / summary.get("training_plot", "training_time.png"),
         }
         save_vus_pr_distribution_plot(plot_paths["metrics_plot"], model_summaries)
         save_vus_pr_vs_inference_plot(plot_paths["scatter_plot"], timed_model_summaries)
+        save_vus_pr_raw_vs_coverage_plot(plot_paths["coverage_plot"], model_summaries)
     else:
         max_detection_rate = float(summary.get("config", {}).get("max_detection_rate", DEFAULT_MAX_DETECTION_RATE))
         plot_paths = {

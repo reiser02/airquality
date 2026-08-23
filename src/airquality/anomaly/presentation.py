@@ -130,18 +130,25 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 
 def _series_metric_values(summary: dict[str, object], metric: str) -> list[float]:
     """Extract one metric's per-case values from one model summary."""
-    return [
-        _safe_float(entry.get("metrics", {}).get(metric))
-        for entry in summary.get("series_results", [])
-        if isinstance(entry, dict)
-    ]
+    values = []
+    for entry in summary.get("series_results", []):
+        if not isinstance(entry, dict):
+            continue
+        value = _safe_float(
+            entry.get("metrics", {}).get(metric), default=float("nan")
+        )
+        if np.isfinite(value):
+            values.append(value)
+    return values
 
 
 def _metric_order_value(summary: dict[str, object], metric: str) -> float:
     """Sort key for models: the macro metric, else the median of per-case values."""
     macro_metrics = summary.get("macro_metrics", {})
     if isinstance(macro_metrics, dict) and metric in macro_metrics:
-        return _safe_float(macro_metrics[metric])
+        value = _safe_float(macro_metrics[metric], default=float("nan"))
+        if np.isfinite(value):
+            return value
     values = _series_metric_values(summary, metric)
     return float(np.median(values)) if values else float("inf")
 
@@ -362,11 +369,18 @@ def save_detection_rate_vs_inference_plot(
 # --- synthetic-mode figures -------------------------------------------------
 
 
-def save_vus_pr_distribution_plot(output_path: Path, model_summaries: dict[str, dict[str, object]]) -> None:
-    """Render the per-model VUS-PR distribution figure (violin + box + points)."""
+def save_vus_pr_distribution_plot(
+    output_path: Path,
+    model_summaries: dict[str, dict[str, object]],
+) -> None:
+    """Render the primary coverage-adjusted VUS-PR distribution figure."""
     model_names = sorted(model_summaries, key=lambda model_name: _metric_order_value(model_summaries[model_name], "vus_pr"))
     figure, axis = plt.subplots(figsize=(12.5, 7.0), facecolor=FIGURE_FACE)
-    add_plot_header(figure, "VUS-PR Distribution Across Series", "Models ordered from lower to higher average VUS-PR")
+    add_plot_header(
+        figure,
+        "Coverage-Adjusted VUS-PR Across Series",
+        "Adjusted VUS-PR = raw VUS-PR x scored-point coverage",
+    )
     style_axis(axis)
     distributions = [_series_metric_values(model_summaries[model_name], "vus_pr") for model_name in model_names]
     positions = np.arange(1, len(model_names) + 1)
@@ -423,7 +437,7 @@ def save_vus_pr_distribution_plot(output_path: Path, model_summaries: dict[str, 
     axis.set_yticks(positions)
     axis.set_yticklabels(model_names)
     axis.set_xlim(0.0, 1.08)
-    axis.set_xlabel("VUS-PR")
+    axis.set_xlabel("Coverage-adjusted VUS-PR")
     axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
     axis.grid(False, axis="y")
     axis.legend(handles=category_legend_handles(alpha=0.78), loc="lower right", ncols=3)
@@ -432,13 +446,20 @@ def save_vus_pr_distribution_plot(output_path: Path, model_summaries: dict[str, 
     plt.close(figure)
 
 
-def save_vus_pr_vs_inference_plot(output_path: Path, model_summaries: dict[str, dict[str, object]]) -> None:
+def save_vus_pr_vs_inference_plot(
+    output_path: Path,
+    model_summaries: dict[str, dict[str, object]],
+) -> None:
     """Render the macro VUS-PR vs. mean inference-time scatter per model."""
     figure, axis = plt.subplots(figsize=(12.5, 6.5), facecolor=FIGURE_FACE)
     style_axis(axis)
     for model_name, summary in model_summaries.items():
-        vus_pr = summary["macro_metrics"]["vus_pr"]
+        vus_pr = _safe_float(
+            summary.get("macro_metrics", {}).get("vus_pr"), default=float("nan")
+        )
         inference_seconds = summary["timing"]["mean_inference_seconds"]
+        if not np.isfinite(vus_pr):
+            continue
         color = model_color(model_name)
         axis.scatter(
             inference_seconds,
@@ -460,8 +481,8 @@ def save_vus_pr_vs_inference_plot(output_path: Path, model_summaries: dict[str, 
         )
     axis.set_xscale("log")
     axis.set_xlabel("Average Held-Out Evaluation Inference Time (sec)")
-    axis.set_ylabel("Average VUS-PR")
-    axis.set_title("VUS-PR vs. Inference Time", fontsize=13)
+    axis.set_ylabel("Average Coverage-Adjusted VUS-PR")
+    axis.set_title("Coverage-Adjusted VUS-PR vs. Inference Time", fontsize=13)
     legend_handles = [
         plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markeredgecolor="#444444", markersize=8, label=category)
         for category, color in MODEL_CATEGORY_COLORS.items()
@@ -472,14 +493,66 @@ def save_vus_pr_vs_inference_plot(output_path: Path, model_summaries: dict[str, 
     plt.close(figure)
 
 
+def save_vus_pr_raw_vs_coverage_plot(
+    output_path: Path, model_summaries: dict[str, dict[str, object]]
+) -> None:
+    """Render raw macro VUS-PR against score coverage, annotated by adjusted VUS."""
+    figure, axis = plt.subplots(figsize=(12.5, 6.5), facecolor=FIGURE_FACE)
+    style_axis(axis)
+    for model_name, summary in model_summaries.items():
+        raw_metrics = summary.get("macro_raw_metrics", {})
+        macro_metrics = summary.get("macro_metrics", {})
+        raw = _safe_float(
+            raw_metrics.get("vus_pr") if isinstance(raw_metrics, dict) else None,
+            default=float("nan"),
+        )
+        coverage = _safe_float(
+            summary.get("macro_coverage_rate"), default=float("nan")
+        )
+        adjusted = _safe_float(
+            macro_metrics.get("vus_pr") if isinstance(macro_metrics, dict) else None,
+            default=float("nan"),
+        )
+        if not np.isfinite(raw) or not np.isfinite(coverage):
+            continue
+        axis.scatter(
+            coverage,
+            raw,
+            s=90,
+            color=model_color(model_name),
+            edgecolor=EDGE_COLOR,
+            linewidth=0.8,
+            zorder=3,
+        )
+        label = f"{model_name}  adjusted={adjusted:.3f}"
+        axis.annotate(
+            label,
+            (coverage, raw),
+            textcoords="offset points",
+            xytext=(6, 4),
+            fontsize=8.5,
+            color=TEXT_COLOR,
+        )
+    axis.set_xlim(-0.02, 1.02)
+    axis.set_ylim(-0.02, 1.02)
+    axis.xaxis.set_major_formatter(_percent_formatter())
+    axis.set_xlabel("Scored-point coverage")
+    axis.set_ylabel("Raw VUS-PR on scored support")
+    axis.set_title("Raw VUS-PR vs. Coverage", fontsize=13)
+    axis.legend(handles=category_legend_handles(alpha=0.92), loc="lower left", ncols=2)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+
+
 def _inject_all_anomaly_types(
     values: np.ndarray, seed: int
 ) -> tuple[np.ndarray, list[tuple[int, int, str]]]:
     """Inject one segment of *every* type, each in its own slot.
 
-    Mirrors :func:`airquality.anomaly.anomalies.inject_synthetic_anomalies` (same
-    building block and length/scale parameters) so the shapes match, but places
-    one segment per equal-width slot so all types stay visible and non-overlapping.
+    This is an illustrative panel rather than the dynamic ``combined`` policy:
+    it uses the same shapes but places one segment per equal-width slot so every
+    type stays visible and non-overlapping.
     Returns the injected series and the ``(start, end, type)`` of each segment.
     """
     rng = np.random.default_rng(seed)

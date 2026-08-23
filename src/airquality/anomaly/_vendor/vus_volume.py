@@ -1,14 +1,10 @@
 """VUS-ROC / VUS-PR (Volume Under the Surface) computation.
 
 Trimmed copy of the ``metricor`` class from VUS 0.0.6
-(``vus/utils/metrics.py``, The DATUM Lab, Apache-2.0). Only the methods needed
-to reproduce ``generate_curve``'s ``avg_auc_3d`` (VUS_ROC) and ``avg_ap_3d``
-(VUS_PR) are kept: ``range_convers_new``, ``new_sequence``, ``sequencing`` and
-``RangeAUC_volume_opt``. The methods are copied from upstream so results match
-the original ``vus.metrics.get_metrics`` exactly; the only local change is
-hoisting the per-threshold prediction masks out of the window loop in
-``RangeAUC_volume_opt`` (identical arrays, identical results, O(windowSize)
-times fewer full-series comparisons). See ``NOTICE`` for attribution.
+(``vus/utils/metrics.py``, The DATUM Lab, Apache-2.0). The single-series path
+matches upstream exactly. Local changes hoist threshold masks out of the window
+loop and add a segmented path that pools statistics while preventing events
+from crossing sequence bounds. See ``NOTICE`` for attribution.
 """
 
 from __future__ import annotations
@@ -165,6 +161,129 @@ class metricor:
 
         return tpr_3d, fpr_3d, prec_3d, window_3d, sum(auc_3d) / len(window_3d), sum(ap_3d) / len(window_3d)
 
+    def RangeAUC_volume_opt_segments(
+        self, labels_by_segment, scores_by_segment, windowSize, thre=250
+    ):
+        """Pool VUS statistics across independent temporal sequences."""
+        labels_by_segment = [np.asarray(labels).ravel() for labels in labels_by_segment]
+        scores_by_segment = [
+            np.asarray(scores, dtype=float).ravel() for scores in scores_by_segment
+        ]
+        if not labels_by_segment or len(labels_by_segment) != len(scores_by_segment):
+            raise ValueError("VUS requires matching non-empty segment lists")
+        if any(
+            labels.shape != scores.shape or labels.size == 0
+            for labels, scores in zip(labels_by_segment, scores_by_segment, strict=True)
+        ):
+            raise ValueError("VUS segment labels and scores must have matching non-empty shapes")
+        if any(not np.isin(labels, (0, 1)).all() for labels in labels_by_segment):
+            raise ValueError("VUS segment labels must be binary")
+        if any(not np.isfinite(scores).all() for scores in scores_by_segment):
+            raise ValueError("VUS segment scores must be finite")
+        if windowSize < 0 or thre < 1:
+            raise ValueError("VUS windowSize must be non-negative and thre must be positive")
+
+        score = np.concatenate(scores_by_segment)
+        n_points = len(score)
+        positives = float(sum(np.sum(labels) for labels in labels_by_segment))
+        if positives == 0 or positives == n_points:
+            raise ValueError("VUS requires both classes across all segments")
+        if len(labels_by_segment) == 1:
+            return self.RangeAUC_volume_opt(
+                labels_by_segment[0], scores_by_segment[0], windowSize, thre
+            )
+
+        sequences = [self.range_convers_new(labels) for labels in labels_by_segment]
+        maximum_ranges = [
+            self.new_sequence(labels, sequence, windowSize) if sequence else []
+            for labels, sequence in zip(labels_by_segment, sequences, strict=True)
+        ]
+        score_sorted = -np.sort(-score)
+        threshold_positions = np.linspace(0, n_points - 1, thre).astype(int)
+        flat_masks = [score >= score_sorted[index] for index in threshold_positions]
+        split_points = np.cumsum([len(scores) for scores in scores_by_segment])[:-1]
+        pred_masks = [np.split(mask, split_points) for mask in flat_masks]
+
+        window_3d = np.arange(0, windowSize + 1, 1)
+        tpr_3d = np.zeros((windowSize + 1, thre + 2))
+        fpr_3d = np.zeros((windowSize + 1, thre + 2))
+        prec_3d = np.zeros((windowSize + 1, thre + 1))
+        auc_3d = np.zeros(windowSize + 1)
+        ap_3d = np.zeros(windowSize + 1)
+
+        for window in window_3d:
+            extended = [
+                self.sequencing(labels, sequence, window)
+                if sequence
+                else labels.astype(float)
+                for labels, sequence in zip(labels_by_segment, sequences, strict=True)
+            ]
+            ranges = [
+                self.new_sequence(labels, sequence, window) if sequence else []
+                for labels, sequence in zip(extended, sequences, strict=True)
+            ]
+            total_ranges = sum(len(value) for value in ranges)
+            TF_list = np.zeros((thre + 2, 2))
+            Precision_list = np.ones(thre + 1)
+
+            for threshold_index, masks_by_segment in enumerate(pred_masks, start=1):
+                true_positives = 0.0
+                weighted_labels = 0.0
+                existence = 0
+                predicted = float(sum(np.sum(mask) for mask in masks_by_segment))
+
+                for labels, sequence, local_ranges, max_ranges, mask in zip(
+                    extended,
+                    sequences,
+                    ranges,
+                    maximum_ranges,
+                    masks_by_segment,
+                    strict=True,
+                ):
+                    if not sequence:
+                        continue
+                    weighted = labels.copy()
+                    for start, end in local_ranges:
+                        local = slice(start, end + 1)
+                        weighted[local] = labels[local] * mask[local]
+                        existence += int(mask[local].any())
+                    for start, end in sequence:
+                        weighted[start : end + 1] = 1
+                    for start, end in max_ranges:
+                        local = slice(start, end + 1)
+                        true_positives += float(np.dot(weighted[local], mask[local]))
+                        weighted_labels += float(np.sum(weighted[local]))
+
+                adjusted_positives = (positives + weighted_labels) / 2.0
+                recall = min(true_positives / adjusted_positives, 1.0)
+                tpr = recall * (existence / total_ranges)
+                false_positives = predicted - true_positives
+                fpr = false_positives / (n_points - adjusted_positives)
+                precision = true_positives / predicted
+                TF_list[threshold_index] = [tpr, fpr]
+                Precision_list[threshold_index] = precision
+
+            TF_list[thre + 1] = [1, 1]
+            tpr_3d[window] = TF_list[:, 0]
+            fpr_3d[window] = TF_list[:, 1]
+            prec_3d[window] = Precision_list
+            auc_3d[window] = np.dot(
+                TF_list[1:, 1] - TF_list[:-1, 1],
+                (TF_list[1:, 0] + TF_list[:-1, 0]) / 2,
+            )
+            ap_3d[window] = np.dot(
+                TF_list[1:-1, 0] - TF_list[:-2, 0], Precision_list[1:]
+            )
+
+        return (
+            tpr_3d,
+            fpr_3d,
+            prec_3d,
+            window_3d,
+            float(np.mean(auc_3d)),
+            float(np.mean(ap_3d)),
+        )
+
 
 def vus_roc_pr(labels, score, sliding_window, thre=250):
     """Return ``(VUS_ROC, VUS_PR)`` for the given labels/score.
@@ -174,5 +293,13 @@ def vus_roc_pr(labels, score, sliding_window, thre=250):
     """
     *_, avg_auc_3d, avg_ap_3d = metricor().RangeAUC_volume_opt(
         labels_original=labels, score=score, windowSize=sliding_window, thre=thre
+    )
+    return avg_auc_3d, avg_ap_3d
+
+
+def vus_roc_pr_segments(labels_by_segment, scores_by_segment, sliding_window, thre=250):
+    """Return VUS pooled across independent temporal sequences."""
+    *_, avg_auc_3d, avg_ap_3d = metricor().RangeAUC_volume_opt_segments(
+        labels_by_segment, scores_by_segment, sliding_window, thre
     )
     return avg_auc_3d, avg_ap_3d

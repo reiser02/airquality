@@ -3,7 +3,7 @@
 Defaults come from the ``[anomaly]`` section of the project config; any argument
 overrides its config default. ``--mode unlabeled`` (default) screens detectors
 label-free by detection rate; ``--mode synthetic`` scores them against injected
-anomalies (VUS-PR et al.).
+anomalies (coverage-adjusted VUS-PR et al., with raw metrics retained).
 """
 
 from __future__ import annotations
@@ -15,9 +15,11 @@ from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 
 from .benchmark import (
     AnomalyBenchmarkConfig,
+    INJECTION_VARIANT,
     normalize_sub_pca_components,
     run_benchmark,
 )
+from .anomalies import INJECTION_VARIANTS
 from .ensemble import DEFAULT_TOP_K
 from .metrics import DEFAULT_MAX_DETECTION_RATE, DEFAULT_THRESHOLD_K
 
@@ -51,6 +53,7 @@ def build_config_from_args(args: argparse.Namespace) -> AnomalyBenchmarkConfig:
         carla_stride=args.carla_stride,
         threshold_k=args.threshold_k,
         max_detection_rate=args.max_detection_rate,
+        injection_variant=args.injection_variant,
         eval_seed=args.eval_seed,
         ensemble_top_k=args.top_k,
         min_series_points=args.min_series_points,
@@ -93,7 +96,7 @@ def main() -> None:
         "--threshold-k",
         type=float,
         default=cfg_get_float("anomaly", "threshold_k", DEFAULT_THRESHOLD_K),
-        help="[unlabeled] k of the median + k*MAD score-binarization threshold",
+        help="k of the median + k*MAD score-binarization threshold",
     )
     parser.add_argument(
         "--max-detection-rate",
@@ -108,10 +111,16 @@ def main() -> None:
         help="[synthetic] held-out evaluation-injection seed",
     )
     parser.add_argument(
+        "--injection-variant",
+        choices=INJECTION_VARIANTS,
+        default=cfg_get_str("synthetic", "injection_variant", INJECTION_VARIANT),
+        help="[synthetic] anomaly profile used for injection",
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
         default=cfg_get_int("anomaly", "ensemble_top_k", DEFAULT_TOP_K),
-        help="[synthetic] ensemble size (ranked by selection VUS-PR)",
+        help="[synthetic] maximum pointwise ensemble size (2 or 3)",
     )
     parser.add_argument(
         "--min-series-points",

@@ -28,6 +28,7 @@ Reference:
 The Apache License 2.0 is available at:
   https://www.apache.org/licenses/LICENSE-2.0
 
-This vendored code is unmodified except for trimming unused methods/imports and
-adding module docstrings. The original copyright and license notices are
-retained in the source file headers.
+This vendored code is trimmed to the required methods and locally extends VUS
+with a multi-sequence aggregation path that preserves temporal boundaries. The
+single-sequence path remains aligned with upstream. Original copyright and
+license notices are retained in the source file headers.
