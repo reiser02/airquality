@@ -9,7 +9,15 @@ import pandas as pd
 import pytest
 
 from airquality.anomaly import benchmark as benchmark_module
-from airquality.anomaly.anomalies import ANOMALY_TYPES, apply_anomaly_segment, inject_synthetic_anomalies
+from airquality.anomaly import metrics as metrics_module
+from airquality.anomaly.anomalies import (
+    ANOMALY_TYPES,
+    INJECTION_REFERENCE_WINDOW,
+    _combined_group,
+    _plan_synthetic_anomalies,
+    apply_anomaly_segment,
+    inject_synthetic_anomalies,
+)
 from airquality.anomaly.benchmark import (
     INJECTION_VARIANT,
     SYNTHETIC_METRIC_KEYS,
@@ -25,7 +33,7 @@ from airquality.anomaly.benchmark import (
     run_benchmark,
     split_by_detection_rate,
 )
-from airquality.anomaly.ensemble import consensus, rank_top_k
+from airquality.anomaly.ensemble import consensus, rank_top_k, ranked_pointwise_vote
 from airquality.anomaly.metrics import (
     MAD_SCALE,
     compute_metrics,
@@ -35,6 +43,7 @@ from airquality.anomaly.metrics import (
     normalize_scores,
 )
 from airquality.anomaly import plot_benchmark_results as plot_module
+from airquality.anomaly import presentation as presentation_module
 from airquality.anomaly.plot_benchmark_results import save_benchmark_plots
 from airquality.anomaly.registry import MODEL_REGISTRY, resolve_model_class, resolve_model_names
 
@@ -84,6 +93,22 @@ def test_injection_variant_is_raw_combined():
     assert INJECTION_VARIANT == "combined"
 
 
+@pytest.mark.parametrize("variant", ["combined", *ANOMALY_TYPES])
+def test_injection_variant_is_normalized(variant: str):
+    config = benchmark_module.AnomalyBenchmarkConfig(
+        mode="synthetic", injection_variant=variant.upper()
+    )
+
+    assert config.injection_variant == variant
+
+
+def test_injection_variant_rejects_unknown_profile():
+    with pytest.raises(ValueError, match="Unknown injection variant"):
+        benchmark_module.AnomalyBenchmarkConfig(
+            mode="synthetic", injection_variant="unknown"
+        )
+
+
 def test_inject_preserves_series_outside_labels():
     # No STL base: outside the injected segments the REAL series is untouched.
     values = _base_series(400)
@@ -119,6 +144,141 @@ def test_inject_is_deterministic_for_seed():
     assert np.array_equal(a_labels, b_labels)
 
 
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [
+        (40, ({"spikes"}, {"scale"}, {"noise"})),
+        (80, ({"spikes", "scale"}, {"spikes", "noise"})),
+        (240, ({"spikes", "scale", "noise", "drift"},)),
+    ],
+)
+def test_combined_injection_uses_four_w80_levels(length, expected):
+    group = set(_combined_group(length, np.random.default_rng(7)))
+
+    assert INJECTION_REFERENCE_WINDOW == 80
+    assert group in expected
+
+
+def test_combined_level_three_selects_one_of_two_groups():
+    groups = {
+        tuple(sorted(_combined_group(200, np.random.default_rng(seed))))
+        for seed in range(100)
+    }
+
+    assert groups == {("drift",), ("noise", "scale", "spikes")}
+
+
+def test_combined_level_three_is_balanced_50_50():
+    drift = sum(
+        _combined_group(200, np.random.default_rng(seed)) == ["drift"]
+        for seed in range(1000)
+    )
+
+    assert 450 <= drift <= 550
+
+
+def test_combined_budget_is_station_wide_not_per_segment():
+    plans = _plan_synthetic_anomalies([40] * 10, "combined", seed=7)
+
+    assert len(plans) == 4
+    assert len({plan[0] for plan in plans}) == 4
+
+
+def test_combined_budget_reaches_every_segment_before_second_events():
+    plans = _plan_synthetic_anomalies([100] * 10, "combined", seed=7)
+
+    assert len(plans) == 12  # The single drift quota cannot fit in these segments.
+    assert len({plan[0] for plan in plans[:10]}) == 10
+    assert {plan[0] for plan in plans} == set(range(10))
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_combined_respects_every_type_quota_across_segments(seed):
+    plans = _plan_synthetic_anomalies([400] * 5, "combined", seed=seed)
+    counts = {
+        anomaly_type: sum(plan[3] == anomaly_type for plan in plans)
+        for anomaly_type in ANOMALY_TYPES
+    }
+
+    assert counts == {"spikes": 13, "scale": 6, "noise": 6, "drift": 2}
+    assert {plan[0] for plan in plans} == set(range(5))
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_combined_guarantees_every_type_when_station_can_fit_them(seed):
+    plans = _plan_synthetic_anomalies([200] * 10, "combined", seed=seed)
+
+    assert {plan[3] for plan in plans} == set(ANOMALY_TYPES)
+
+
+def test_combined_reservations_preserve_first_round_segment_coverage():
+    plans = _plan_synthetic_anomalies([160, *([8] * 100)], "combined", seed=7)
+
+    assert len({plan[0] for plan in plans}) == len(plans)
+
+
+def test_combined_does_not_force_drift_without_a_large_enough_segment():
+    plans = _plan_synthetic_anomalies([100] * 20, "combined", seed=7)
+
+    assert "drift" not in {plan[3] for plan in plans}
+
+
+def test_combined_does_not_force_types_before_their_station_quota():
+    plans = _plan_synthetic_anomalies([899], "combined", seed=7)
+
+    assert "drift" not in {plan[3] for plan in plans}
+
+
+def test_combined_level_four_cannot_exceed_station_budget():
+    plans = _plan_synthetic_anomalies([240], "combined", seed=7)
+
+    assert len(plans) == 1
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    ([80], [160], [240], [400], [40] * 10, [100, 200, 300]),
+)
+def test_combined_never_exceeds_global_event_budget(lengths):
+    total = sum(lengths)
+    budget = max(
+        1,
+        sum(total // points for points in (150, 300, 300, 900)),
+    )
+
+    assert len(_plan_synthetic_anomalies(lengths, "combined", seed=11)) <= budget
+
+
+def test_combined_events_never_overlap():
+    plans = _plan_synthetic_anomalies([900], "combined", seed=7)
+    ordered = sorted(plans, key=lambda plan: plan[1])
+
+    for left, right in zip(
+        ordered[:-1],
+        ordered[1:],
+        strict=True,
+    ):
+        assert left[2] <= right[1]
+
+
+def test_large_combined_segment_uses_station_wide_type_rates():
+    plans = _plan_synthetic_anomalies([900], "combined", seed=7)
+    counts = {
+        anomaly_type: sum(plan[3] == anomaly_type for plan in plans)
+        for anomaly_type in ANOMALY_TYPES
+    }
+
+    assert counts == {"spikes": 6, "scale": 3, "noise": 3, "drift": 1}
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_single_drift_variant_uses_a_segment_where_it_fits(seed):
+    plans = _plan_synthetic_anomalies([8, 1000], "drift", seed=seed)
+
+    assert plans
+    assert {plan[0] for plan in plans} == {1}
+
+
 # --- supervised metrics (synthetic mode) ------------------------------------
 
 
@@ -130,20 +290,107 @@ def test_compute_metrics_perfect_score():
     assert metrics["vus_pr"] > 0.5
 
 
-def test_compute_metrics_no_anomalies_returns_zero_dict():
+def test_compute_metrics_no_anomalies_returns_undefined_metrics():
     metrics = compute_metrics(np.zeros(8, dtype=np.int64), np.linspace(0, 1, 8), window_size=2)
     assert set(metrics) == set(SYNTHETIC_METRIC_KEYS)
-    assert all(value == 0.0 for value in metrics.values())
+    assert all(np.isnan(value) for value in metrics.values())
 
 
-def test_compute_metrics_all_anomalous_returns_zero_dict():
-    metrics = compute_metrics(np.ones(8, dtype=np.int64), np.linspace(0, 1, 8), window_size=2)
-    assert all(value == 0.0 for value in metrics.values())
+def test_segmented_metrics_all_anomalous_keeps_affiliation_defined():
+    labels = np.ones(8, dtype=np.int64)
+    metrics = metrics_module.compute_segmented_metrics(
+        [labels], [labels.astype(float)], window_size=2,
+        prediction_masks_by_segment=[np.ones(8, dtype=bool)],
+    )["metrics"]
+    assert all(np.isnan(metrics[key]) for key in ("auroc", "aupr", "vus_pr", "vus_roc"))
+    assert metrics["affiliation_f1"] == pytest.approx(1.0)
 
 
-def test_compute_metrics_empty_returns_zero_dict():
+def test_compute_metrics_empty_returns_undefined_metrics():
     metrics = compute_metrics(np.array([], dtype=np.int64), np.array([]), window_size=2)
-    assert all(value == 0.0 for value in metrics.values())
+    assert all(np.isnan(value) for value in metrics.values())
+
+
+def test_segmented_metrics_pool_opposite_single_class_segments():
+    labels = [np.zeros(4, dtype=np.int64), np.ones(4, dtype=np.int64)]
+    scores = [np.linspace(0.0, 0.3, 4), np.linspace(0.7, 1.0, 4)]
+
+    result = metrics_module.compute_segmented_metrics(labels, scores, window_size=1)
+
+    assert result["metrics"]["auroc"] == pytest.approx(1.0)
+    assert result["metrics"]["aupr"] == pytest.approx(1.0)
+    assert result["metrics"]["vus_pr"] > 0.9
+
+
+def test_segmented_vus_matches_single_series_implementation():
+    labels = np.array([0, 0, 1, 1, 0, 1, 0, 0], dtype=np.int64)
+    scores = np.array([0.1, 0.2, 0.9, 0.8, 0.3, 0.7, 0.4, 0.0])
+
+    expected = metrics_module.vus_roc_pr(labels, scores, 2, thre=17)
+    actual = metrics_module.vus_roc_pr_segments([labels], [scores], 2, thre=17)
+
+    assert actual == expected
+
+
+def test_segmented_vus_does_not_join_events_across_boundaries():
+    labels = [np.array([0, 0, 1]), np.array([1, 0, 0])]
+
+    assert metrics_module.vus_sliding_window_segments(labels) == 1
+    assert metrics_module.vus_sliding_window(np.concatenate(labels)) == 2
+
+
+def test_segmented_vus_tolerance_does_not_cross_boundaries():
+    labels = [np.array([0, 0, 1]), np.array([0, 0, 0])]
+    scores = [np.zeros(3), np.array([1.0, 0.0, 0.0])]
+    normalized = metrics_module.normalize_scores(np.concatenate(scores))
+    segmented = metrics_module.vus_roc_pr_segments(
+        labels, list(np.split(normalized, [3])), 2, thre=7
+    )[1]
+    concatenated = metrics_module.vus_roc_pr(
+        np.concatenate(labels), normalized, 2, thre=7
+    )[1]
+
+    assert segmented < concatenated
+
+
+def test_segmented_vus_is_invariant_to_segment_order():
+    labels = [np.array([0, 1, 1, 0]), np.array([0, 0, 1, 0])]
+    scores = [np.array([0.1, 0.9, 0.8, 0.2]), np.array([0.3, 0.2, 0.7, 0.1])]
+
+    forward = metrics_module.vus_roc_pr_segments(labels, scores, 2, thre=13)
+    reverse = metrics_module.vus_roc_pr_segments(
+        list(reversed(labels)), list(reversed(scores)), 2, thre=13
+    )
+
+    assert reverse == pytest.approx(forward)
+
+
+def test_segmented_affiliation_reports_orphan_predictions():
+    labels = [np.array([0, 0, 1, 1]), np.zeros(4, dtype=np.int64)]
+    scores = [np.array([0.0, 0.0, 1.0, 1.0]), np.ones(4)]
+    masks = [np.array([0, 0, 1, 1], dtype=bool), np.ones(4, dtype=bool)]
+
+    result = metrics_module.compute_segmented_metrics(
+        labels, scores, window_size=1, prediction_masks_by_segment=masks
+    )
+
+    assert np.isnan(result["metrics"]["affiliation_f1"])
+    assert result["affiliation_diagnostics"]["status"] == "orphan_predictions"
+    assert result["affiliation_diagnostics"]["orphan_prediction_events"] == 1
+    assert result["affiliation_diagnostics"]["orphan_prediction_points"] == 4
+
+
+def test_segmented_affiliation_aggregates_events_before_f1():
+    labels = [np.array([0, 1, 1, 0]), np.array([0, 1, 1, 0])]
+    scores = [labels[0].astype(float), np.zeros(4)]
+    masks = [labels[0].astype(bool), np.zeros(4, dtype=bool)]
+
+    result = metrics_module.compute_segmented_metrics(
+        labels, scores, window_size=1, prediction_masks_by_segment=masks
+    )
+
+    assert result["metrics"]["affiliation_f1"] == pytest.approx(2 / 3)
+    assert result["affiliation_diagnostics"]["ground_truth_events"] == 2
 
 
 def test_vus_sliding_window_is_median_segment_length():
@@ -251,6 +498,35 @@ def test_rank_top_k_breaks_ties_by_name():
 
 def test_rank_top_k_k_larger_than_input_returns_all():
     assert rank_top_k({"a": 0.1, "b": 0.2}, k=5) == ["b", "a"]
+
+
+def test_rank_top_k_excludes_models_without_finite_selection_metric():
+    assert rank_top_k(
+        {"valid": 0.4, "nan": np.nan, "inf": np.inf, "missing": None}, k=4
+    ) == ["valid"]
+
+
+def test_ranked_pointwise_vote_backfills_and_requires_two_models():
+    scores = {
+        "a": np.array([10.0, 10.0, 0.0, 10.0, 0.0, 0.0]),
+        "b": np.array([np.nan, 10.0, np.nan, 0.0, 0.0, 0.0]),
+        "c": np.array([10.0, 0.0, np.nan, np.nan, 0.0, 0.0]),
+        "d": np.array([0.0, 0.0, np.nan, np.nan, 0.0, 0.0]),
+    }
+
+    fused, supported, used = ranked_pointwise_vote(
+        scores, ["a", "b", "c", "d"], top_k=3, threshold_k=0.0
+    )
+
+    assert supported.tolist() == [True, True, False, True, True, True]
+    assert fused.astype(bool).tolist() == [True, True, False, False, False, False]
+    assert used == ["a", "b", "c", "d"]
+
+
+@pytest.mark.parametrize("top_k", [1, 4])
+def test_synthetic_top_k_must_preserve_two_of_three_protocol(top_k: int):
+    with pytest.raises(ValueError, match="ensemble_top_k"):
+        AnomalyBenchmarkConfig(mode="synthetic", ensemble_top_k=top_k)
 
 
 def test_consensus_shape_and_range():
@@ -399,6 +675,129 @@ def test_summarize_derives_metric_keys_from_entries():
     assert set(out["macro_metrics"]) == set(SYNTHETIC_METRIC_KEYS)
 
 
+def test_synthetic_metrics_include_single_class_segments_in_coverage():
+    valid_labels = np.array([0, 0, 1, 1, 0, 0, 1, 0], dtype=np.int64)
+    invalid_labels = np.ones(4, dtype=np.int64)
+    scores = np.array([0.0, 0.0, 1.0, 1.0, np.nan, np.nan, np.nan, np.nan])
+
+    result = benchmark_module._synthetic_score_summary(
+        [valid_labels, invalid_labels],
+        [scores, np.arange(4, dtype=float)],
+    )
+
+    assert result["eligible_points"] == 12
+    assert result["scored_points"] == 8
+    assert result["coverage_rate"] == pytest.approx(2 / 3)
+    assert result["positive_coverage_rate"] == pytest.approx(6 / 7)
+    assert result["negative_coverage_rate"] == pytest.approx(2 / 5)
+    for metric in SYNTHETIC_METRIC_KEYS:
+        if np.isfinite(result["raw_metrics"][metric]):
+            assert result["metrics"][metric] == pytest.approx(
+                result["raw_metrics"][metric] * 2 / 3
+            )
+
+
+def test_synthetic_metrics_keep_globally_single_class_station_for_coverage():
+    labels = np.ones(4, dtype=np.int64)
+
+    result = benchmark_module._synthetic_score_summary(
+        [labels], [np.arange(4, dtype=float)]
+    )
+
+    assert result["eligible_points"] == 4
+    assert result["scored_points"] == 4
+    assert result["coverage_rate"] == 1.0
+    assert np.isnan(result["raw_metrics"]["vus_pr"])
+    assert np.isnan(result["metrics"]["vus_pr"])
+
+
+def test_synthetic_metrics_score_zero_when_detector_covers_no_eligible_points():
+    labels = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    result = benchmark_module._synthetic_score_summary(
+        [labels], [np.full(4, np.nan)]
+    )
+
+    assert result["eligible_points"] == 4
+    assert result["scored_points"] == 0
+    assert result["coverage_rate"] == 0.0
+    assert all(np.isnan(value) for value in result["raw_metrics"].values())
+    assert all(value == 0.0 for value in result["metrics"].values())
+
+
+def test_selection_vus_is_missing_when_detector_has_no_finite_support():
+    labels = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    assert np.isnan(
+        benchmark_module._selection_vus_pr(labels, np.full(4, np.nan))
+    )
+
+
+def test_selection_vus_is_missing_when_finite_support_contains_one_class():
+    labels = np.array([0, 0, 1, 1], dtype=np.int64)
+    scores = np.array([0.0, 1.0, np.nan, np.nan])
+
+    assert np.isnan(benchmark_module._selection_vus_pr(labels, scores))
+
+
+def test_selection_vus_uses_raw_metric_without_coverage_multiplier():
+    labels = np.array([0, 0, 1, 1, 0, 0, 1, 0], dtype=np.int64)
+    scores = np.array([0.0, 0.0, 1.0, 1.0, np.nan, np.nan, np.nan, np.nan])
+    expected = compute_metrics(
+        labels[:4], scores[:4], metrics_module.vus_sliding_window(labels)
+    )["vus_pr"]
+
+    assert benchmark_module._selection_vus_pr(labels, scores) == pytest.approx(expected)
+
+
+def test_summarize_excludes_intrinsically_ineligible_station_but_keeps_detector_failure():
+    timing = {"fit_seconds": 0.0, "inference_seconds": 0.0}
+    series_results = [
+        {
+            "metrics": {key: np.nan for key in SYNTHETIC_METRIC_KEYS},
+            "raw_metrics": {key: np.nan for key in SYNTHETIC_METRIC_KEYS},
+            "eligible_points": 0,
+            "scored_points": 0,
+            "coverage_rate": np.nan,
+            "timing": timing,
+        },
+        {
+            "metrics": {key: 0.0 for key in SYNTHETIC_METRIC_KEYS},
+            "raw_metrics": {key: np.nan for key in SYNTHETIC_METRIC_KEYS},
+            "eligible_points": 10,
+            "scored_points": 0,
+            "coverage_rate": 0.0,
+            "timing": timing,
+        },
+    ]
+
+    summary = _summarize(series_results)
+
+    assert summary["macro_metrics"]["vus_pr"] == 0.0
+    assert np.isnan(summary["macro_raw_metrics"]["vus_pr"])
+    assert summary["macro_coverage_rate"] == 0.0
+
+
+def test_json_safe_serializes_nonfinite_metrics_as_null():
+    safe = benchmark_module._json_safe(
+        {"missing": np.nan, "infinite": np.inf, "valid": np.float64(0.5)}
+    )
+
+    assert safe == {"missing": None, "infinite": None, "valid": 0.5}
+
+
+def test_plot_metric_values_omit_ineligible_null_but_keep_real_zero():
+    summary = {
+        "series_results": [
+            {"metrics": {"vus_pr": None}},
+            {"metrics": {"vus_pr": 0.0}},
+            {"metrics": {"vus_pr": 0.4}},
+        ]
+    }
+
+    assert presentation_module._series_metric_values(summary, "vus_pr") == [0.0, 0.4]
+
+
 def _hourly_5m_frame(n_hours: int, start: str = "2024-01-01"):
     """Build a varied 5-minute frame that survives preprocessing to ~n_hours points."""
     import pandas as pd
@@ -433,6 +832,29 @@ def test_build_cases_synthetic_injects_two_independent_seeds(monkeypatch):
     assert case.labels.sum() >= 1 and case.labels_select.sum() >= 1
     # Selection and evaluation injections are independent (different seeds).
     assert not np.array_equal(case.values, case.values_select)
+
+
+def test_build_cases_synthetic_uses_configured_injection_variant(monkeypatch):
+    stations = [("Good", _hourly_5m_frame(320))]
+    variants: list[str] = []
+
+    def fake_inject(segments, variant, seed):
+        variants.append(variant)
+        return [
+            (values.astype(np.float32, copy=True), np.ones(len(values), dtype=np.int64))
+            for values in segments
+        ]
+
+    monkeypatch.setattr(benchmark_module, "load_raw_5m", lambda pollutant, base_dir: stations)
+    monkeypatch.setattr(
+        benchmark_module, "inject_synthetic_anomaly_segments", fake_inject
+    )
+
+    benchmark_module.build_cases(
+        AnomalyBenchmarkConfig(mode="synthetic", injection_variant="drift")
+    )
+
+    assert variants == ["drift", "drift"]
 
 
 def test_build_cases_synthetic_evaluates_short_segments_but_selects_long_ones(monkeypatch):
@@ -474,17 +896,19 @@ def test_build_cases_synthetic_uses_longest_selection_fallback(monkeypatch):
     assert case.selection_segment_indices == (0,)
 
 
-def test_score_case_synthetic_inherits_mean_selection_ranking(monkeypatch):
+def test_score_case_synthetic_inherits_station_selection_ranking(monkeypatch):
     lengths = (320, 10, 350)
     selection_lengths = (320, 350)
     first_labels = np.zeros(320, dtype=np.int64)
     first_labels[20:30] = 1
+    short_labels = np.zeros(10, dtype=np.int64)
+    short_labels[4:6] = 1
     last_labels = np.zeros(350, dtype=np.int64)
     last_labels[40:50] = 1
     case = AnomalyCase(
         name="Station",
         values=np.zeros(sum(lengths), dtype=np.float32),
-        labels=np.zeros(sum(lengths), dtype=np.int64),
+        labels=np.concatenate([first_labels, short_labels, last_labels]),
         values_select=np.zeros(sum(selection_lengths), dtype=np.float32),
         labels_select=np.concatenate([first_labels, last_labels]),
         segment_lengths=lengths,
@@ -513,7 +937,7 @@ def test_score_case_synthetic_inherits_mean_selection_ranking(monkeypatch):
 
     rankings = result["vus_pr_select_by_segment"]
     assert rankings[0] != rankings[2]
-    assert rankings[1] == pytest.approx((rankings[0] + rankings[2]) / 2.0)
+    assert rankings[1] == pytest.approx(result["vus_pr_select"])
     assert result["vus_pr_select"] == pytest.approx(rankings[1])
     assert result["timing"]["selection_fit_seconds"] == 1.0
     assert result["timing"]["fit_seconds"] == 3.0
@@ -529,7 +953,13 @@ def test_synthetic_ensemble_uses_local_and_inherited_rankings():
     case = AnomalyCase(
         name="Station",
         values=np.concatenate([first, short, last]),
-        labels=np.zeros(680, dtype=np.int64),
+        labels=np.concatenate(
+            [
+                np.r_[np.zeros(300), np.ones(20)],
+                np.r_[np.zeros(8), np.ones(2)],
+                np.r_[np.zeros(330), np.ones(20)],
+            ]
+        ).astype(np.int64),
         values_select=np.concatenate([first, last]),
         labels_select=np.zeros(670, dtype=np.int64),
         segment_lengths=(320, 10, 350),
@@ -539,6 +969,8 @@ def test_synthetic_ensemble_uses_local_and_inherited_rankings():
     )
     scores_a = np.zeros(680)
     scores_a[:5] = np.nan
+    scores_b = np.zeros(680)
+    scores_b[320:330] = np.nan
     detector_results = {
         "a": {
             "per_case": [{
@@ -550,7 +982,7 @@ def test_synthetic_ensemble_uses_local_and_inherited_rankings():
         },
         "b": {
             "per_case": [{
-                "scores": np.zeros(680),
+                "scores": scores_b,
                 "vus_pr_select_by_segment": [0.1, 0.5, 0.9],
                 "scored_segments": [True, False, True],
                 "timing": {"fit_seconds": 1.0, "inference_seconds": 0.0},
@@ -566,12 +998,106 @@ def test_synthetic_ensemble_uses_local_and_inherited_rankings():
 
     assert result["training_summary"]["selected_models_by_segment"] == [
         ["a", "b"],
-        ["a"],  # short segment inherits the station mean (a wins the tie)
+        [],  # only one detector has support, so the ensemble abstains
         ["b", "a"],
     ]
     assert result["scored_segments"] == [True, False, True]
     assert result["scored_points"] == 665
     assert result["timing"]["fit_seconds"] == 2.0
+
+
+def test_synthetic_ensemble_coverage_is_measured_after_pointwise_fallback():
+    labels = np.array([0, 1, 1, 0, 0, 0], dtype=np.int64)
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(6, dtype=np.float32),
+        labels=labels,
+        values_select=np.zeros(6, dtype=np.float32),
+        labels_select=labels,
+        segment_lengths=(6,),
+        segment_indices=_segment_indices((6,)),
+        selection_segment_lengths=(6,),
+        selection_segment_indices=(0,),
+    )
+    arrays = {
+        "a": np.array([10.0, 10.0, 0.0, 10.0, 0.0, 0.0]),
+        "b": np.array([np.nan, 10.0, np.nan, 0.0, 0.0, 0.0]),
+        "c": np.array([10.0, 0.0, np.nan, np.nan, 0.0, 0.0]),
+        "d": np.array([0.0, 0.0, np.nan, np.nan, 0.0, 0.0]),
+    }
+    detector_results = {
+        name: {
+            "per_case": [
+                {
+                    "scores": scores,
+                    "vus_pr_select_by_segment": [1.0 - index / 10.0],
+                    "scored_segments": [True],
+                    "timing": {"fit_seconds": 1.0, "inference_seconds": 0.0},
+                }
+            ]
+        }
+        for index, (name, scores) in enumerate(arrays.items())
+    }
+
+    (result,) = benchmark_module._build_synthetic_ensemble(
+        AnomalyBenchmarkConfig(mode="synthetic", ensemble_top_k=3, threshold_k=0.0),
+        [case],
+        detector_results,
+    )
+
+    assert result["eligible_points"] == 6
+    assert result["scored_points"] == 5
+    assert result["coverage_rate"] == pytest.approx(5 / 6)
+    assert result["training_summary"]["selected_models_by_segment"] == [
+        ["a", "b", "c", "d"]
+    ]
+    assert result["metrics"]["vus_pr"] == pytest.approx(
+        result["raw_metrics"]["vus_pr"] * 5 / 6
+    )
+    assert result["timing"]["fit_seconds"] == 4.0
+
+
+def test_synthetic_ensemble_support_does_not_depend_on_evaluation_labels():
+    scores = {
+        "a": np.array([0.0, 0.0, 10.0, 0.0]),
+        "b": np.array([0.0, 0.0, 9.0, 0.0]),
+        "c": np.array([0.0, 0.0, 8.0, 0.0]),
+    }
+    detector_results = {
+        name: {
+            "per_case": [{
+                "scores": values,
+                "vus_pr_select_by_segment": [1.0 - index / 10.0],
+                "scored_segments": [True],
+                "timing": {"fit_seconds": 0.0, "inference_seconds": 0.0},
+            }]
+        }
+        for index, (name, values) in enumerate(scores.items())
+    }
+
+    def build(labels: np.ndarray) -> dict[str, object]:
+        case = AnomalyCase(
+            name="Station",
+            values=np.zeros(4, dtype=np.float32),
+            labels=labels,
+            values_select=np.zeros(4, dtype=np.float32),
+            labels_select=np.array([0, 0, 1, 1]),
+            segment_lengths=(4,),
+            segment_indices=_segment_indices((4,)),
+            selection_segment_lengths=(4,),
+            selection_segment_indices=(0,),
+        )
+        return benchmark_module._build_synthetic_ensemble(
+            AnomalyBenchmarkConfig(mode="synthetic"), [case], detector_results
+        )[0]
+
+    mixed = build(np.array([0, 0, 1, 1]))
+    all_anomalous = build(np.ones(4, dtype=np.int64))
+
+    assert mixed["scored_points"] == all_anomalous["scored_points"] == 4
+    assert mixed["training_summary"]["selected_models_by_segment"] == (
+        all_anomalous["training_summary"]["selected_models_by_segment"]
+    )
 
 
 def test_build_cases_keeps_all_observed_segments(monkeypatch):
@@ -938,7 +1464,9 @@ def test_time_plots_exclude_ensemble(tmp_path, monkeypatch, mode):
         monkeypatch.setattr(
             plot_module,
             "save_vus_pr_vs_inference_plot",
-            lambda _path, summaries: received.setdefault("scatter", set(summaries)),
+            lambda _path, summaries, **_: received.setdefault(
+                "scatter", set(summaries)
+            ),
         )
     else:
         monkeypatch.setattr(
@@ -1055,15 +1583,34 @@ def test_run_benchmark_synthetic_end_to_end(tmp_path, monkeypatch):
     summary = run_benchmark(config)
 
     assert summary["mode"] == "synthetic"
+    assert "schema_version" not in summary
     assert summary["model_names"][-1] == "Ensemble"
     for name in summary["model_names"]:
-        assert "vus_pr" in summary["models"][name]["macro_metrics"]
+        model_summary = summary["models"][name]
+        assert "vus_pr" in model_summary["macro_metrics"]
+        assert "vus_pr" in model_summary["macro_raw_metrics"]
+        assert 0.0 <= model_summary["macro_coverage_rate"] <= 1.0
+        assert 0.0 <= model_summary["macro_positive_coverage_rate"] <= 1.0
+        assert 0.0 <= model_summary["macro_negative_coverage_rate"] <= 1.0
+        entry = model_summary["series_results"][0]
+        assert set(
+            (
+                "raw_metrics",
+                "eligible_points",
+                "coverage_rate",
+                "positive_coverage_rate",
+                "negative_coverage_rate",
+                "affiliation_diagnostics",
+            )
+        ) <= set(entry)
 
     results_path = tmp_path / "results.json"
     assert results_path.exists()
     payload = json.loads(results_path.read_text())
+    assert "schema_version" not in payload
     assert "Ensemble" in payload["models"]
     assert payload["variants"] == [INJECTION_VARIANT]
+    assert "NaN" not in results_path.read_text()
     # Detectors carry a selection-injection VUS-PR distinct from the reported (eval) one.
     assert "vus_pr_select" in payload["models"]["IQR"]["series_results"][0]
     # Labels are persisted so the ensemble can be recomputed without retraining.
@@ -1085,8 +1632,9 @@ def test_save_benchmark_plots_synthetic_run(tmp_path, monkeypatch):
 
     plot_paths = save_benchmark_plots(tmp_path / "results.json")
 
-    assert plot_paths["metrics_plot"].name == "vus_pr_distribution.png"
-    for key in ("metrics_plot", "scatter_plot", "training_plot"):
+    assert plot_paths["metrics_plot"].name == "vus_pr_adjusted_distribution.png"
+    assert plot_paths["coverage_plot"].name == "vus_pr_raw_vs_coverage.png"
+    for key in ("metrics_plot", "coverage_plot", "scatter_plot", "training_plot"):
         assert plot_paths[key].exists()
 
 
