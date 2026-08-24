@@ -11,43 +11,7 @@ from airquality.forecasting.detection import DetectionResult
 from airquality.data.block_support_analysis import (
     _gap_diagnostics,
     _normalize_pollutant,
-    training_support_diagnostics,
 )
-
-
-def test_training_support_diagnostics_uses_one_worst_case_threshold() -> None:
-    index = pd.date_range("2024-01-01", periods=12, freq="h")
-    raw = pd.Series(1.0, index=index, name="ST")
-    raw.iloc[3] = np.nan
-    anomaly_mask = pd.Series(False, index=index)
-    anomaly_mask.iloc[8] = True
-    cleaned = raw.mask(anomaly_mask)
-    imputed = cleaned.fillna(1.0)
-
-    result = training_support_diagnostics(
-        raw,
-        cleaned,
-        imputed,
-        anomaly_mask,
-        test_target_start=index[-1] + pd.Timedelta(hours=1),
-        min_train_points=4,
-    )
-
-    assert result["n_imputed_before_holdout"] == 2
-    assert result["n_imputed_anomalies_before_holdout"] == 1
-    assert result["n_imputed_preexisting_gaps_before_holdout"] == 1
-    assert result["n_eligible_blocks_before_imputation"] == 1
-    assert result["n_eligible_blocks_after_imputation"] == 1
-    assert result["n_eligible_points_before_imputation"] == 4
-    assert result["n_eligible_points_after_imputation"] == 12
-    assert result["n_eligible_points_added"] == 8
-    assert result["n_imputed_in_eligible_blocks"] == 2
-    assert result["n_observed_points_recovered"] == 6
-    assert result["n_recovered_blocks"] == 1
-    assert result["imputed_eligible_age_hours_median"] == 6.5
-    assert result["imputed_eligible_age_hours_max"] == 9.0
-    assert result["recovered_observed_age_hours_median"] == 6.5
-    assert result["recovered_observed_age_hours_max"] == 12.0
 
 
 def test_gap_diagnostics_keeps_adjacent_gap_over_limit_unfilled() -> None:
@@ -115,6 +79,7 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     int_values = {
         ("forecasting", "holdout"): 4,
         ("forecasting", "context_len"): 2,
+        ("forecasting", "carla_stride"): 3,
         ("forecasting", "short_horizon"): 2,
         ("forecasting", "short_stride"): 1,
         ("forecasting", "short_validation_len"): 2,
@@ -168,11 +133,13 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     monkeypatch.setattr(
         analysis, "build_detection_strategy", lambda spec, **kwargs: FakeStrategy(spec)
     )
-    monkeypatch.setattr(
-        analysis,
-        "_detect_for_strategies",
-        lambda *_args, **_kwargs: {"unlabeled": detection},
-    )
+    detect_call: dict[str, object] = {}
+
+    def fake_detect(*_args, **kwargs):
+        detect_call.update(kwargs)
+        return {"unlabeled": detection}
+
+    monkeypatch.setattr(analysis, "_detect_for_strategies", fake_detect)
     monkeypatch.setattr(
         analysis, "_load_raw_hourly_series", lambda **kwargs: [series.to_frame()]
     )
@@ -205,6 +172,10 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     assert manifest["injection_variant"] == "combined"
     assert manifest["injection_seed"] == analysis.DEFAULT_INJECTION_SEED
     assert manifest["injection_policy"] == analysis.INJECTION_POLICY_VERSION
+    assert manifest["carla_stride"] == 3
+    assert detect_call["base_key"]["carla_stride"] == 3
+    assert detect_call["context_kwargs"]["carla_stride"] == 3
+    assert detect_call["context_kwargs"]["cache_key"]["carla_stride"] == 3
     for filename in (
         "summary.csv",
         "series_summary.csv",

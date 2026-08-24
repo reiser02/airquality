@@ -28,8 +28,7 @@ from airquality.config import (
 )
 from airquality.data.block_analysis import classify_blocks
 from airquality.data.preprocessing import DETECTION_LIMITS
-from airquality.data.segments import contiguous_observed_segments, observed_blocks
-from airquality.data.series import ensure_datetime_series
+from airquality.data.segments import observed_blocks
 from airquality.forecasting.backtest import (
     get_strict_forecast_requirements,
     select_holdout_window,
@@ -90,16 +89,6 @@ def _normalize_pollutant(value: str) -> str:
     return pollutant
 
 
-def _eligible_support(
-    series: pd.Series, minimum: int
-) -> tuple[list[pd.Series], pd.DatetimeIndex]:
-    segments = contiguous_observed_segments(series, min_len=minimum)
-    index = pd.DatetimeIndex(
-        [timestamp for segment in segments for timestamp in segment.index]
-    )
-    return segments, index
-
-
 def _age_stats(
     index: pd.DatetimeIndex, test_target_start: pd.Timestamp
 ) -> tuple[float, float]:
@@ -107,75 +96,6 @@ def _age_stats(
         return float("nan"), float("nan")
     ages = (test_target_start - index) / pd.Timedelta(hours=1)
     return float(np.median(ages)), float(np.max(ages))
-
-
-def training_support_diagnostics(
-    raw_train: pd.Series,
-    cleaned_train: pd.Series,
-    imputed_train: pd.Series,
-    anomaly_mask: pd.Series,
-    *,
-    test_target_start: pd.Timestamp,
-    min_train_points: int,
-) -> dict[str, int | float]:
-    """Compare eligible support before and after actual imputation."""
-    if min_train_points <= 0:
-        raise ValueError("min_train_points debe ser positivo")
-
-    name = str(raw_train.name or "series")
-    raw = ensure_datetime_series(raw_train, freq="h", name=name)
-    cleaned = ensure_datetime_series(cleaned_train, freq="h", name=name).reindex(raw.index)
-    imputed = ensure_datetime_series(imputed_train, freq="h", name=name).reindex(raw.index)
-    mask = anomaly_mask.reindex(raw.index, fill_value=False).astype(bool)
-    if len(raw) and raw.index[-1] >= test_target_start:
-        raise ValueError("El historial de train debe terminar antes del test")
-
-    before_segments, before_index = _eligible_support(cleaned, min_train_points)
-    after_segments, after_index = _eligible_support(imputed, min_train_points)
-    imputed_index = raw.index[cleaned.isna() & imputed.notna()]
-    imputed_eligible = after_index.intersection(imputed_index)
-    added_index = after_index.difference(before_index)
-    recovered_observed = added_index.intersection(cleaned.index[cleaned.notna()])
-    imputed_anomalies = imputed_index.intersection(raw.index[raw.notna() & mask])
-    imputed_preexisting = imputed_index.intersection(raw.index[raw.isna()])
-
-    if len(added_index) != len(imputed_eligible) + len(recovered_observed):
-        raise RuntimeError("La ganancia de soporte no cuadra con imputados + observados")
-
-    imputed_age_median, imputed_age_max = _age_stats(
-        imputed_eligible, test_target_start
-    )
-    recovered_age_median, recovered_age_max = _age_stats(
-        recovered_observed, test_target_start
-    )
-    return {
-        "n_detected_anomalies_before_holdout": int((mask & raw.notna()).sum()),
-        "n_observed_before_imputation": int(cleaned.notna().sum()),
-        "n_imputed_before_holdout": len(imputed_index),
-        "n_imputed_anomalies_before_holdout": len(imputed_anomalies),
-        "n_imputed_preexisting_gaps_before_holdout": len(imputed_preexisting),
-        "n_eligible_blocks_before_imputation": len(before_segments),
-        "n_eligible_blocks_after_imputation": len(after_segments),
-        "n_eligible_points_before_imputation": len(before_index),
-        "n_eligible_points_after_imputation": len(after_index),
-        "n_eligible_points_added": len(added_index),
-        "n_observed_points_recovered": len(recovered_observed),
-        "n_recovered_blocks": sum(
-            not pd.DatetimeIndex(segment.index).intersection(recovered_observed).empty
-            for segment in after_segments
-        ),
-        "n_imputed_in_eligible_blocks": len(imputed_eligible),
-        "n_imputed_anomalies_in_eligible_blocks": len(
-            imputed_eligible.intersection(imputed_anomalies)
-        ),
-        "n_imputed_preexisting_gaps_in_eligible_blocks": len(
-            imputed_eligible.intersection(imputed_preexisting)
-        ),
-        "imputed_eligible_age_hours_median": imputed_age_median,
-        "imputed_eligible_age_hours_max": imputed_age_max,
-        "recovered_observed_age_hours_median": recovered_age_median,
-        "recovered_observed_age_hours_max": recovered_age_max,
-    }
 
 
 def _imputer_identity(
@@ -599,6 +519,9 @@ def run_analysis(
         raise ValueError("No hay estrategias de deteccion configuradas")
 
     seed = cfg_get_int("forecasting", "seed", 13)
+    carla_stride = cfg_get_int("forecasting", "carla_stride", 1)
+    if carla_stride < 1:
+        raise ValueError("carla_stride debe ser positivo")
     device = resolve_forecasting_devices(
         cfg_get_str("forecasting", "device", "cpu")
     )[0]
@@ -673,6 +596,7 @@ def run_analysis(
             "freq": freq,
             "detectors": sorted(detectors),
             "seed": seed,
+            "carla_stride": carla_stride,
             "injection_seed": injection_seed,
             "injection_variant": injection_variant,
             "injection_policy": INJECTION_POLICY_VERSION,
@@ -690,6 +614,7 @@ def run_analysis(
                 "seed": seed,
                 "device": device,
                 "freq": freq,
+                "carla_stride": carla_stride,
                 "injection_seed": injection_seed,
                 "injection_variant": injection_variant,
                 "min_selection_points": min_selection_points,
@@ -701,6 +626,7 @@ def run_analysis(
                     "series_fp": series_fp,
                     "freq": freq,
                     "seed": seed,
+                    "carla_stride": carla_stride,
                 },
             },
         )
@@ -870,6 +796,7 @@ def run_analysis(
         "forecast_models": model_names,
         "strategies": [strategy.name for strategy in strategies],
         "detectors": detectors,
+        "carla_stride": carla_stride,
         "injection_seed": injection_seed,
         "injection_variant": injection_variant,
         "injection_policy": INJECTION_POLICY_VERSION,
