@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from darts import TimeSeries
-from airquality.data.io import to_pd_series
+from airquality.data.series import to_pd_series
 
 
 def _draw_series(

@@ -611,17 +611,6 @@ class ProphetGapImputer(_DartsContextImputer):
         """Skip gaps with fewer clean points than Prophet's fitting minimum."""
         return self._min_required
 
-    def _predict_block(
-        self,
-        *,
-        context: pd.Series,
-        n: int,
-        freq: str,
-        config_workers: Mapping[str, Any] | None,
-    ) -> pd.Series:
-        """Unused compatibility hook; Prophet predicts internal timestamps in bulk."""
-        raise NotImplementedError
-
     def impute_gaps(
         self,
         *,

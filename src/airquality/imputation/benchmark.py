@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field  # Structured diagnostics for skipped gaps.
-import logging
 from typing import Any, Mapping, Sequence  # Typing utilities for flexible public API.
 
 import numpy as np  # Numeric operations for masks, metrics, and random sampling.
 import pandas as pd  # Time-indexed series/dataframe processing.
 
 from darts import TimeSeries  # Darts time series container used across the module.
-from airquality.data.io import to_pd_series
-from airquality.data.series import ensure_datetime_series
+from airquality.data.series import ensure_datetime_series, to_pd_series
 from airquality.modeling.training_config import BenchmarkDatasetBundle
 from airquality.metrics import compute_mase
 
@@ -50,7 +48,6 @@ class PlotGapPayload:
     """Internal benchmark plotting payload for one gap size."""
 
     series: dict[str, PlotSeriesPayload]
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _make_plot_series_payload(actual: pd.Series, naive_mase: pd.Series) -> PlotSeriesPayload:
@@ -79,14 +76,12 @@ def _serialize_plot_gap_payload(payload: PlotGapPayload) -> dict[str, Any]:
             for series_name, series_payload in payload.series.items()
         }
     }
-    serialized.update(payload.metadata)
     return serialized
 
 
 def _ts_to_series(ts: TimeSeries, freq: str, name: str) -> pd.Series:
     """Convert Darts `TimeSeries` into normalized `pd.Series`."""
-    out = to_pd_series(ts, freq=freq, name=name)
-    return ensure_datetime_series(out, freq=freq, name=name)
+    return to_pd_series(ts, freq=freq, name=name)
 
 
 def _normalize_series_collection(

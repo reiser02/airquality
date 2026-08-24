@@ -530,30 +530,17 @@ def load_darts_models_from_artifacts(
             missing.append(model_name)
             continue
 
-        if use_cuda:
-            trainer_kwargs = build_lightning_trainer_kwargs(
-                "gpu",
-                use_early_stopping=False,
-                precision="32-true",
-                devices=1,
-                enable_progress_bar=False,
-                enable_checkpointing=False,
-                enable_model_summary=False,
-                logger=False,
-            )
-            map_location = "cuda"
-        else:
-            trainer_kwargs = build_lightning_trainer_kwargs(
-                "cpu",
-                use_early_stopping=False,
-                precision="32-true",
-                devices=1,
-                enable_progress_bar=False,
-                enable_checkpointing=False,
-                enable_model_summary=False,
-                logger=False,
-            )
-            map_location = "cpu"
+        trainer_kwargs = build_lightning_trainer_kwargs(
+            "gpu" if use_cuda else "cpu",
+            use_early_stopping=False,
+            precision="32-true",
+            devices=1,
+            enable_progress_bar=False,
+            enable_checkpointing=False,
+            enable_model_summary=False,
+            logger=False,
+        )
+        map_location = "cuda" if use_cuda else "cpu"
 
         try:
             model = model_cls.load(

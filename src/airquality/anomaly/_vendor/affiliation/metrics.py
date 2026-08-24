@@ -4,8 +4,7 @@ from .generics import (
         infer_Trange,
         has_point_anomalies, 
         _len_wo_nan, 
-        _sum_wo_nan,
-        read_all_as_events)
+        _sum_wo_nan)
 from ._affiliation_zone import (
         get_all_E_gt_func, 
         affiliation_partition)
@@ -94,23 +93,3 @@ def pr_from_events(events_pred, events_gt, Trange):
                      'individual_precision_distances': d_precision,
                      'individual_recall_distances': d_recall})
     return(dict_out)
-
-def produce_all_results():
-    """
-    Produce the affiliation precision/recall for all files
-    contained in the `data` repository
-    :return: a dictionary indexed by data names, each containing a dictionary
-    indexed by algorithm names, each containing the results of the affiliation
-    metrics (precision, recall, individual probabilities and distances)
-    """
-    datasets, Tranges = read_all_as_events() # read all the events in folder `data`
-    results = dict()
-    for data_name in datasets.keys():
-        results_data = dict()
-        for algo_name in datasets[data_name].keys():
-            if algo_name != 'groundtruth':
-                results_data[algo_name] = pr_from_events(datasets[data_name][algo_name],
-                                                         datasets[data_name]['groundtruth'],
-                                                         Tranges[data_name])
-        results[data_name] = results_data
-    return(results)

@@ -20,16 +20,12 @@ from airquality.paths import create_run_dir
 LOGGER = logging.getLogger(__name__)
 
 
-def _repo_root() -> Path:
-    """Return the repository root (two levels above this module)."""
-    return Path(__file__).resolve().parents[2]
-
-
 def _build_output_dir() -> Path:
     """Create the timestamped output directory for one Monte Carlo run."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return create_run_dir(
-        _repo_root() / "reports" / "benchmark", f"montecarlo_{stamp}"
+        Path(__file__).resolve().parents[2] / "reports" / "benchmark",
+        f"montecarlo_{stamp}",
     )
 
 
