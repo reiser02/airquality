@@ -17,6 +17,7 @@ from airquality.anomaly.anomalies import (
     _combined_group,
     _plan_synthetic_anomalies,
     apply_anomaly_segment,
+    inject_synthetic_anomaly_segments,
     inject_synthetic_anomalies,
 )
 from airquality.anomaly.benchmark import (
@@ -271,7 +272,23 @@ def test_combined_events_never_overlap():
         ordered[1:],
         strict=True,
     ):
-        assert left[2] <= right[1]
+        assert left[2] < right[1]
+
+
+def test_combined_plans_remain_distinct_binary_events():
+    lengths = [8, 1000]
+    plans = _plan_synthetic_anomalies(lengths, "combined", seed=0)
+    generated = inject_synthetic_anomaly_segments(
+        [np.arange(length, dtype=np.float32) for length in lengths],
+        "combined",
+        seed=0,
+    )
+    event_count = sum(
+        np.count_nonzero(np.diff(np.r_[0, labels, 0]) == 1)
+        for _, labels in generated
+    )
+
+    assert event_count == len(plans)
 
 
 def test_large_combined_segment_uses_station_wide_type_rates():
@@ -332,6 +349,22 @@ def test_segmented_metrics_pool_opposite_single_class_segments():
 
     assert result["metrics"]["auroc"] == pytest.approx(1.0)
     assert result["metrics"]["aupr"] == pytest.approx(1.0)
+    assert result["metrics"]["vus_pr"] > 0.9
+
+
+def test_segmented_vus_scores_station_wide_generated_labels():
+    generated = inject_synthetic_anomaly_segments(
+        [_base_series(40) for _ in range(10)], "combined", seed=7
+    )
+    labels = [segment_labels for _, segment_labels in generated]
+    result = metrics_module.compute_segmented_metrics(
+        labels,
+        [segment_labels.astype(float) for segment_labels in labels],
+        metrics_module.vus_sliding_window_segments(labels),
+    )
+
+    assert sum(np.any(segment_labels) for segment_labels in labels) == 4
+    assert sum(not np.any(segment_labels) for segment_labels in labels) == 6
     assert result["metrics"]["vus_pr"] > 0.9
 
 
@@ -659,11 +692,19 @@ def test_sub_pca_component_count_must_be_positive_or_all():
 def test_summarize_aggregates_and_drops_scores():
     series_results = [
         {
+            "series_length": 3,
+            "segment_lengths": [3],
+            "scored_points": 2,
+            "scored_segments": [True],
             "metrics": {key: 1.0 for key in UNLABELED_METRIC_KEYS},
             "timing": {"fit_seconds": 1.0, "inference_seconds": 2.0},
             "scores": np.zeros(3),
         },
         {
+            "series_length": 3,
+            "segment_lengths": [1, 2],
+            "scored_points": 1,
+            "scored_segments": [False, True],
             "metrics": {key: 0.0 for key in UNLABELED_METRIC_KEYS},
             "timing": {"fit_seconds": 3.0, "inference_seconds": 4.0},
             "scores": np.zeros(3),
@@ -675,6 +716,18 @@ def test_summarize_aggregates_and_drops_scores():
     assert out["macro_metrics"]["detection_rate"] == 0.5
     assert out["timing"]["mean_fit_seconds"] == 2.0
     assert all("scores" not in entry for entry in out["series_results"])
+    assert out["series_results"][0]["counts"] == {
+        "total_points": 3,
+        "evaluated_points": 2,
+        "total_segments": 1,
+        "evaluated_segments": 1,
+    }
+    assert out["series_results"][1]["counts"] == {
+        "total_points": 3,
+        "evaluated_points": 1,
+        "total_segments": 2,
+        "evaluated_segments": 1,
+    }
 
 
 def test_summarize_derives_metric_keys_from_entries():
@@ -1193,8 +1246,8 @@ def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
     case = AnomalyCase(
         "Station",
         np.zeros(6),
-        segment_lengths=(6,),
-        segment_indices=_segment_indices((6,)),
+        segment_lengths=(2, 4),
+        segment_indices=_segment_indices((2, 4)),
     )
     scores = np.array([np.nan, np.nan, 0.0, 0.0, 0.0, 10.0])
     detector_results = {
@@ -1202,7 +1255,7 @@ def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
             "per_case": [
                 {
                     "scores": scores,
-                    "scored_segments": [True],
+                    "scored_segments": [True, True],
                     "timing": {"fit_seconds": 0.0, "inference_seconds": 0.0},
                 }
             ]
@@ -1221,8 +1274,15 @@ def test_unlabeled_ensemble_uses_only_points_with_finite_votes():
     )
 
     assert result["voted_points"] == 4
+    assert result["scored_segments"] == [False, True]
     assert result["n_flagged"] == 1
     assert result["metrics"]["detection_rate"] == pytest.approx(0.25)
+    assert _summarize([result])["series_results"][0]["counts"] == {
+        "total_points": 6,
+        "evaluated_points": 4,
+        "total_segments": 2,
+        "evaluated_segments": 1,
+    }
 
 
 def test_synthetic_failed_scores_remain_nan(monkeypatch):
@@ -1396,6 +1456,14 @@ def test_run_benchmark_end_to_end(tmp_path, monkeypatch):
     payload = json.loads(results_path.read_text())
     assert "Ensemble" in payload["models"]
     assert payload["models"]["IQR"]["series_results"][0]["metrics"]["detection_rate"] >= 0.0
+    for model in payload["models"].values():
+        for entry in model["series_results"]:
+            assert entry["counts"] == {
+                "total_points": 700,
+                "evaluated_points": 700,
+                "total_segments": 1,
+                "evaluated_segments": 1,
+            }
     assert (tmp_path / "scores.npz").exists()
     # The benchmark itself does NOT render plots (that is a separate script).
     assert not (tmp_path / "detection_rate_distribution.png").exists()
@@ -1564,14 +1632,12 @@ def _synthetic_cases() -> list[AnomalyCase]:
 
 def _synthetic_multisegment_case() -> AnomalyCase:
     segments = [_base_series(length) for length in (320, 10, 350)]
-    selected = [
-        inject_synthetic_anomalies(segments[index], INJECTION_VARIANT, seed=3 + index)
-        for index in (0, 2)
-    ]
-    evaluated = [
-        inject_synthetic_anomalies(segment, INJECTION_VARIANT, seed=101 + index)
-        for index, segment in enumerate(segments)
-    ]
+    selected = inject_synthetic_anomaly_segments(
+        [segments[index] for index in (0, 2)], INJECTION_VARIANT, seed=3
+    )
+    evaluated = inject_synthetic_anomaly_segments(
+        segments, INJECTION_VARIANT, seed=101
+    )
     return AnomalyCase(
         name="Station",
         values=np.concatenate([values for values, _ in evaluated]),
@@ -1616,6 +1682,12 @@ def test_run_benchmark_synthetic_end_to_end(tmp_path, monkeypatch):
                 "affiliation_diagnostics",
             )
         ) <= set(entry)
+        assert entry["counts"] == {
+            "total_points": 700,
+            "evaluated_points": 700,
+            "total_segments": 1,
+            "evaluated_segments": 1,
+        }
 
     results_path = tmp_path / "results.json"
     assert results_path.exists()

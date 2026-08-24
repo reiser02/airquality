@@ -117,7 +117,7 @@ def _place_event(
     occupied: np.ndarray,
     rng: np.random.Generator,
 ) -> tuple[int, int, int, str] | None:
-    """Reserve one non-overlapping event interval, or return ``None`` if none fits."""
+    """Reserve one separated event interval, or return ``None`` if none fits."""
     drawn = _draw_span(anomaly_type, rng)
     maximum = segment_length - 1  # Always retain at least one normal point.
     minimum = 1
@@ -131,7 +131,9 @@ def _place_event(
         starts = [
             start
             for start in range(segment_length - length + 1)
-            if not occupied[start : start + length].any()
+            if not occupied[
+                max(0, start - 1) : min(segment_length, start + length + 1)
+            ].any()
         ]
         if starts:
             start = int(rng.choice(starts))
