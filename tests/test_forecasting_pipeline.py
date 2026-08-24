@@ -12,74 +12,29 @@ import airquality.forecasting.fill as fill
 import airquality.forecasting.pipeline as cp
 from darts import TimeSeries
 
+from _forecasting_helpers import BASELINE_DETECTORS, _seasonal_series
 from airquality.forecasting.backtest import (
     backtest_forecast,
     select_holdout_window,
     split_train_val_subseries,
 )
-from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
+from airquality.forecasting.cleaning import remove_anomalies
 from airquality.forecasting.detection import DetectionResult
 from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
 from airquality.imputation.registry import resolve_imputer_family
 
-BASELINE_DETECTORS = ["ModifiedZScore", "IQR", "Hampel_w24"]
-
-
-def _seasonal_series(n: int = 900, name: str = "ST", seed: int = 0) -> pd.Series:
-    idx = pd.date_range("2024-01-01", periods=n, freq="h")
-    rng = np.random.default_rng(seed)
-    vals = (
-        30.0
-        + 8.0 * np.sin(np.arange(n) * 2 * np.pi / 24)
-        + 4.0 * np.sin(np.arange(n) * 2 * np.pi / 168)
-        + rng.normal(0, 1, n)
-    )
-    return pd.Series(vals, index=idx, name=name)
-
-
 # --------------------------------------------------------------------------- #
-# Anomaly detection / removal
+# Anomaly removal
 # --------------------------------------------------------------------------- #
-def test_detect_anomaly_mask_flags_spikes():
+def test_remove_anomalies_masks_flagged_timestamps():
     series = _seasonal_series(seed=1)
-    series.iloc[300] = 140.0
-    series.iloc[500] = 130.0
-    series.iloc[100:105] = np.nan  # pre-existing gap stays out of detection
-
-    result = detect_anomaly_mask(series, detectors=BASELINE_DETECTORS, device="cpu")
-
-    assert result.detectors and set(result.detectors) <= set(BASELINE_DETECTORS)
-    assert bool(result.mask.iloc[300]) and bool(result.mask.iloc[500])
-    # Gaps are never flagged (they are not observed points).
-    assert not result.mask.iloc[100:105].any()
-    # The consensus itself must respect the rarity budget on this clean series.
-    assert result.detection_rate <= 0.07
+    mask = pd.Series(False, index=series.index)
+    mask.iloc[[300, 500]] = True
+    result = DetectionResult("test", [], [], {}, 3.5, mask)
 
     cleaned = remove_anomalies(series, result)
     assert np.isnan(cleaned.iloc[300]) and np.isnan(cleaned.iloc[500])
     assert int(cleaned.isna().sum()) >= int(series.isna().sum()) + 2
-
-
-def test_detect_anomaly_mask_short_series_is_noop():
-    idx = pd.date_range("2024-01-01", periods=5, freq="h")
-    result = detect_anomaly_mask(pd.Series([1.0, 2, 3, 4, 5], index=idx, name="s"))
-    assert result.detectors == []
-    assert result.n_flagged == 0
-
-
-def test_detect_anomaly_mask_discards_detectors_over_budget():
-    # With a budget of 0, any detector that flags a point is discarded and the
-    # final mask is empty (no survivors flag anything).
-    series = _seasonal_series(seed=1)
-    series.iloc[300] = 140.0
-
-    result = detect_anomaly_mask(
-        series, detectors=BASELINE_DETECTORS, device="cpu", max_detection_rate=0.0
-    )
-
-    assert set(result.discarded) >= {"ModifiedZScore"}
-    assert all(result.rates[name] == 0.0 for name in result.detectors)
-    assert result.n_flagged == 0
 
 
 def test_contiguous_observed_segments_splits_on_gaps():
@@ -95,31 +50,6 @@ def test_contiguous_observed_segments_splits_on_gaps():
     assert all(not seg.isna().any() for seg in segments)
     # min_len filters the 2-point tail run
     assert contiguous_observed_segments(series, min_len=1)[-1].index[0] == series.index[58]
-
-
-def test_detect_anomaly_mask_reports_per_detector_rates():
-    series = _seasonal_series(seed=3)
-    series.iloc[400] = 150.0
-
-    result = detect_anomaly_mask(series, detectors=BASELINE_DETECTORS, device="cpu")
-
-    assert set(result.rates) == set(BASELINE_DETECTORS)
-    assert all(0.0 <= rate <= 1.0 for rate in result.rates.values())
-    assert bool(result.mask.iloc[400])
-
-
-def test_detect_anomaly_mask_detects_per_contiguous_segment():
-    # A spike in a second contiguous stretch (after a long gap) must still be
-    # flagged: detection runs per segment instead of gluing stretches.
-    series = _seasonal_series(n=700, seed=4)
-    series.iloc[300:340] = np.nan  # long gap -> two contiguous segments
-    series.iloc[500] = 160.0  # spike in the SECOND segment
-
-    result = detect_anomaly_mask(series, detectors=BASELINE_DETECTORS, device="cpu")
-
-    assert bool(result.mask.iloc[500])
-    # Nothing inside the gap can be flagged.
-    assert not result.mask.iloc[300:340].any()
 
 
 def test_common_detection_support_masks_every_strategy_timestamp():
