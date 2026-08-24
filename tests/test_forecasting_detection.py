@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from _forecasting_helpers import BASELINE_DETECTORS, _seasonal_series
 import airquality.forecasting.detection as detection_module
 from airquality.forecasting.cache import BenchmarkCache
 from airquality.forecasting.detection import (
@@ -16,21 +17,6 @@ from airquality.forecasting.detection import (
     apply_mask_transforms,
     build_detection_strategy,
 )
-
-BASELINE_DETECTORS = ["ModifiedZScore", "IQR", "Hampel_w24"]
-
-
-def _seasonal_series(n: int = 900, name: str = "ST", seed: int = 0) -> pd.Series:
-    idx = pd.date_range("2024-01-01", periods=n, freq="h")
-    rng = np.random.default_rng(seed)
-    vals = (
-        30.0
-        + 8.0 * np.sin(np.arange(n) * 2 * np.pi / 24)
-        + 4.0 * np.sin(np.arange(n) * 2 * np.pi / 168)
-        + rng.normal(0, 1, n)
-    )
-    return pd.Series(vals, index=idx, name=name)
-
 
 def _spike_scores(n: int, positions: list[int]) -> np.ndarray:
     """Score array whose MAD mask flags exactly ``positions`` (10 over a 0 floor)."""

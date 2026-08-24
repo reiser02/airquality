@@ -17,7 +17,7 @@ from airquality.forecasting.backtest import (
     get_strict_forecast_requirements,
     select_holdout_window,
 )
-from airquality.forecasting.cleaning import detect_anomaly_mask, remove_anomalies
+from airquality.forecasting.cleaning import remove_anomalies
 from airquality.forecasting.detection import (
     ConsensusDetection,
     DetectionResult,
@@ -53,7 +53,6 @@ __all__ = [
     "ForecastArm",
     "ForecastRegime",
     "build_arms",
-    "detect_anomaly_mask",
     "remove_anomalies",
     "DetectionResult",
     "DetectionStrategy",
