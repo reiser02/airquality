@@ -73,7 +73,6 @@ from .metrics import (
     vus_sliding_window_segments,
 )
 from .registry import (
-    MODEL_REGISTRY,
     filter_model_kwargs as _filter_model_kwargs,
     fit_model_segments,
     resolve_model_class,
@@ -1069,6 +1068,7 @@ def _build_unlabeled_ensemble(
             for name in kept_models
         }
         mask_parts: list[np.ndarray] = []
+        scored_segments: list[bool] = []
         voted_points = 0
         for segment_index, length in enumerate(lengths):
             score_arrays = [
@@ -1088,7 +1088,9 @@ def _build_unlabeled_ensemble(
                 flagged = supported & (votes.sum(axis=0) > available / 2.0)
                 voted_points += int(supported.sum())
             else:
+                supported = np.zeros(length, dtype=bool)
                 flagged = np.zeros(length, dtype=bool)
+            scored_segments.append(bool(supported.any()))
             mask_parts.append(flagged)
         mask = np.concatenate(mask_parts)
 
@@ -1110,6 +1112,7 @@ def _build_unlabeled_ensemble(
                 },
                 "n_flagged": int(mask.sum()),
                 "voted_points": voted_points,
+                "scored_segments": scored_segments,
                 "threshold": 0.5,
                 "timing": {
                     "fit_seconds": float(sum(timing["fit_seconds"] for timing in timings)),
@@ -1230,6 +1233,21 @@ def _summarize(series_results: list[dict[str, object]]) -> dict[str, object]:
     helper serves both modes.
     """
     clean = [{key: entry[key] for key in entry if key != "scores"} for entry in series_results]
+    for entry in clean:
+        evaluated_points = entry.get("scored_points", entry.get("voted_points"))
+        if (
+            evaluated_points is not None
+            and "segment_lengths" in entry
+            and "scored_segments" in entry
+        ):
+            entry["counts"] = {
+                "total_points": int(
+                    entry.get("eligible_points", entry.get("series_length", 0))
+                ),
+                "evaluated_points": int(evaluated_points),
+                "total_segments": len(entry["segment_lengths"]),
+                "evaluated_segments": sum(map(bool, entry["scored_segments"])),
+            }
     metric_keys = list(clean[0]["metrics"]) if clean else []
     macro_metrics = {
         metric: _finite_mean([entry["metrics"][metric] for entry in clean])
