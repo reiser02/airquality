@@ -2,7 +2,7 @@
 
 from configparser import ConfigParser
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -58,15 +58,6 @@ class BenchmarkDatasetBundle:
             )
 
 
-@dataclass(frozen=True)
-class EvalConfig:
-    """Configuración de evaluación para modelos globales."""
-
-    size_k: int
-    method_names: Sequence[str]
-    forecast_sizes: Sequence[int] = (1, 2, 5, 10)
-
-
 def build_base_training_kwargs(cfg: ConfigParser | None = None) -> dict[str, Any]:
     """Build the common optimizer and trainer kwargs used across Darts models."""
     return {
@@ -87,9 +78,6 @@ def build_base_training_kwargs(cfg: ConfigParser | None = None) -> dict[str, Any
         "force_reset": True,
         "random_state": cfg_get_int("training", "random_state", 42, cfg=cfg),
     }
-
-
-BASE_TRAINING_KWARGS: dict[str, Any] = build_base_training_kwargs()
 
 
 class Float32StandardScaler(StandardScaler):

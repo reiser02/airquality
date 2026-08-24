@@ -9,7 +9,7 @@ import pandas as pd
 from airquality.config import cfg_get_str
 from airquality.data.loaders import load_raw_5m
 from airquality.data.preprocessing import preprocess
-from airquality.data.series import ensure_datetime_series, to_pd_series
+from airquality.data.series import ensure_datetime_series
 
 
 def resolve_device(preferred: str) -> str:

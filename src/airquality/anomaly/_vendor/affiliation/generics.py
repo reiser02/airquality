@@ -3,9 +3,6 @@
 from itertools import groupby
 from operator import itemgetter
 import math
-import gzip
-import glob
-import os
 
 def convert_vector_to_events(vector = [0, 1, 1, 0, 0, 1, 0]):
     """
@@ -86,50 +83,3 @@ def _len_wo_nan(vec):
     """
     vec_wo_nan = [e for e in vec if not math.isnan(e)]
     return(len(vec_wo_nan))
-
-def read_gz_data(filename = 'data/machinetemp_groundtruth.gz'):
-    """
-    Load a file compressed with gz, such that each line of the
-    file is either 0 (representing a normal instance) or 1 (representing)
-    an anomalous instance.
-    :param filename: file path to the gz compressed file
-    :return: list of integers with either 0 or 1
-    """
-    with gzip.open(filename, 'rb') as f:
-        content = f.read().splitlines()
-    content = [int(x) for x in content]
-    return(content)
-
-def read_all_as_events():
-    """
-    Load the files contained in the folder `data/` and convert
-    to events. The length of the series is kept.
-    The convention for the file name is: `dataset_algorithm.gz`
-    :return: two dictionaries:
-        - the first containing the list of events for each dataset and algorithm,
-        - the second containing the range of the series for each dataset
-    """
-    filepaths = glob.glob('data/*.gz')
-    datasets = dict()
-    Tranges = dict()
-    for filepath in filepaths:
-        vector = read_gz_data(filepath)
-        events = convert_vector_to_events(vector)
-        # ad hoc cut for those files
-        cut_filepath = (os.path.split(filepath)[1]).split('_')
-        data_name = cut_filepath[0]
-        algo_name = (cut_filepath[1]).split('.')[0]
-        if not data_name in datasets:
-            datasets[data_name] = dict()
-            Tranges[data_name] = (0, len(vector))
-        datasets[data_name][algo_name] = events
-    return(datasets, Tranges)
-
-def f1_func(p, r):
-    """
-    Compute the f1 function
-    :param p: precision numeric value
-    :param r: recall numeric value
-    :return: f1 numeric value
-    """
-    return(2*p*r/(p+r))

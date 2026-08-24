@@ -16,9 +16,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
-from airquality.data.io import resolve_device, to_pd_series
+from airquality.data.io import resolve_device
 from airquality.data.loaders import load_to_df
 from airquality.data.preprocessing import preprocess
+from airquality.data.series import to_pd_series
 from airquality.data.holdout import (
     build_holdout_manifest,
     select_retrospective_holdouts,
