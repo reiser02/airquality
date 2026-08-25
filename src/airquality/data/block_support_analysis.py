@@ -75,7 +75,7 @@ from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
 from airquality.paths import create_run_dir
 
-ANALYSIS_VERSION = 4
+ANALYSIS_VERSION = 5
 REGIME_NAMES = ("short", "long")
 
 

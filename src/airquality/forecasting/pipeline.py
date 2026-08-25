@@ -3,11 +3,12 @@
 Measures whether anomaly detection (and the subsequent imputation) improves
 multi-step forecasting. For every configured series the pipeline builds one
 training *arm* per (detection strategy, imputation) combination — plus the
-``raw`` baseline — and backtests the same forecasting models on each arm over
-the **same** fixed observed test in short (8 h, stride 4 h) and long
-(48 h, stride 24 h) regimes:
+``raw`` and ``raw+frozen`` source baselines — and backtests the same forecasting
+models on each arm over the **same timestamps** in short (8 h, stride 4 h) and
+long (48 h, stride 24 h) regimes:
 
 - ``raw``: the hourly-mean series as loaded (gaps + anomalies kept).
+- ``raw+frozen``: the parallel hourly series without either frozen-value filter.
 - ``<strategy>+impute``: anomalies flagged by the strategy are removed and the
   resulting gaps imputed (:mod:`airquality.forecasting.fill`).
 - ``<strategy>+noimpute``: anomalies removed, gaps left as NaN (the backtest
@@ -21,12 +22,12 @@ strategies through a per-series :class:`~airquality.forecasting.detection.Series
 and every strategy's mask can be post-processed through ``mask_transforms``
 hooks before removal.
 
-Detection runs over the complete series before splitting. The test is chosen
-from the support left observed by every strategy, so no ``+noimpute`` arm can
-break the shared test. Removal and imputation still touch only the
-training portion.
+Detection runs over the complete primary series before splitting. The test is
+chosen after masking the union of anomaly flags; strategy abstentions are
+reported but do not remove support. Every arm uses the selected timestamps on
+its own source series. Removal and imputation still touch only training.
 
-Foundation models remain single zero-shot references in that common test. A
+Foundation models run on the two raw-source views in that common time window. A
 separate paired experiment injects one synthetic anomaly type into copies of
 clean test contexts and compares ``clean_reference``, ``corrupted`` and
 ``inject-vote``; imputation is only a compatibility fallback after a NaN causes
@@ -132,6 +133,8 @@ from airquality.imputation.registry import (
 from airquality.paths import create_run_dir
 
 RAW_ARM = "raw"
+RAW_FROZEN_ARM = "raw+frozen"
+RAW_SOURCE_ARMS = (RAW_ARM, RAW_FROZEN_ARM)
 DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote")
 IMPUTATION_CHOICES = ("both", "impute", "none")
 #: The benchmark's reported metrics, both scale-free so they compare across
@@ -185,7 +188,11 @@ FOUNDATION_PREPROCESSING_COLUMNS = (
 
 
 def _load_raw_hourly_series(
-    *, pollutant: str, raw_base_dir: str, freq: str
+    *,
+    pollutant: str,
+    raw_base_dir: str,
+    freq: str,
+    preserve_frozen: bool = False,
 ) -> list[pd.DataFrame]:
     """Load raw 5-minute stations and apply the shared hourly preprocess."""
     if freq != "h":
@@ -193,7 +200,12 @@ def _load_raw_hourly_series(
 
     out: list[pd.DataFrame] = []
     for station, raw in load_raw_5m(pollutant, raw_base_dir):
-        (hourly,), _ = preprocess([raw], pollutant)
+        (hourly,), _ = preprocess(
+            [raw],
+            pollutant,
+            exclude_frozen=not preserve_frozen,
+            remove_repeated=not preserve_frozen,
+        )
         series = ensure_datetime_series(
             hourly.iloc[:, 0].rename(station), freq=freq, name=station
         )
@@ -201,12 +213,23 @@ def _load_raw_hourly_series(
     return out
 
 
+def _series_by_name(frames: Sequence[pd.DataFrame]) -> dict[str, pd.Series]:
+    """Index one source view by station, rejecting ambiguous duplicates."""
+    series_by_name: dict[str, pd.Series] = {}
+    for frame in frames:
+        name = str(frame.columns[0])
+        if name in series_by_name:
+            raise RuntimeError(f"Nombre de estacion duplicado: {name}")
+        series_by_name[name] = frame.iloc[:, 0]
+    return series_by_name
+
+
 @dataclass(frozen=True)
 class ForecastArm:
     """One benchmark arm: how the training series is preprocessed before fitting."""
 
     name: str
-    strategy: str | None  # detection strategy spec; None = raw baseline
+    strategy: str | None  # detection strategy spec; None = raw-source arm
     impute: bool
 
 
@@ -398,7 +421,7 @@ def _shutdown_gpu_resources(*, cancel_futures: bool) -> None:
 
 
 def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
-    """Expand strategy specs into benchmark arms; ``raw`` is always first.
+    """Expand strategy specs; the two raw-source arms are always first.
 
     ``imputation`` picks the variants built per strategy: ``impute`` (detect →
     remove → impute), ``none`` (detect → remove, gaps stay NaN) or ``both``.
@@ -407,7 +430,10 @@ def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
         raise ValueError(
             f"Valor de imputacion desconocido: '{imputation}'. Usa uno de {IMPUTATION_CHOICES}"
         )
-    arms = [ForecastArm(RAW_ARM, None, False)]
+    arms = [
+        ForecastArm(RAW_ARM, None, False),
+        ForecastArm(RAW_FROZEN_ARM, None, False),
+    ]
     for spec in dict.fromkeys(strategies):  # dedupe, keep order
         if imputation in ("both", "impute"):
             arms.append(ForecastArm(f"{spec}+impute", spec, True))
@@ -703,7 +729,7 @@ def _run_benchmark_from_config(
 
     arms = build_arms(strategy_specs, imputation)
     if all(not config.uses_training_arms for config in forecast_model_configs.values()):
-        arms = arms[:1]
+        arms = arms[: len(RAW_SOURCE_ARMS)]
     active_strategy_specs = [arm.strategy for arm in arms if arm.strategy]
     strategies = [
         build_detection_strategy(
@@ -734,6 +760,16 @@ def _run_benchmark_from_config(
     )
     if not series_dfs:
         raise RuntimeError("No se cargaron series para el benchmark.")
+    frozen_series_dfs = _load_raw_hourly_series(
+        pollutant=pollutant,
+        raw_base_dir=raw_base_dir,
+        freq=freq,
+        preserve_frozen=True,
+    )
+    primary_series_by_name = _series_by_name(series_dfs)
+    frozen_series_by_name = _series_by_name(frozen_series_dfs)
+    if set(frozen_series_by_name) != set(primary_series_by_name):
+        raise RuntimeError("Las vistas raw y raw+frozen no contienen las mismas estaciones")
 
     # Resolve "all" against the registry NOW so cache keys list concrete names
     # (registry availability, e.g. optional TSPulse, then invalidates entries).
@@ -772,7 +808,7 @@ def _run_benchmark_from_config(
             "raw_base_dir": raw_base_dir,
             "holdout": holdout,
             "context_len": context_len,
-            "split_policy": "fixed-common-detection-support-v1",
+            "split_policy": "fixed-anomaly-mask-support-v2",
             "regimes": [asdict(regime) for regime in regimes],
             "seed": seed,
             "device": device_request,
@@ -844,7 +880,9 @@ def _run_benchmark_from_config(
     _ACTIVE_PROGRESS = progress
     run_started = time.perf_counter()
     backtests_per_station = len(regimes) * sum(
-        len(arms) if config.uses_training_arms else 1
+        len(arms)
+        if config.uses_training_arms
+        else sum(arm.name in RAW_SOURCE_ARMS for arm in arms)
         for config in forecast_model_configs.values()
     )
     PROGRESS_LOGGER.info(
@@ -870,7 +908,7 @@ def _run_benchmark_from_config(
         "branch=forecast arm (raw, unlabeled+impute, etc.), model=model name"
     )
     PROGRESS_LOGGER.info(
-        "[log-guide] example: [backtest task=18/146 completed=7/146]"
+        "[log-guide] example: [backtest task=18/172 completed=7/172]"
         "[AQN1 - Puerto][long][unlabeled+impute][TiDE]"
     )
 
@@ -893,6 +931,9 @@ def _run_benchmark_from_config(
         station_started = time.perf_counter()
         series = df.iloc[:, 0]
         name = str(series.name)
+        frozen_series = frozen_series_by_name[name]
+        if not frozen_series.index.equals(series.index):
+            raise RuntimeError(f"{name}: raw y raw+frozen no comparten la misma rejilla")
         progress.update(
             stage="detection",
             detail=f"station={station_index}/{len(series_dfs)} name={name}",
@@ -1044,9 +1085,13 @@ def _run_benchmark_from_config(
 
         test_target_start = window["test_target_start"]
         test_series = series.loc[window["test_index"]]
-        train_raw = series.loc[window["train_index"]]
+        frozen_test_series = frozen_series.loc[window["test_index"]]
+        train_raw = series.loc[series.index < test_target_start]
+        train_frozen = frozen_series.loc[frozen_series.index < test_target_start]
         if test_series.isna().any() or common_mask.loc[window["test_index"]].any():
             raise RuntimeError(f"{name}: el test comun no es valido")
+        if frozen_test_series.isna().any():
+            raise RuntimeError(f"{name}: raw+frozen no cubre el test comun")
         selection_rows.append(
             {
                 **selection_common,
@@ -1079,6 +1124,7 @@ def _run_benchmark_from_config(
         if not math.isfinite(scale_ref) or scale_ref <= 0.0:
             scale_ref = float("nan")
         train_fp = series_fingerprint(train_raw)
+        frozen_train_fp = series_fingerprint(train_frozen)
         support_fp = series_fingerprint(support)
 
         # Arm training series are built lazily: fully-cached arms skip anomaly
@@ -1087,11 +1133,12 @@ def _run_benchmark_from_config(
 
         def train_for(arm: ForecastArm) -> pd.Series:
             if arm.name not in train_by_arm:
-                base = (
-                    train_raw
-                    if arm.strategy is None
-                    else remove_anomalies(train_raw, detections[arm.strategy])
-                )
+                if arm.name == RAW_FROZEN_ARM:
+                    base = train_frozen
+                elif arm.strategy is None:
+                    base = train_raw
+                else:
+                    base = remove_anomalies(train_raw, detections[arm.strategy])
                 train_by_arm[arm.name] = (
                     impute_series(
                         base,
@@ -1105,7 +1152,9 @@ def _run_benchmark_from_config(
                 )
             return train_by_arm[arm.name]
 
-        test_fp = series_fingerprint(test_series)
+        def test_for(arm: ForecastArm) -> pd.Series:
+            return frozen_test_series if arm.name == RAW_FROZEN_ARM else test_series
+
         series_backtest_rows: dict[int, dict[str, Any]] = {}
         pending_gpu: dict[
             Any, tuple[int, dict[str, Any], str, str, dict[str, Any], str, float]
@@ -1206,7 +1255,7 @@ def _run_benchmark_from_config(
                     "n_anomalies": n_train_anomalies,
                     "n_anomalies_full": detection.n_flagged if detection else 0,
                     "detection_scope": "full_series" if detection else "none",
-                    "split_basis": "common_detection_support" if detections else "raw",
+                    "split_basis": "common_anomaly_mask_support" if detections else "raw",
                     "split_n_flagged": split_n_flagged,
                     "split_n_unscored": split_n_unscored,
                     "test_context_start": str(window["test_context_start"]),
@@ -1217,15 +1266,23 @@ def _run_benchmark_from_config(
                 arm_strategy_key = (
                     asdict(strategy_by_spec[arm.strategy]) if arm.strategy else None
                 )
+                arm_test_series = test_for(arm)
+                arm_train_fp = (
+                    frozen_train_fp if arm.name == RAW_FROZEN_ARM else train_fp
+                )
+                arm_test_fp = series_fingerprint(arm_test_series)
                 for model_name in forecast_models:
                     forecast_model_config = forecast_model_configs[model_name]
-                    if not forecast_model_config.uses_training_arms and arm.name != RAW_ARM:
+                    if (
+                        not forecast_model_config.uses_training_arms
+                        and arm.name not in RAW_SOURCE_ARMS
+                    ):
                         continue
                     ordinal = backtest_ordinal
                     backtest_ordinal += 1
                     backtest_key = {
                         **base_key,
-                        "train_fp": train_fp,
+                        "train_fp": arm_train_fp,
                         "support_fp": support_fp,
                         "stage": "backtest",
                         "arm": arm.name,
@@ -1241,7 +1298,7 @@ def _run_benchmark_from_config(
                         "regime": asdict(regime),
                         "seasonality_m": seasonality_m,
                         "test_target_start": str(test_target_start),
-                        "test_fp": test_fp,
+                        "test_fp": arm_test_fp,
                     }
                     task_number = ordinal + 1
                     task_started = time.perf_counter()
@@ -1284,7 +1341,7 @@ def _run_benchmark_from_config(
                                 _run_gpu_backtest,
                                 _BacktestTask(
                                     train_series=arm_train,
-                                    test_series=test_series,
+                                    test_series=arm_test_series,
                                     mase_insample=train_raw,
                                     model_name=model_name,
                                     size_k=regime.horizon,
@@ -1325,7 +1382,7 @@ def _run_benchmark_from_config(
                         )
                         res = backtest_forecast(
                             arm_train,
-                            test_series,
+                            arm_test_series,
                             model_name,
                             size_k=regime.horizon,
                             test_target_start=test_target_start,
@@ -1438,7 +1495,9 @@ def _run_benchmark_from_config(
                             "seed": seed,
                             "device": detection_device,
                             "freq": freq,
+                            "carla_stride": carla_stride,
                             "injection_seed": injection_seed,
+                            "injection_variant": injection_variant,
                             "min_selection_points": min_selection_points,
                             "cache": cache,
                             "cache_key": {
@@ -1449,6 +1508,8 @@ def _run_benchmark_from_config(
                                 "foundation_test_config": foundation_test_config,
                                 "freq": freq,
                                 "seed": seed,
+                                "carla_stride": carla_stride,
+                                "injection_variant": injection_variant,
                             },
                         },
                     )

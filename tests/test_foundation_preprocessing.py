@@ -169,11 +169,13 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
     int_values = {
         ("forecasting", "holdout"): 96,
         ("forecasting", "context_len"): 72,
+        ("forecasting", "carla_stride"): 7,
         ("forecasting", "foundation_test_seed"): 1001,
         ("forecasting", "foundation_test_repeats"): 1,
     }
     target_values: dict[tuple[pd.Timestamp, int], list[np.ndarray]] = {}
     prepare_calls: list[int] = []
+    synthetic_contexts: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         pipeline,
@@ -195,6 +197,8 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         lambda section, option, default, cfg=None: (
             "interp"
             if (section, option) == ("forecasting", "imputation_model")
+            else "drift"
+            if (section, option) == ("synthetic", "injection_variant")
             else default
         ),
     )
@@ -215,6 +219,8 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
 
     def fake_detect(values, strategies, *_args, base_key, **_kwargs):
         synthetic = base_key.get("experiment") == "foundation-preprocessing-synthetic-v1"
+        if synthetic:
+            synthetic_contexts.append(_kwargs["context_kwargs"])
         output = {}
         for strategy in strategies:
             mask = pd.Series(False, index=values.index)
@@ -289,6 +295,14 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         "inject-vote",
     }
     assert prepare_calls == [8, 48]
+    assert synthetic_contexts
+    assert all(context["carla_stride"] == 7 for context in synthetic_contexts)
+    assert all(context["injection_variant"] == "drift" for context in synthetic_contexts)
+    assert all(
+        context["cache_key"]["carla_stride"] == 7
+        and context["cache_key"]["injection_variant"] == "drift"
+        for context in synthetic_contexts
+    )
     assert all(
         np.array_equal(values[0], candidate)
         for values in target_values.values()

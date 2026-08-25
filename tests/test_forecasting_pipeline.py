@@ -69,7 +69,7 @@ def test_common_detection_support_masks_every_strategy_timestamp():
     assert support.isna().iloc[[5, 12]].all()
 
 
-def test_common_detection_support_excludes_unscored_timestamps():
+def test_common_detection_support_keeps_unscored_timestamps():
     series = _seasonal_series(n=20)
     mask = pd.Series(False, index=series.index)
     scored = pd.Series(True, index=series.index)
@@ -82,8 +82,8 @@ def test_common_detection_support_excludes_unscored_timestamps():
         series, {"inject-vote": detection}
     )
 
-    assert common_mask[common_mask].index.tolist() == [series.index[7]]
-    assert pd.isna(support.iloc[7])
+    assert not common_mask.any()
+    assert support.iloc[7] == series.iloc[7]
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +110,51 @@ def test_load_raw_hourly_series_applies_preprocess_and_preserves_station(monkeyp
     assert frame.columns.tolist() == ["Station A"]
     assert len(frame) == 3
     assert pd.isna(frame.iloc[1, 0])
+
+
+def test_load_raw_hourly_series_can_preserve_frozen_values(monkeypatch):
+    index = pd.date_range("2024-01-01", periods=24, freq="5min")
+    raw = pd.DataFrame(
+        {"NO2": np.r_[np.full(12, 10.0), np.arange(12.0, 24.0)]},
+        index=index,
+    )
+    monkeypatch.setattr(cp, "load_raw_5m", lambda *_args: [("Station A", raw)])
+
+    (filtered,) = cp._load_raw_hourly_series(
+        pollutant="NO2", raw_base_dir="raw", freq="h"
+    )
+    (preserved,) = cp._load_raw_hourly_series(
+        pollutant="NO2", raw_base_dir="raw", freq="h", preserve_frozen=True
+    )
+
+    assert pd.isna(filtered.iloc[0, 0])
+    assert preserved.iloc[0, 0] == 10.0
+
+
+def test_load_raw_hourly_series_can_preserve_repeated_hourly_values(monkeypatch):
+    index = pd.date_range("2024-01-01", periods=36, freq="5min")
+    raw = pd.DataFrame(
+        {"NO2": np.r_[np.arange(12.0), np.arange(11.0, -1.0, -1.0), np.arange(24.0, 36.0)]},
+        index=index,
+    )
+    monkeypatch.setattr(cp, "load_raw_5m", lambda *_args: [("Station A", raw)])
+
+    (filtered,) = cp._load_raw_hourly_series(
+        pollutant="NO2", raw_base_dir="raw", freq="h"
+    )
+    (preserved,) = cp._load_raw_hourly_series(
+        pollutant="NO2", raw_base_dir="raw", freq="h", preserve_frozen=True
+    )
+
+    assert pd.isna(filtered.iloc[1, 0])
+    assert preserved.iloc[1, 0] == preserved.iloc[0, 0]
+
+
+def test_series_by_name_rejects_duplicate_stations():
+    series = _seasonal_series(n=20, name="ST0")
+
+    with pytest.raises(RuntimeError, match="duplicado: ST0"):
+        cp._series_by_name([series.to_frame(), series.to_frame()])
 
 
 # --------------------------------------------------------------------------- #
@@ -366,19 +411,29 @@ def test_build_arms_expands_strategies_and_imputation_variants():
     arms = cp.build_arms(["unlabeled", "inject-vote"], "both")
     assert [arm.name for arm in arms] == [
         "raw",
+        "raw+frozen",
         "unlabeled+impute",
         "unlabeled+noimpute",
         "inject-vote+impute",
         "inject-vote+noimpute",
     ]
     assert arms[0].strategy is None and not arms[0].impute
-    assert arms[1].strategy == "unlabeled" and arms[1].impute
-    assert arms[2].strategy == "unlabeled" and not arms[2].impute
+    assert arms[1].strategy is None and not arms[1].impute
+    assert arms[2].strategy == "unlabeled" and arms[2].impute
+    assert arms[3].strategy == "unlabeled" and not arms[3].impute
 
     only_impute = cp.build_arms(["unlabeled"], "impute")
-    assert [arm.name for arm in only_impute] == ["raw", "unlabeled+impute"]
+    assert [arm.name for arm in only_impute] == [
+        "raw",
+        "raw+frozen",
+        "unlabeled+impute",
+    ]
     only_gaps = cp.build_arms(["unlabeled", "unlabeled"], "none")  # dedupes
-    assert [arm.name for arm in only_gaps] == ["raw", "unlabeled+noimpute"]
+    assert [arm.name for arm in only_gaps] == [
+        "raw",
+        "raw+frozen",
+        "unlabeled+noimpute",
+    ]
 
     with pytest.raises(ValueError):
         cp.build_arms(["unlabeled"], "sometimes")
@@ -455,15 +510,17 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     tmp_path, monkeypatch
 ):
     series = _seasonal_series(n=600, name="ST0", seed=8)
+    preserved = series + 100.0
     seen_detection_index: list[pd.DatetimeIndex] = []
+    seen_detection_values: list[pd.Series] = []
     seen_detection_context: dict[str, object] = {}
     test_indices: list[pd.DatetimeIndex] = []
 
-    monkeypatch.setattr(
-        cp,
-        "_load_raw_hourly_series",
-        lambda **_kwargs: [series.to_frame()],
-    )
+    def fake_loader(**kwargs):
+        source = preserved if kwargs.get("preserve_frozen") else series
+        return [source.to_frame()]
+
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     csv_map = {
         ("forecasting", "detectors"): tuple(BASELINE_DETECTORS),
         ("forecasting", "forecast_models"): ("LinearRegression",),
@@ -501,6 +558,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     def fake_detect(full_series, strategies, *_args, **_kwargs):
         seen_detection_index.append(pd.DatetimeIndex(full_series.index))
+        seen_detection_values.append(full_series.copy())
         seen_detection_context.update(_kwargs["context_kwargs"])
         out = {}
         for strategy, position in zip(strategies, (500, 550), strict=True):
@@ -539,6 +597,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     assert len(seen_detection_index) == 1
     assert seen_detection_index[0].equals(series.index)
+    pd.testing.assert_series_equal(seen_detection_values[0], series)
     assert seen_detection_context["carla_stride"] == 7
     assert seen_detection_context["injection_variant"] == "drift"
     selection = artifacts["selection_df"].iloc[0]
@@ -547,6 +606,80 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     assert pd.Timestamp(selection["test_target_end"]) == series.index[499]
     assert all(index.equals(test_indices[0]) for index in test_indices)
     assert series.index[500] not in test_indices[0]
+
+
+def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
+    tmp_path, monkeypatch
+):
+    primary = _seasonal_series(n=700, name="ST0", seed=9)
+    primary.iloc[200:230] = np.nan
+    preserved = primary.copy()
+    preserved.iloc[200:230] = np.linspace(25.0, 35.0, 30)
+    preserved.iloc[500:] += 20.0
+
+    def fake_loader(**kwargs):
+        source = preserved if kwargs.get("preserve_frozen") else primary
+        return [source.to_frame()]
+
+    csv_map = {
+        ("forecasting", "detectors"): tuple(BASELINE_DETECTORS),
+        ("forecasting", "forecast_models"): ("LinearRegression",),
+        ("forecasting", "strategies"): (),
+    }
+    int_map = {
+        ("forecasting", "holdout"): 96,
+        ("forecasting", "context_len"): 72,
+    }
+    seen: list[tuple[pd.Series, pd.Series, pd.Series]] = []
+
+    def fake_backtest(train, test, _model, **kwargs):
+        seen.append((train.copy(), test.copy(), kwargs["mase_insample"].copy()))
+        horizon = kwargs["size_k"]
+        stride = kwargs["forecast_stride"]
+        n_forecasts = (96 - horizon) // stride + 1
+        return {
+            "rmse": float(test.loc[kwargs["test_target_start"] :].mean()),
+            "mase": 1.0,
+            "n_test_predictions": n_forecasts * horizon,
+            "n_forecasts": n_forecasts,
+            "n_expected_forecasts": n_forecasts,
+            "n_unique_targets": 96,
+        }
+
+    monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_csv_list",
+        lambda section, option, default, *, cfg=None: csv_map.get(
+            (section, option), default
+        ),
+    )
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_int",
+        lambda section, option, default, cfg=None: int_map.get(
+            (section, option), default
+        ),
+    )
+    monkeypatch.setattr(cp, "cfg_get_bool", lambda *args, **kwargs: False)
+    monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path)
+    monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
+    monkeypatch.setattr(cp, "backtest_forecast", fake_backtest)
+
+    artifacts = cp.run_benchmark_from_config()
+
+    assert set(artifacts["results_df"]["arm"]) == {"raw", "raw+frozen"}
+    assert artifacts["results_df"].groupby("arm")["rmse"].mean().nunique() == 2
+    assert len(seen) == 4
+    for raw_call, frozen_call in ((seen[0], seen[1]), (seen[2], seen[3])):
+        raw_train, raw_test, raw_mase = raw_call
+        frozen_train, frozen_test, frozen_mase = frozen_call
+        assert frozen_train.notna().sum() > raw_train.notna().sum()
+        assert raw_test.index.equals(frozen_test.index)
+        assert not raw_test.equals(frozen_test)
+        pd.testing.assert_series_equal(raw_mase, frozen_mase)
+        assert raw_train.index.max() < raw_test.index[72]
+        assert frozen_train.index.max() < frozen_test.index[72]
 
 
 def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
@@ -595,6 +728,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     detection_df = artifacts["detection_df"]
     expected_arms = {
         "raw",
+        "raw+frozen",
         "unlabeled+impute",
         "unlabeled+noimpute",
         "inject-vote+impute",
@@ -641,6 +775,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     assert "[run] done" in progress_log
     for col in (
         "rmse_raw",
+        "rmse_raw+frozen",
         "rmse_unlabeled+impute",
         "rmse_unlabeled+impute_delta",
         "rmse_unlabeled+impute_improve_pct",
@@ -712,9 +847,11 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
         def join_thread(self):
             pass
 
-    def fake_loader(**_kwargs):
+    def fake_loader(**kwargs):
         series = _seasonal_series(n=900, name="ST0", seed=2)
         series.iloc[300:330] = np.nan
+        if kwargs.get("preserve_frozen"):
+            series = series + 10.0
         return [series.to_frame()]
 
     csv_map = {
@@ -776,11 +913,16 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
 
     artifacts = cp.run_benchmark_from_config()
 
-    assert [arm.name for arm in artifacts["arms"]] == ["raw"]
-    assert set(artifacts["results_df"]["arm"]) == {"raw"}
+    assert [arm.name for arm in artifacts["arms"]] == ["raw", "raw+frozen"]
+    assert set(artifacts["results_df"]["arm"]) == {"raw", "raw+frozen"}
     assert set(artifacts["results_df"]["model_mode"]) == {"foundation"}
-    assert len(artifacts["results_df"]) == 2
-    assert len(submitted) == 2
+    assert len(artifacts["results_df"]) == 4
+    assert len(submitted) == 4
+    for raw_task, frozen_task in ((submitted[0], submitted[1]), (submitted[2], submitted[3])):
+        assert raw_task.train_series.index.equals(frozen_task.train_series.index)
+        assert raw_task.test_series.index.equals(frozen_task.test_series.index)
+        assert not raw_task.train_series.equals(frozen_task.train_series)
+        assert not raw_task.test_series.equals(frozen_task.test_series)
     assert (artifacts["results_df"]["train_seconds"] == 1.25).all()
     assert (artifacts["results_df"]["inference_seconds"] == 0.5).all()
     assert artifacts["detection_df"].empty
