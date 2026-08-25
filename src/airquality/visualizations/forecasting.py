@@ -56,7 +56,7 @@ from airquality.visualizations.anomaly import (
     TEXT_COLOR,
     style_axis,
 )
-from airquality.forecasting.pipeline import RAW_ARM
+from airquality.forecasting.pipeline import RAW_ARM, RAW_FROZEN_ARM
 
 MUTED_TEXT = "#6d6258"
 
@@ -64,6 +64,7 @@ MUTED_TEXT = "#6d6258"
 #: the cream surface). ``raw`` is neutral on purpose — it is the reference.
 ARM_FAMILY_COLORS = {
     RAW_ARM: "#6d6258",
+    RAW_FROZEN_ARM: "#2a7f76",
     "unlabeled": "#3d7ab5",
     "inject-best": "#cf6f1e",
     "inject-vote": "#9b59b6",
@@ -115,6 +116,8 @@ def _add_header(figure: plt.Figure, title: str, subtitle: str) -> float:
 
 def _family(arm: str) -> str:
     """Strategy family of one arm name (``unlabeled+impute`` → ``unlabeled``)."""
+    if arm == RAW_FROZEN_ARM:
+        return arm
     return arm.split("+", 1)[0]
 
 
@@ -143,7 +146,11 @@ def improvement_table(results_df: pd.DataFrame, metric: str, model: str) -> pd.D
     baseline = wide[RAW_ARM]
     table = pd.DataFrame(index=wide.index)
     for arm in arms:
-        table[arm] = 100.0 * (baseline - wide.get(arm)) / baseline.where(baseline != 0)
+        table[arm] = (
+            100.0 * (baseline - wide[arm]) / baseline.where(baseline != 0)
+            if arm in wide
+            else np.nan
+        )
     return table
 
 
@@ -263,7 +270,7 @@ def _save_arm_dot_plot(
     ]
     handles += [
         Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=TEXT_COLOR,
-               markeredgecolor=TEXT_COLOR, markersize=8, label="con imputacion / raw"),
+               markeredgecolor=TEXT_COLOR, markersize=8, label="con imputacion / vistas raw"),
         Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=FIGURE_FACE,
                markeredgecolor=TEXT_COLOR, markersize=8, label="sin imputacion"),
     ]
@@ -288,7 +295,7 @@ def save_arm_error_plot(output_path: Path, results_df: pd.DataFrame, metric: str
         title=f"Error de prediccion por brazo — {_metric_label(metric)}",
         subtitle=(
             "Puntos = series; barra vertical = media del brazo (menor = mejor).\n"
-            "Relleno = con imputacion (o raw); hueco = sin imputacion. Linea discontinua = media de raw."
+            "Relleno = con imputacion (o vista raw); hueco = sin imputacion. Linea discontinua = media de raw."
         ),
         xlabel=_metric_label(metric),
         value_fmt="{:.2f}",
@@ -305,7 +312,7 @@ def save_train_time_plot(output_path: Path, results_df: pd.DataFrame) -> bool:
         title="Tiempo de entrenamiento por brazo",
         subtitle=(
             "Puntos = series; barra vertical = media del brazo (menor = mas rapido).\n"
-            "Relleno = con imputacion (o raw); hueco = sin imputacion."
+            "Relleno = con imputacion (o vista raw); hueco = sin imputacion."
         ),
         xlabel="tiempo de entrenamiento (s)",
         value_fmt="{:.1f}s",
@@ -322,7 +329,7 @@ def save_inference_time_plot(output_path: Path, results_df: pd.DataFrame) -> boo
         title="Tiempo de inferencia por brazo",
         subtitle=(
             "Puntos = series; barra vertical = media del brazo (menor = mas rapido).\n"
-            "Tiempo del forecast sobre el holdout. Relleno = con imputacion (o raw); hueco = sin imputacion."
+            "Tiempo del forecast sobre el holdout. Relleno = con imputacion (o vista raw); hueco = sin imputacion."
         ),
         xlabel="tiempo de inferencia (s)",
         value_fmt="{:.2f}s",

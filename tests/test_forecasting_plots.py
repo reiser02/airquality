@@ -25,6 +25,7 @@ from airquality.visualizations.forecasting import (
 
 ARMS = [
     "raw",
+    "raw+frozen",
     "unlabeled+impute",
     "unlabeled+noimpute",
     "inject-vote+impute",
@@ -42,15 +43,16 @@ def _results_df(n_series: int = 3, models: tuple[str, ...] = ("NLinear", "TiDE")
             base = 1.0 + rng.uniform(0, 0.5)
             for arm in ARMS:
                 family = arm.split("+", 1)[0]
+                is_raw_view = arm in {"raw", "raw+frozen"}
                 rows.append(
                     {
                         "series": f"ST{s}",
                         "arm": arm,
-                        "strategy": "none" if arm == "raw" else family,
+                        "strategy": "none" if is_raw_view else family,
                         "imputed": arm.endswith("+impute"),
                         "imputation_model": "interp" if arm.endswith("+impute") else "none",
-                        "detectors": "" if arm == "raw" else "IQR,Hampel_w24",
-                        "n_anomalies": 0 if arm == "raw" else 5,
+                        "detectors": "" if is_raw_view else "IQR,Hampel_w24",
+                        "n_anomalies": 0 if is_raw_view else 5,
                         "model": model,
                         "rmse": base * (1 + rng.uniform(-0.3, 0.3)),
                         "mase": base * (1 + rng.uniform(-0.2, 0.2)),
@@ -102,7 +104,17 @@ def test_improvement_table_is_relative_to_raw():
     table = improvement_table(df, "rmse", "NLinear")
 
     assert "raw" not in table.columns
+    assert "raw+frozen" in table.columns
     assert table.loc["ST0", "unlabeled+impute"] == pytest.approx(20.0)  # 20% better
+
+
+def test_improvement_table_keeps_all_nan_arm():
+    df = _results_df(n_series=1, models=("NLinear",))
+    df.loc[df["arm"] == "raw+frozen", "rmse"] = np.nan
+
+    table = improvement_table(df, "rmse", "NLinear")
+
+    assert table["raw+frozen"].isna().all()
 
 
 def test_selection_counts_orders_and_counts():
@@ -117,6 +129,7 @@ def test_imputation_pairs_requires_both_variants():
     df = _results_df(n_series=2, models=("NLinear",))
     pairs = imputation_pairs(df, "mase")
     assert set(pairs["strategy"]) == {"unlabeled", "inject-vote"}
+    assert not pairs["strategy"].str.startswith("raw").any()
     assert {"impute", "noimpute"} <= set(pairs.columns)
     # Without the noimpute arms there is nothing to pair.
     assert imputation_pairs(df[~df["arm"].str.endswith("+noimpute")], "mase").empty
@@ -125,6 +138,7 @@ def test_imputation_pairs_requires_both_variants():
 def test_family_colors_fixed_and_extended():
     colors = family_colors(ARMS + ["custom+impute"])
     assert colors["raw"] == "#6d6258"
+    assert colors["raw+frozen"] == "#2a7f76"
     assert colors["unlabeled"] == "#3d7ab5"
     assert colors["custom"] not in ("", None)
 

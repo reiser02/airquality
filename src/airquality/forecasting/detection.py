@@ -9,7 +9,7 @@ anomaly mask, so strategies share detector fits instead of refitting per arm:
 - ``unlabeled`` (:class:`ConsensusDetection`): the production method — score
   every detector on the real contiguous segments, discard those over the
   detection-rate budget, binarize their scores with MAD and combine the masks
-  by strict-majority vote (:func:`airquality.anomaly.ensemble.consensus`).
+  by strict-majority vote (:class:`ConsensusDetection`).
 - ``inject-best`` (:class:`InjectionTopKDetection`, ``top_k=1``): inject
   synthetic anomalies (:func:`airquality.anomaly.anomalies.inject_synthetic_anomalies`)
   into a copy of the training segments, rank every detector by VUS-PR against
@@ -742,13 +742,15 @@ def common_detection_support(
     series: pd.Series,
     detections: dict[str, DetectionResult],
 ) -> tuple[pd.Series, pd.Series]:
-    """Mask anomalies and observed points where any strategy abstained."""
+    """Mask points flagged as anomalous by any strategy.
+
+    Strategy abstentions remain available for holdout selection. Their coverage
+    is reported through ``scored_mask``/``n_unscored`` but is not itself an
+    anomaly decision.
+    """
     common_mask = pd.Series(False, index=series.index, name=series.name)
     for detection in detections.values():
         common_mask |= detection.mask.reindex(series.index, fill_value=False).astype(bool)
-        if detection.scored_mask is not None:
-            scored = detection.scored_mask.reindex(series.index, fill_value=False).astype(bool)
-            common_mask |= series.notna() & ~scored
     return series.mask(common_mask), common_mask
 
 

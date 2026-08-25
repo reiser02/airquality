@@ -167,7 +167,7 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     assert results.loc[results["stage"] == "imputed", "imputed"].all()
     assert set(results["minimum_hours"]) == {4}
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["analysis_version"] == 4
+    assert manifest["analysis_version"] == 5
     assert manifest["pollutant"] == "CO"
     assert manifest["injection_variant"] == "combined"
     assert manifest["injection_seed"] == analysis.DEFAULT_INJECTION_SEED
