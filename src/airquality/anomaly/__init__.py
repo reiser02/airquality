@@ -29,16 +29,14 @@ from .benchmark import (
     AnomalyCase,
     build_cases,
     run_benchmark,
-    split_by_detection_rate,
 )
-from .ensemble import consensus, rank_top_k
+from .ensemble import rank_top_k
 from .metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
     compute_metrics,
     compute_segmented_metrics,
     detect_mask,
-    detection_rate,
     mad_threshold,
     vus_sliding_window,
     vus_sliding_window_segments,
@@ -56,14 +54,11 @@ __all__ = [
     "build_cases",
     "compute_metrics",
     "compute_segmented_metrics",
-    "consensus",
     "detect_mask",
-    "detection_rate",
     "mad_threshold",
     "rank_top_k",
     "resolve_model_names",
     "run_benchmark",
-    "split_by_detection_rate",
     "vus_sliding_window",
     "vus_sliding_window_segments",
 ]

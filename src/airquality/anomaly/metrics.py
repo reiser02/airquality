@@ -75,14 +75,6 @@ def detect_mask(scores: np.ndarray, k: float = DEFAULT_THRESHOLD_K) -> np.ndarra
         return np.isfinite(scores) & (scores > threshold)
 
 
-def detection_rate(mask: np.ndarray) -> float:
-    """Fraction of flagged points in a boolean ``mask`` (0.0 when empty)."""
-    mask = np.asarray(mask, dtype=bool)
-    if mask.size == 0:
-        return 0.0
-    return float(mask.mean())
-
-
 def vus_sliding_window(labels: np.ndarray) -> int:
     """VUS sliding-window tolerance: the median labeled anomaly length.
 
