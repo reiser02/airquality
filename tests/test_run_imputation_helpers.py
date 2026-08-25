@@ -23,7 +23,6 @@ from airquality.imputation.run_benchmark import (
     _resolve_repo_root,
     load_darts_models_from_artifacts,
     load_series,
-    run_imputation_benchmark,
     run_imputation_benchmark_parallel,
     summarize_results_by_model,
     summarize_montecarlo_rankings,
@@ -268,7 +267,7 @@ def test_build_parallel_task_common_roundtrips_into_benchmark_config(tmp_path: P
     assert rebuilt == config
 
 
-def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
+def test_parallel_benchmark_resolves_config_defaults_at_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -344,7 +343,8 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
         lambda df: df,
     )
 
-    run_imputation_benchmark(
+    run_imputation_benchmark_parallel(
+        max_workers=1,
     )
 
     assert captured["config"] == BenchmarkRunConfig(
@@ -370,7 +370,7 @@ def test_run_imputation_benchmark_resolves_config_defaults_at_runtime(
     )
 
 
-def test_run_imputation_benchmark_allows_benchmark_overrides_without_dataset_selection(
+def test_parallel_benchmark_allows_benchmark_overrides_without_dataset_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -406,7 +406,7 @@ def test_run_imputation_benchmark_allows_benchmark_overrides_without_dataset_sel
         lambda df: df,
     )
 
-    run_imputation_benchmark(
+    run_imputation_benchmark_parallel(
         size_k=11,
         model_names=("TiDE",),
         tspulse_model_id="override-model",
@@ -422,6 +422,7 @@ def test_run_imputation_benchmark_allows_benchmark_overrides_without_dataset_sel
         val_size=12,
         val_context_len=13,
         min_train_len_base=14,
+        max_workers=1,
     )
 
     assert captured["config"] == BenchmarkRunConfig(
@@ -565,75 +566,6 @@ def test_load_darts_models_from_artifacts_raises_for_missing_weights_in_strict_m
         )
 
 
-def test_run_imputation_benchmark_smoke_uses_shared_runner_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    dataset_bundle = object()
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
-        lambda **kwargs: dataset_bundle,
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark.load_darts_models_from_artifacts",
-        lambda **kwargs: {"TiDE": object()},
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._resolve_available_darts_names",
-        lambda model_names, **kwargs: list(model_names),
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._default_model_names",
-        lambda: ("TiDE",),
-    )
-
-    def fake_execute(*, model_dict, dataset_bundle, config):
-        captured["model_names"] = tuple(model_dict.keys())
-        captured["dataset_bundle"] = dataset_bundle
-        captured["config"] = config
-        return (
-            pd.DataFrame(
-                {
-                    "Modelo": ["TiDE"],
-                    "Serie": ["S1"],
-                    "Gap_Size": [2],
-                    "MAE": [1.0],
-                    "RMSE": [1.5],
-                    "MASE": [0.5],
-                }
-            ),
-            {
-                2: {
-                    "series": {
-                        "S1": {
-                            "actual": pd.Series(dtype=float),
-                            "preds": {"TiDE": pd.Series(dtype=float)},
-                            "naive_mase": pd.Series(dtype=float),
-                        }
-                    }
-                }
-            },
-        )
-
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._execute_benchmark_with_dataset",
-        fake_execute,
-    )
-
-    results_df, ranking_df, plot_store = run_imputation_benchmark(
-        repo_root=tmp_path,
-    )
-
-    assert list(results_df["Modelo"]) == ["TiDE"]
-    assert list(ranking_df["Modelo"]) == ["TiDE"]
-    assert list(plot_store) == [2]
-    assert set(plot_store[2]["series"]["S1"]) == {"actual", "preds", "naive_mase"}
-    assert captured["model_names"] == ("TiDE",)
-    assert captured["dataset_bundle"] is dataset_bundle
-    assert isinstance(captured["config"], BenchmarkRunConfig)
-
-
 def test_run_imputation_benchmark_parallel_max_workers_one_combines_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -698,76 +630,10 @@ def test_run_imputation_benchmark_parallel_max_workers_one_combines_outputs(
         max_workers=1,
     )
 
-    assert set(results_df["Modelo"]) == {"TiDE", "TCN"}
+    assert list(results_df["Modelo"]) == ["TiDE", "TCN"]
     assert list(ranking_df["Modelo"]) == ["TiDE", "TCN"]
     assert set(plot_store[1]["series"]["S1"]) == {"actual", "preds", "naive_mase"}
     assert set(plot_store[1]["series"]["S1"]["preds"]) == {"TiDE", "TCN"}
-
-
-def test_run_imputation_benchmark_adds_original_and_finetuned_tspulse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    dataset_bundle = object()
-    captured: dict[str, object] = {}
-    fine_tuned_path = tmp_path / "models" / "fine-tuned"
-    fine_tuned_path.mkdir(parents=True)
-
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark.build_dataset_bundle_for_imputation",
-        lambda **kwargs: dataset_bundle,
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark.load_darts_models_from_artifacts",
-        lambda **kwargs: {},
-    )
-    monkeypatch.setattr("airquality.imputation.run_benchmark.TSFM_PUBLIC_AVAILABLE", True)
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._default_model_names",
-        lambda: (TSPULSE_ORIGINAL_MODEL_NAME, TSPULSE_FINETUNED_MODEL_NAME),
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._default_tspulse_model_path",
-        lambda: "models/fine-tuned",
-    )
-
-    def fake_build_tspulse_model(model_config, *, freq):
-        return {"model_path": model_config.model_path, "freq": freq}
-
-    def fake_execute(*, model_dict, dataset_bundle, config):
-        captured["model_dict"] = model_dict
-        return (
-            pd.DataFrame(
-                {
-                    "Modelo": list(model_dict),
-                    "Serie": ["S1", "S1"],
-                    "Gap_Size": [1, 1],
-                    "MAE": [1.0, 2.0],
-                    "RMSE": [1.0, 2.0],
-                    "MASE": [1.0, 2.0],
-                }
-            ),
-            {},
-        )
-
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._build_tspulse_model",
-        fake_build_tspulse_model,
-    )
-    monkeypatch.setattr(
-        "airquality.imputation.run_benchmark._execute_benchmark_with_dataset",
-        fake_execute,
-    )
-
-    results_df, ranking_df, _ = run_imputation_benchmark(
-        repo_root=tmp_path,
-    )
-
-    assert list(results_df["Modelo"]) == ["TSPulse", "TSPulse_FineTuned"]
-    assert list(ranking_df["Modelo"]) == ["TSPulse", "TSPulse_FineTuned"]
-    assert captured["model_dict"] == {
-        "TSPulse": {"model_path": None, "freq": "h"},
-        "TSPulse_FineTuned": {"model_path": str(fine_tuned_path), "freq": "h"},
-    }
 
 
 def test_run_imputation_benchmark_parallel_adds_original_and_finetuned_tspulse(
@@ -831,7 +697,7 @@ def test_run_imputation_benchmark_parallel_adds_original_and_finetuned_tspulse(
     assert list(ranking_df["Modelo"]) == ["TSPulse", "TSPulse_FineTuned"]
 
 
-def test_run_imputation_benchmark_can_request_only_base_tspulse(
+def test_parallel_benchmark_can_request_only_base_tspulse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -886,9 +752,10 @@ def test_run_imputation_benchmark_can_request_only_base_tspulse(
         fake_execute,
     )
 
-    results_df, ranking_df, _ = run_imputation_benchmark(
+    results_df, ranking_df, _ = run_imputation_benchmark_parallel(
         repo_root=tmp_path,
         model_names=[TSPULSE_ORIGINAL_MODEL_NAME],
+        max_workers=1,
     )
 
     assert list(results_df["Modelo"]) == [TSPULSE_ORIGINAL_MODEL_NAME]
@@ -898,7 +765,7 @@ def test_run_imputation_benchmark_can_request_only_base_tspulse(
     }
 
 
-def test_run_imputation_benchmark_can_request_only_finetuned_tspulse(
+def test_parallel_benchmark_can_request_only_finetuned_tspulse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -955,9 +822,10 @@ def test_run_imputation_benchmark_can_request_only_finetuned_tspulse(
         fake_execute,
     )
 
-    results_df, ranking_df, _ = run_imputation_benchmark(
+    results_df, ranking_df, _ = run_imputation_benchmark_parallel(
         repo_root=tmp_path,
         model_names=[TSPULSE_FINETUNED_MODEL_NAME],
+        max_workers=1,
     )
 
     assert list(results_df["Modelo"]) == [TSPULSE_FINETUNED_MODEL_NAME]
@@ -970,7 +838,7 @@ def test_run_imputation_benchmark_can_request_only_finetuned_tspulse(
     }
 
 
-def test_run_imputation_benchmark_rejects_finetuned_tspulse_without_model_path(
+def test_parallel_benchmark_rejects_finetuned_tspulse_without_model_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -996,13 +864,14 @@ def test_run_imputation_benchmark_rejects_finetuned_tspulse_without_model_path(
     )
 
     with pytest.raises(RuntimeError, match="TSPulse_FineTuned"):
-        run_imputation_benchmark(
+        run_imputation_benchmark_parallel(
             repo_root=tmp_path,
             model_names=[TSPULSE_FINETUNED_MODEL_NAME],
+            max_workers=1,
         )
 
 
-def test_run_imputation_benchmark_rejects_unavailable_tspulse(
+def test_parallel_benchmark_rejects_unavailable_tspulse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -1015,9 +884,10 @@ def test_run_imputation_benchmark_rejects_unavailable_tspulse(
     )
 
     with pytest.raises(ImportError, match="tsfm_public"):
-        run_imputation_benchmark(
+        run_imputation_benchmark_parallel(
             repo_root=tmp_path,
             model_names=[TSPULSE_ORIGINAL_MODEL_NAME],
+            max_workers=1,
         )
 
 
