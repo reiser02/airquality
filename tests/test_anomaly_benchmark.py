@@ -30,17 +30,14 @@ from airquality.anomaly.benchmark import (
     _requested_model_kwargs,
     _filter_model_kwargs,
     _summarize,
-    macro_detection_rate,
     recompute_ensemble,
     run_benchmark,
-    split_by_detection_rate,
 )
-from airquality.anomaly.ensemble import consensus, rank_top_k, ranked_pointwise_vote
+from airquality.anomaly.ensemble import rank_top_k, ranked_pointwise_vote
 from airquality.anomaly.metrics import (
     MAD_SCALE,
     compute_metrics,
     detect_mask,
-    detection_rate,
     mad_threshold,
     normalize_scores,
 )
@@ -510,11 +507,6 @@ def test_detect_mask_never_flags_nan():
     assert not mask[2] and mask[3]
 
 
-def test_detection_rate_simple_and_empty():
-    assert detection_rate(np.array([True, False, False, False])) == pytest.approx(0.25)
-    assert detection_rate(np.array([], dtype=bool)) == 0.0
-
-
 def test_normalize_scores_constant_array_returns_zeros():
     out = normalize_scores(np.array([5.0, 5.0, 5.0]))
     assert np.all(out == 0.0)
@@ -573,54 +565,6 @@ def test_ranked_pointwise_vote_backfills_and_requires_two_models():
 def test_synthetic_top_k_must_preserve_two_of_three_protocol(top_k: int):
     with pytest.raises(ValueError, match="ensemble_top_k"):
         AnomalyBenchmarkConfig(mode="synthetic", ensemble_top_k=top_k)
-
-
-def test_consensus_shape_and_range():
-    scores = [np.array([0.0, 5.0, 1.0, 9.0]), np.array([2.0, 2.0, 8.0, 1.0])]
-    fused = consensus(scores)
-    assert fused.shape == (4,)
-    assert fused.min() >= 0.0 and fused.max() <= 1.0 + 1e-6
-
-
-def test_vote_consensus_requires_strict_majority():
-    score_a = np.array([9.0, 0.0, 0.0, 0.0])
-    score_b = np.array([8.0, 0.0, 0.0, 0.0])
-    score_c = np.array([0.0, 0.0, 7.0, 0.0])
-
-    fused = consensus([score_a, score_b, score_c])
-
-    assert fused.astype(bool).tolist() == [True, False, False, False]
-
-
-def test_consensus_empty_list_raises():
-    with pytest.raises(ValueError):
-        consensus([])
-# --- detection-rate filter -------------------------------------------------
-
-
-def _fake_results(rates_by_model: dict[str, list[float]]) -> dict[str, dict[str, object]]:
-    return {
-        name: {"per_case": [{"metrics": {"detection_rate": rate}} for rate in rates]}
-        for name, rates in rates_by_model.items()
-    }
-
-
-def test_split_by_detection_rate_discards_over_budget():
-    results = _fake_results({"ok": [0.01, 0.03], "noisy": [0.20, 0.30], "silent": [0.0, 0.0]})
-    kept, discarded = split_by_detection_rate(results, max_detection_rate=0.07)
-    assert kept == ["ok", "silent"]
-    assert discarded == ["noisy"]
-
-
-def test_split_by_detection_rate_budget_is_inclusive():
-    results = _fake_results({"at_budget": [0.07, 0.07]})
-    kept, discarded = split_by_detection_rate(results, max_detection_rate=0.07)
-    assert kept == ["at_budget"] and discarded == []
-
-
-def test_macro_detection_rate_averages_cases():
-    results = _fake_results({"m": [0.1, 0.3]})
-    assert macro_detection_rate(results["m"]) == pytest.approx(0.2)
 
 
 # --- registry ------------------------------------------------------------

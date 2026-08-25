@@ -9,8 +9,8 @@ production (real time, no ground truth):
    compute its **detection rate** (fraction of flagged points).
 3. For each station, **discard** detectors whose detection rate over its scored
    segments exceeds ``max_detection_rate`` (default 7%).
-4. Combine the surviving detectors by strict-majority vote
-   (:func:`.ensemble.consensus`) and report its detection rate too.
+4. Combine the surviving detectors by strict-majority vote and report its
+   detection rate too.
 
 **``synthetic``** — supervised evaluation against injected anomalies. The
 configured injection variant (default ``combined``: a per-segment mix of
@@ -995,32 +995,6 @@ def _run_detectors(
         if manager is not None:
             manager.shutdown()
     return results
-
-
-def macro_detection_rate(result: dict[str, object]) -> float:
-    """Mean per-case detection rate of one detector's ``per_case`` results."""
-    per_case = result["per_case"]
-    if not per_case:
-        return float("nan")
-    return _finite_mean([entry["metrics"]["detection_rate"] for entry in per_case])
-
-
-def split_by_detection_rate(
-    detector_results: dict[str, dict[str, object]],
-    max_detection_rate: float,
-) -> tuple[list[str], list[str]]:
-    """Legacy global split retained for historical artifact/tests compatibility.
-
-    A detector is discarded when its macro detection rate exceeds
-    ``max_detection_rate``: sensor faults are rare, so flagging more than the
-    budget means the detector is marking normal variation as anomalous.
-    """
-    kept: list[str] = []
-    discarded: list[str] = []
-    for name in detector_results:
-        rate = macro_detection_rate(detector_results[name])
-        (discarded if rate > max_detection_rate else kept).append(name)
-    return sorted(kept), sorted(discarded)
 
 
 def _selection_by_series(
