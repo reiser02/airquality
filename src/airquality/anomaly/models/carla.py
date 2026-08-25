@@ -779,17 +779,16 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         self,
         loader: DataLoader,
         model: ContrastiveModel,
-        ts_repository: TSRepository,
+        ts_repository: TSRepository | None,
         *,
         real_aug: bool = False,
         ts_repository_aug: TSRepository | None = None,
     ) -> RepositoryAugmentedDataset | None:
         model.eval()
-        ts_repository.reset()
+        if ts_repository is not None:
+            ts_repository.reset()
         if ts_repository_aug is not None:
             ts_repository_aug.reset()
-        if real_aug:
-            ts_repository.resize(3)
         # Collect per-batch pieces and concatenate once at the end: repeated
         # `torch.cat` on the accumulator copies everything gathered so far on
         # every batch (quadratic time and memory churn).
@@ -800,22 +799,20 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
                 ts_org = batch["ts_org"].float().to(self.device)
                 targets = batch["target"].to(self.device)
                 outputs = model(ts_org.transpose(1, 2))
-                ts_repository.update(outputs, targets)
+                if ts_repository is not None:
+                    ts_repository.update(outputs, targets)
                 if ts_repository_aug is not None:
                     ts_repository_aug.update(outputs, targets)
                 if real_aug:
                     con_data_parts.append(ts_org.cpu())
                     con_target_parts.append(targets.cpu())
-                    ts_w_augment = batch["ts_w_augment"].float().to(self.device)
-                    weak_targets = torch.full((ts_w_augment.shape[0],), 2, dtype=torch.long, device=self.device)
-                    weak_outputs = model(ts_w_augment.transpose(1, 2))
-                    ts_repository.update(weak_outputs, weak_targets)
                     ts_ss_augment = batch["ts_ss_augment"].float().to(self.device)
                     subseq_targets = torch.full((ts_ss_augment.shape[0],), 4, dtype=torch.long, device=self.device)
                     con_data_parts.append(ts_ss_augment.cpu())
                     con_target_parts.append(subseq_targets.cpu())
                     subseq_outputs = model(ts_ss_augment.transpose(1, 2))
-                    ts_repository.update(subseq_outputs, subseq_targets)
+                    if ts_repository is not None:
+                        ts_repository.update(subseq_outputs, subseq_targets)
                     if ts_repository_aug is not None:
                         ts_repository_aug.update(subseq_outputs, subseq_targets)
         if real_aug:
@@ -838,12 +835,11 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
         # Repositories stay on CPU: `update()` stores detached CPU copies and
         # neighbor mining runs in NumPy, so device residency only wasted VRAM
         # and transfers.
-        repository_base = TSRepository(len(pretext_dataset), self.features_dim, self.num_clusters, self.temperature)
         repository_aug = TSRepository(len(pretext_dataset) * 2, self.features_dim, self.num_clusters, self.temperature)
         repo_dataset = self._fill_ts_repository(
             base_loader,
             self.pretext_model,
-            repository_base,
+            None,
             real_aug=True,
             ts_repository_aug=repository_aug,
         )
