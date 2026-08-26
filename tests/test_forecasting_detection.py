@@ -111,10 +111,10 @@ def test_injection_vote_abstains_when_fewer_models_available():
 
     result = strategy.detect(context)
 
-    assert result.detectors == ["A"]
+    assert result.detectors == []
     assert not result.mask.any()
     assert not result.scored_mask.any()
-    assert result.selected_by_segment == [["A"]]
+    assert result.selected_by_segment == [[]]
     assert result.n_unscored == n
 
 
@@ -159,6 +159,64 @@ def test_injection_vote_abstains_pointwise_without_quorum():
     assert not result.scored_mask.iloc[:20].any()
     assert result.scored_mask.iloc[20:].all()
     assert list(np.flatnonzero(result.mask.to_numpy())) == [20]
+
+
+def test_injection_vote_backfills_partial_top_ranked_scores_pointwise():
+    n = 30
+    scores = {
+        "A": _spike_scores(n, [5]),
+        "B": _spike_scores(n, [10]),
+        "C": _spike_scores(n, [15]),
+        "D": _spike_scores(n, [5]),
+        "E": _spike_scores(n, [5]),
+    }
+    scores["B"][5] = np.nan
+    scores["C"][5] = np.nan
+    context = _StubContext(
+        n=n,
+        scores_by_model=scores,
+        ranking={name: 1.0 - index / 10.0 for index, name in enumerate(scores)},
+    )
+
+    result = InjectionTopKDetection(
+        name="inject-vote", top_k=3, min_votes=2
+    ).detect(context)
+
+    # At position 5, D and E replace the non-finite B and C scores. The
+    # selected detector list is the union of pointwise candidates.
+    assert result.selected_by_segment == [["A", "B", "C", "D", "E"]]
+    assert result.detectors == ["A", "B", "C", "D", "E"]
+    assert result.scored_mask.iloc[5]
+    assert result.mask.iloc[5]
+    assert result.n_unscored == 0
+
+
+def test_injection_vote_uses_configured_quorum_with_pointwise_backfill():
+    n = 30
+    scores = {
+        "A": _spike_scores(n, [5]),
+        "B": _spike_scores(n, [5]),
+        "C": _spike_scores(n, [10]),
+        "D": _spike_scores(n, [15]),
+        "E": _spike_scores(n, [5]),
+    }
+    scores["C"][5] = np.nan
+    scores["D"][5] = np.nan
+    context = _StubContext(
+        n=n,
+        scores_by_model=scores,
+        ranking={name: 1.0 - index / 10.0 for index, name in enumerate(scores)},
+    )
+
+    result = InjectionTopKDetection(
+        name="inject-vote", top_k=4, min_votes=3
+    ).detect(context)
+
+    # With a 3-of-4 quorum, E is the pointwise fallback for C/D at position 5.
+    assert result.selected_by_segment == [["A", "B", "C", "D", "E"]]
+    assert result.scored_mask.iloc[5]
+    assert result.mask.iloc[5]
+    assert result.n_unscored == 0
 
 
 # --------------------------------------------------------------------------- #

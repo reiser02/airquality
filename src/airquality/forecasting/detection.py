@@ -15,9 +15,9 @@ anomaly mask, so strategies share detector fits instead of refitting per arm:
   into a copy of the training segments, rank every detector by VUS-PR against
   the injection labels, and keep the single best detector's MAD-thresholded
   mask on the real series.
-- ``inject-vote`` (``top_k=3, min_votes=2``): rank long blocks locally (short
-  blocks inherit the station mean), backfill detectors that cannot score a
-  block, and flag points where at least 2 selected masks agree.
+- ``inject-vote`` (``top_k=3, min_votes=2`` by default): rank long blocks
+  locally (short blocks inherit the station mean), backfill non-finite scores
+  point by point, and flag points where the configured quorum agrees.
 
 The injected copies are used ONLY to select detectors; the final mask always
 comes from scores on the real (uninjected) series.
@@ -44,7 +44,7 @@ from airquality.anomaly.anomalies import (
     inject_synthetic_anomaly_segments,
     normalize_injection_variant,
 )
-from airquality.anomaly.ensemble import rank_top_k
+from airquality.anomaly.ensemble import rank_top_k, ranked_pointwise_vote
 from airquality.anomaly.metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
@@ -582,10 +582,11 @@ class InjectionTopKDetection:
     """Detectors selected by injection VUS-PR; masks combined by vote.
 
     ``top_k=1`` keeps the single best detector's MAD-thresholded mask. With
-    ``top_k > 1`` each selected detector's real scores are binarized
-    independently (same MAD rule per segment) and a point is flagged when at
-    least ``min_votes`` masks agree. Segments with fewer available detectors
-    than ``min_votes`` are unscored rather than silently treated as normal.
+    ``top_k > 1`` each candidate detector's real scores are binarized
+    independently (same MAD rule per segment). For ``inject-vote``, the first
+    ``top_k`` finite scores at each timestamp are voted and lower-ranked
+    detectors backfill missing scores. Points with fewer than ``min_votes``
+    finite candidates are unscored rather than silently treated as normal.
     """
 
     name: str = STRATEGY_INJECT_BEST
@@ -630,6 +631,30 @@ class InjectionTopKDetection:
                 if name in scores_by_model
                 and scores_by_model[name][segment_index] is not None
             ]
+
+            if self.name == STRATEGY_INJECT_VOTE:
+                if eligible:
+                    fused, supported, selected = ranked_pointwise_vote(
+                        {
+                            name: scores_by_model[name][segment_index]
+                            for name in eligible
+                        },
+                        eligible,
+                        top_k=self.top_k,
+                        min_votes=self.min_votes,
+                        threshold_k=self.threshold_k,
+                    )
+                else:
+                    fused = np.zeros(len(segment), dtype=np.float32)
+                    supported = np.zeros(len(segment), dtype=bool)
+                    selected = []
+                selected_by_segment.append(selected)
+                selected_set.update(selected)
+                mask.loc[segment.index] = fused.astype(bool)
+                scored_mask.loc[segment.index] = supported
+                n_flagged += int(fused.astype(bool).sum())
+                continue
+
             selected = eligible[: self.top_k]
             selected_by_segment.append(selected)
             selected_set.update(selected)
