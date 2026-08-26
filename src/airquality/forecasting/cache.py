@@ -49,8 +49,9 @@ import pandas as pd
 #: TSB-AD Sub_PCA, full-window Hampel, and timestamp-aware Prophet. v14: CARLA
 #: training stride is an explicit forecasting configuration. v15: centered
 #: Hampel uses an odd effective window for even nominal hourly spans. v16:
-#: common holdout support ignores abstentions and raw+frozen is a source arm.
-CACHE_VERSION = 16
+#: common holdout support ignores abstentions and raw+frozen is a source arm. v17:
+#: inject-vote uses ranked pointwise backfill with its configured quorum.
+CACHE_VERSION = 17
 
 
 def series_fingerprint(series: pd.Series) -> str:

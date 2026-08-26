@@ -5,8 +5,8 @@ so :class:`airquality.forecasting.detection.ConsensusDetection` combines every
 detector that survives the detection-rate filter. In ``synthetic`` mode detectors
 are ranked by selection-injection VUS-PR: long
 segments use local rankings and short segments inherit the station ranking. At
-each point, the first three ranked detectors with a finite score vote; later
-detectors backfill missing scores and at least two votes are required.
+each point, the first ``top_k`` ranked detectors with a finite score vote; later
+detectors backfill missing scores and at least ``min_votes`` votes are required.
 """
 
 from __future__ import annotations
@@ -40,11 +40,12 @@ def ranked_pointwise_vote(
     ranking: list[str],
     *,
     top_k: int = DEFAULT_TOP_K,
+    min_votes: int = 2,
     threshold_k: float = DEFAULT_THRESHOLD_K,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Vote pointwise with ranked backfill; return mask, support, and used models."""
-    if top_k not in (2, 3):
-        raise ValueError("top_k must be 2 or 3")
+    """Vote pointwise with ranked backfill and a configurable quorum."""
+    if top_k < 1 or min_votes < 1 or min_votes > top_k:
+        raise ValueError("min_votes must be between 1 and top_k")
     if not ranking:
         return np.array([], dtype=np.float32), np.array([], dtype=bool), []
 
@@ -63,10 +64,12 @@ def ranked_pointwise_vote(
         selected = [
             name for name in ranking if np.isfinite(arrays[name][point])
         ][:top_k]
-        if len(selected) < 2:
+        if len(selected) < min_votes:
             continue
         used.update(selected)
         supported[point] = True
-        fused[point] = float(sum(bool(masks[name][point]) for name in selected) >= 2)
+        fused[point] = float(
+            sum(bool(masks[name][point]) for name in selected) >= min_votes
+        )
 
     return fused, supported, [name for name in ranking if name in used]

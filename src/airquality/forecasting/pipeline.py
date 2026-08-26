@@ -16,8 +16,9 @@ long (48 h, stride 24 h) regimes:
 
 Detection strategies (:mod:`airquality.forecasting.detection`): ``unlabeled``
 (rate-filtered consensus, the production method), ``inject-best`` (single best
-detector by VUS-PR on a synthetic-injection copy) and ``inject-vote`` (top-3
-by injection VUS-PR, 2-of-3 mask vote). Detector fits are shared across
+detector by VUS-PR on a synthetic-injection copy) and ``inject-vote`` (top-k
+by injection VUS-PR with a configurable quorum, defaulting to 2-of-3). Detector
+fits are shared across
 strategies through a per-series :class:`~airquality.forecasting.detection.SeriesDetectionContext`,
 and every strategy's mask can be post-processed through ``mask_transforms``
 hooks before removal.
