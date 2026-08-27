@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import airquality.forecasting.backtest as backtest_module
 import airquality.forecasting.fill as fill
 import airquality.forecasting.pipeline as cp
 from darts import TimeSeries
@@ -315,7 +316,8 @@ def test_backtest_forecast_returns_finite_metrics():
         forecast_stride=2,
     )
     assert res["n_test_predictions"] > 0
-    assert np.isfinite(res["rmse"]) and np.isfinite(res["mae"])
+    assert np.isfinite(res["_rmse"]) and np.isfinite(res["_mae"])
+    assert np.isfinite(res["mase"]) and np.isfinite(res["rmsse"])
     assert res["n_forecasts"] > 1
     assert res["n_test_predictions"] > res["n_unique_targets"]
 
@@ -375,9 +377,8 @@ def test_train_val_split_returns_none_when_no_block_fits():
     assert split_train_val_subseries(short, input_chunk=72, size_k=5) is None
 
 
-def test_backtest_forecast_mase_uses_shared_insample():
-    # MASE = MAE / naive-MAE(insample): doubling the insample amplitude doubles
-    # the denominator, so the reported MASE halves while RMSE/MAE stay put.
+def test_backtest_forecast_scaled_metrics_scale_with_reference_amplitude():
+    # Changing the reference affects only the scaled metrics, not pooled errors.
     series = _seasonal_series(n=600, seed=5)
     series.iloc[200:240] = np.nan
     window = select_holdout_window(
@@ -389,19 +390,94 @@ def test_backtest_forecast_mase_uses_shared_insample():
     )
     train = series.loc[window["train_index"]]
     test_series = series.loc[window["test_index"]]
+    reference = series.loc[: window["test_target_end"]]
     kwargs = dict(
         size_k=5,
         test_target_start=window["test_target_start"],
         seasonality_m=24,
+        reference_insample=reference,
     )
 
     res_own = backtest_forecast(train, test_series, "LinearRegression", **kwargs)
     res_shared = backtest_forecast(
-        train, test_series, "LinearRegression", **kwargs, mase_insample=train * 2.0
+        train,
+        test_series,
+        "LinearRegression",
+        **{**kwargs, "reference_insample": reference * 2.0},
     )
 
-    assert res_shared["rmse"] == pytest.approx(res_own["rmse"])
+    assert res_shared["_mae"] == pytest.approx(res_own["_mae"])
+    assert res_shared["_rmse"] == pytest.approx(res_own["_rmse"])
+    assert res_shared["rmsse"] == pytest.approx(res_own["rmsse"] / 2.0, rel=1e-6)
     assert res_shared["mase"] == pytest.approx(res_own["mase"] / 2.0, rel=1e-6)
+
+
+def test_backtest_scaled_metrics_use_raw_history_before_each_origin(monkeypatch):
+    series = _seasonal_series(n=600, seed=11)
+    window = select_holdout_window(
+        series,
+        holdout=40,
+        context_len=72,
+        train_min_len=77,
+        validation_len=48,
+    )
+    train = series.loc[window["train_index"]]
+    test_series = series.loc[window["test_index"]]
+    reference = series.loc[: window["test_target_end"]]
+    seen_mase: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    seen_rmsse: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+
+    def record_seen(seen):
+        def metric(actual, _pred, insample, *, seasonality_m):
+            del seasonality_m
+            seen.append((actual.start_time(), insample.index[-1]))
+            return float(len(insample))
+
+        return metric
+
+    monkeypatch.setattr(backtest_module, "compute_mase", record_seen(seen_mase))
+    monkeypatch.setattr(backtest_module, "compute_rmsse", record_seen(seen_rmsse))
+
+    result = backtest_forecast(
+        train,
+        test_series,
+        "LinearRegression",
+        size_k=5,
+        test_target_start=window["test_target_start"],
+        seasonality_m=24,
+        forecast_stride=2,
+        reference_insample=reference,
+    )
+
+    assert result["n_forecasts"] > 1
+    assert seen_mase == seen_rmsse
+    assert all(
+        reference_end == origin - pd.Timedelta(hours=1)
+        for origin, reference_end in seen_mase
+    )
+    assert all(
+        reference_end < origin and reference_end in reference.index
+        for origin, reference_end in seen_mase
+    )
+    assert [reference_end for _, reference_end in seen_mase] == sorted(
+        reference_end for _, reference_end in seen_mase
+    )
+
+
+def test_darts_error_metrics_pool_overlapping_forecasts():
+    from darts.metrics import mae, rmse
+    from airquality.forecasting.backtest import _darts_error_metrics
+
+    actual_values = np.array([1.0, 3.0, 5.0, 7.0, 9.0])
+    predicted_values = np.array([2.0, 1.0, 6.0, 5.0, 12.0])
+    index = pd.RangeIndex(len(actual_values))
+    actual = TimeSeries.from_times_and_values(index, actual_values)
+    predicted = TimeSeries.from_times_and_values(index, predicted_values)
+
+    got_mae, got_rmse = _darts_error_metrics(actual_values, predicted_values)
+
+    assert got_mae == pytest.approx(float(mae(actual, predicted)))
+    assert got_rmse == pytest.approx(float(rmse(actual, predicted)))
 
 
 # --------------------------------------------------------------------------- #
@@ -441,7 +517,10 @@ def test_build_arms_expands_strategies_and_imputation_variants():
 
 def test_only_complete_backtests_are_cacheable():
     complete = {
-        "rmse": 1.0,
+        "_mae": 1.0,
+        "_rmse": 1.0,
+        "mase": 1.0,
+        "rmsse": 1.0,
         "n_test_predictions": 16,
         "n_forecasts": 2,
         "n_expected_forecasts": 2,
@@ -449,7 +528,72 @@ def test_only_complete_backtests_are_cacheable():
 
     assert cp._cacheable_backtest(complete)
     assert not cp._cacheable_backtest({**complete, "n_forecasts": 1})
-    assert not cp._cacheable_backtest({**complete, "rmse": float("nan")})
+    assert not cp._cacheable_backtest({**complete, "_rmse": float("nan")})
+
+
+def test_relative_metrics_pair_each_arm_with_matching_raw_result():
+    rows = [
+        {
+            "series": "ST0",
+            "regime": "short",
+            "model": "NLinear",
+            "arm": "raw+frozen",
+            "_mae": 1.5,
+            "_rmse": 3.0,
+        },
+        {
+            "series": "ST0",
+            "regime": "short",
+            "model": "NLinear",
+            "arm": "raw",
+            "_mae": 2.0,
+            "_rmse": 4.0,
+        },
+        {
+            "series": "ST0",
+            "regime": "short",
+            "model": "LinearRegression",
+            "arm": "raw",
+            "_mae": 5.0,
+            "_rmse": 10.0,
+        },
+    ]
+
+    cp._apply_raw_relative_metrics(rows)
+
+    frozen = rows[0]
+    assert frozen["relmae"] == pytest.approx(0.75)
+    assert frozen["relrmse"] == pytest.approx(0.75)
+    assert rows[1]["relmae"] == pytest.approx(1.0)
+    assert rows[1]["relrmse"] == pytest.approx(1.0)
+    assert rows[2]["relmae"] == pytest.approx(1.0)
+    assert rows[2]["relrmse"] == pytest.approx(1.0)
+
+
+def test_relative_metrics_are_nan_when_pooled_raw_error_is_zero():
+    rows = [
+        {
+            "series": "ST0",
+            "regime": "short",
+            "model": "NLinear",
+            "arm": "raw",
+            "_mae": 0.0,
+            "_rmse": 0.0,
+        },
+        {
+            "series": "ST0",
+            "regime": "short",
+            "model": "NLinear",
+            "arm": "unlabeled+impute",
+            "_mae": 1.0,
+            "_rmse": 2.0,
+        },
+    ]
+
+    cp._apply_raw_relative_metrics(rows)
+
+    assert np.isnan(rows[1]["relmae"])
+    assert np.isnan(rows[1]["relrmse"])
 
 
 def test_resolve_forecasting_devices_uses_visible_gpus_and_cpu_fallback(
@@ -473,7 +617,7 @@ def test_gpu_worker_preserves_train_and_inference_timings(monkeypatch):
     task = cp._BacktestTask(
         train_series=series.iloc[:80],
         test_series=series.iloc[80:],
-        mase_insample=series.iloc[:80],
+        reference_insample=series.iloc[:80],
         model_name="TiDE",
         size_k=8,
         test_target_start=series.index[88],
@@ -493,11 +637,16 @@ def test_gpu_worker_preserves_train_and_inference_timings(monkeypatch):
 
     expected = {"train_seconds": 1.25, "inference_seconds": 0.5}
     monkeypatch.setattr(cp, "resolve_forecasting_model_configs", fake_configs)
-    monkeypatch.setattr(cp, "backtest_forecast", lambda *args, **kwargs: expected)
+    def fake_backtest(*args, **kwargs):
+        seen["reference_insample"] = kwargs["reference_insample"].copy()
+        return expected
+
+    monkeypatch.setattr(cp, "backtest_forecast", fake_backtest)
     released = []
     monkeypatch.setattr(cp, "_release_cuda_memory", lambda: released.append(True))
 
     assert cp._run_gpu_backtest(task) is expected
+    pd.testing.assert_series_equal(seen["reference_insample"], task.reference_insample)
     assert seen["accelerator"] == "gpu"
     assert seen["devices"] == [1]
     assert released == [True]
@@ -582,8 +731,10 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
         stride = kwargs["forecast_stride"]
         n_forecasts = (96 - horizon) // stride + 1
         return {
-            "rmse": 1.0,
+            "_mae": 1.0,
+            "_rmse": 1.0,
             "mase": 1.0,
+            "rmsse": 1.0,
             "n_test_predictions": n_forecasts * horizon,
             "n_forecasts": n_forecasts,
             "n_unique_targets": 96,
@@ -633,13 +784,15 @@ def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
     seen: list[tuple[pd.Series, pd.Series, pd.Series]] = []
 
     def fake_backtest(train, test, _model, **kwargs):
-        seen.append((train.copy(), test.copy(), kwargs["mase_insample"].copy()))
+        seen.append((train.copy(), test.copy(), kwargs["reference_insample"].copy()))
         horizon = kwargs["size_k"]
         stride = kwargs["forecast_stride"]
         n_forecasts = (96 - horizon) // stride + 1
         return {
-            "rmse": float(test.loc[kwargs["test_target_start"] :].mean()),
+            "_mae": float(test.loc[kwargs["test_target_start"] :].mean()),
+            "_rmse": float(test.loc[kwargs["test_target_start"] :].mean()),
             "mase": 1.0,
+            "rmsse": 1.0,
             "n_test_predictions": n_forecasts * horizon,
             "n_forecasts": n_forecasts,
             "n_expected_forecasts": n_forecasts,
@@ -669,7 +822,7 @@ def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
     artifacts = cp.run_benchmark_from_config()
 
     assert set(artifacts["results_df"]["arm"]) == {"raw", "raw+frozen"}
-    assert artifacts["results_df"].groupby("arm")["rmse"].mean().nunique() == 2
+    assert artifacts["results_df"].groupby("arm")["relrmse"].mean().nunique() == 2
     assert len(seen) == 4
     for raw_call, frozen_call in ((seen[0], seen[1]), (seen[2], seen[3])):
         raw_train, raw_test, raw_mase = raw_call
@@ -677,6 +830,10 @@ def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
         assert frozen_train.notna().sum() > raw_train.notna().sum()
         assert raw_test.index.equals(frozen_test.index)
         assert not raw_test.equals(frozen_test)
+        pd.testing.assert_series_equal(
+            raw_mase,
+            primary.loc[: raw_test.index[-1]],
+        )
         pd.testing.assert_series_equal(raw_mase, frozen_mase)
         assert raw_train.index.max() < raw_test.index[72]
         assert frozen_train.index.max() < frozen_test.index[72]
@@ -741,13 +898,28 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     assert (raw_rows["strategy"] == "none").all() and (~raw_rows["imputed"]).all()
     imputed_rows = results_df[results_df["imputed"]]
     assert set(imputed_rows["imputation_model"]) == {"interp"}
-    # Metrics are the scale-free pair: scaled RMSE (+ its scale_ref) and MASE.
-    assert "mae" not in results_df.columns
-    assert (results_df["scale_ref"] > 0).all()
+    # The public forecasting metric contract contains only scaled and relative metrics.
+    assert set(results_df.columns) >= {"rmsse", "mase", "relmae", "relrmse"}
+    assert not {
+        "mae",
+        "rmse",
+        "_mae",
+        "_rmse",
+        "scale_ref",
+        "origin_mae_mean",
+        "origin_mae_std",
+        "origin_rmse_mean",
+        "origin_rmse_std",
+    } & set(results_df.columns)
     assert set(results_df["regime"]) == {"short", "long"}
     trainable = ~results_df["arm"].str.endswith("+noimpute")
-    assert np.isfinite(results_df.loc[trainable, "rmse"]).all()
+    assert np.isfinite(results_df.loc[trainable, "rmsse"]).all()
     assert np.isfinite(results_df.loc[trainable, "mase"]).all()
+    assert np.isfinite(results_df.loc[trainable, "relmae"]).all()
+    assert np.isfinite(results_df.loc[trainable, "relrmse"]).all()
+    raw_rows = results_df[results_df["arm"] == "raw"]
+    assert np.allclose(raw_rows["relmae"], 1.0)
+    assert np.allclose(raw_rows["relrmse"], 1.0)
     for regime, horizon, stride in (("short", 8, 4), ("long", 48, 24)):
         subset = results_df.loc[(results_df["regime"] == regime) & trainable]
         assert (subset["horizon"] == horizon).all()
@@ -774,11 +946,11 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     assert "cache=off" in progress_log
     assert "[run] done" in progress_log
     for col in (
-        "rmse_raw",
-        "rmse_raw+frozen",
-        "rmse_unlabeled+impute",
-        "rmse_unlabeled+impute_delta",
-        "rmse_unlabeled+impute_improve_pct",
+        "rmsse_raw",
+        "mase_raw+frozen",
+        "relmae_unlabeled+impute",
+        "relmae_unlabeled+impute_delta",
+        "relrmse_unlabeled+impute_improve_pct",
         "mase_inject-vote+noimpute_delta",
     ):
         assert col in summary_df.columns
@@ -900,8 +1072,10 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
         cp,
         "_run_gpu_backtest",
         lambda task: {
-            "rmse": 1.0,
+            "_mae": 1.0,
+            "_rmse": 1.0,
             "mase": 1.0,
+            "rmsse": 1.0,
             "train_seconds": 1.25,
             "inference_seconds": 0.5,
             "n_test_predictions": task.size_k,
@@ -974,10 +1148,10 @@ def test_run_benchmark_closes_gpu_resources_on_failure(monkeypatch):
     assert cp._ACTIVE_DEVICE_QUEUE is None
 
 
-def test_backtest_mase_matches_mae_over_seasonal_naive_denominator():
+def test_backtest_scaled_metrics_match_darts_denominators():
     from darts import TimeSeries
-    from darts.metrics import mae
-    from airquality.metrics import compute_mase
+    from darts.metrics import mae, mase, rmsse
+    from airquality.metrics import compute_mase, compute_rmsse
 
     rng = np.random.default_rng(13)
     n = 400
@@ -996,14 +1170,27 @@ def test_backtest_mase_matches_mae_over_seasonal_naive_denominator():
         pd.Series(actual_vals + rng.normal(0, 0.7, 48), index=hold_idx), freq="h"
     )
 
-    # MASE equals MAE over the in-sample seasonal-naive MAE computed on the
-    # interpolated training history.
+    # The wrappers use the interpolated training history and the native Darts
+    # scaled metrics on a contiguous synthetic index.
     filled = insample.interpolate(method="time", limit_direction="both").ffill().bfill()
     values = filled.to_numpy(dtype=float)
-    denominator = float(np.mean(np.abs(values[24:] - values[:-24])))
+    insample_ts = TimeSeries.from_times_and_values(pd.RangeIndex(n), values)
+    eval_index = pd.RangeIndex(n, n + len(actual_vals))
+    actual_ts = TimeSeries.from_times_and_values(eval_index, actual_vals)
+    pred_ts = TimeSeries.from_times_and_values(
+        eval_index, pred.to_series().to_numpy(dtype=float)
+    )
 
-    out = compute_mase(actual, pred, insample, seasonality_m=24)
-    assert out == pytest.approx(float(mae(actual, pred)) / denominator, rel=1e-9)
+    mase_out = compute_mase(actual, pred, insample, seasonality_m=24)
+    rmsse_out = compute_rmsse(actual, pred, insample, seasonality_m=24)
+    assert mase_out == pytest.approx(
+        float(mase(actual_ts, pred_ts, insample_ts, m=24)), rel=1e-9
+    )
+    assert rmsse_out == pytest.approx(
+        float(rmsse(actual_ts, pred_ts, insample_ts, m=24)), rel=1e-9
+    )
+
+    assert float(mae(actual_ts, pred_ts)) > 0.0
 
 
 def test_backtest_mase_returns_nan_when_history_is_too_short():
@@ -1017,4 +1204,18 @@ def test_backtest_mase_returns_nan_when_history_is_too_short():
     ts = TimeSeries.from_series(pd.Series([1.0, 2.0, 3.0, 4.0], index=hold_idx), freq="h")
 
     out = compute_mase(ts, ts, insample, seasonality_m=24)
+    assert np.isnan(out)
+
+
+def test_backtest_rmsse_returns_nan_when_history_is_too_short():
+    from darts import TimeSeries
+
+    from airquality.metrics import compute_rmsse
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="h")
+    insample = pd.Series(np.arange(10, dtype=float), index=idx, name="S")
+    hold_idx = pd.date_range(idx[-1] + pd.Timedelta(hours=1), periods=4, freq="h")
+    ts = TimeSeries.from_series(pd.Series([1.0, 2.0, 3.0, 4.0], index=hold_idx), freq="h")
+
+    out = compute_rmsse(ts, ts, insample, seasonality_m=24)
     assert np.isnan(out)

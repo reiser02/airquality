@@ -138,20 +138,10 @@ RAW_FROZEN_ARM = "raw+frozen"
 RAW_SOURCE_ARMS = (RAW_ARM, RAW_FROZEN_ARM)
 DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote")
 IMPUTATION_CHOICES = ("both", "impute", "none")
-#: The benchmark's reported metrics, both scale-free so they compare across
-#: series of different levels and across arms:
-#:
-#: - ``rmse``: RMSE in raw units divided by ``scale_ref`` (std of the RAW
-#:   observed training series) — i.e. the RMSE on standardized data.
-#: - ``mase``: the scaled MAE — the existing darts MASE (MAE over the
-#:   seasonal-naive MAE of the training history), computed for EVERY arm
-#:   against the RAW training history.
-#:
-#: Both scale references are per series and shared by every arm; per-arm
-#: scaling would bias the comparison (cleaning removes spikes, shrinking that
-#: arm's std / naive error and inflating its scaled metric). Multiply ``rmse``
-#: by the persisted ``scale_ref`` column to recover raw units.
-METRIC_COLS = ("rmse", "mase")
+#: Public forecasting metrics. ``mase`` and ``rmsse`` use the primary raw
+#: history available before each origin; the relative metrics compare each arm
+#: with its matching ``raw`` result for the same series, regime and model.
+METRIC_COLS = ("rmsse", "mase", "relmae", "relrmse")
 PROGRESS_LOGGER = get_progress_logger()
 _ACTIVE_PROGRESS: BenchmarkProgress | None = None
 _ACTIVE_GPU_EXECUTOR: ProcessPoolExecutor | None = None
@@ -164,10 +154,9 @@ RESULT_COLUMNS = (
     "detection_scope", "split_basis", "split_n_flagged", "split_n_unscored",
     "test_context_start", "test_target_start", "test_target_end",
     "test_target_hours", "model",
-    "model_mode", "rmse", "mase", "train_seconds", "inference_seconds",
-    "scale_ref", "n_test_predictions", "n_forecasts", "n_expected_forecasts",
-    "n_unique_targets", "origin_mae_mean", "origin_mae_std",
-    "origin_rmse_mean", "origin_rmse_std",
+    "model_mode", "rmsse", "mase", "relmae", "relrmse", "train_seconds",
+    "inference_seconds", "n_test_predictions", "n_forecasts",
+    "n_expected_forecasts", "n_unique_targets",
 )
 
 SELECTION_COLUMNS = (
@@ -182,8 +171,8 @@ FOUNDATION_PREPROCESSING_COLUMNS = (
     "series", "regime", "horizon", "model", "case_id", "anomaly_type",
     "test_seed", "test_target_start", "condition", "detectors", "n_injected",
     "n_context_flagged", "n_injected_detected", "n_context_nan",
-    "imputation_applied", "imputation_model", "n_imputed", "rmse", "mase",
-    "model_load_seconds", "inference_seconds", "scale_ref",
+    "imputation_applied", "imputation_model", "n_imputed", "mase", "rmsse",
+    "model_load_seconds", "inference_seconds",
     "n_test_predictions", "failure_reason",
 )
 
@@ -250,7 +239,7 @@ class _BacktestTask:
 
     train_series: pd.Series
     test_series: pd.Series
-    mase_insample: pd.Series
+    reference_insample: pd.Series
     model_name: str
     size_k: int
     test_target_start: pd.Timestamp
@@ -344,7 +333,7 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
             test_target_start=task.test_target_start,
             seasonality_m=task.seasonality_m,
             freq=task.freq,
-            mase_insample=task.mase_insample,
+            reference_insample=task.reference_insample,
             validation_len=task.validation_len,
             validation_stride=task.validation_stride,
             forecast_stride=task.forecast_stride,
@@ -514,7 +503,7 @@ def _format_ranking(ranking: dict[str, float]) -> str:
 def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.DataFrame:
     """Pivot per-(series, model) metrics into arm columns with deltas vs the baseline.
 
-    For every metric (scaled RMSE/MAE, see :data:`METRIC_COLS`) and non-baseline
+    For every metric (see :data:`METRIC_COLS`) and non-baseline
     arm the summary adds ``_delta`` (arm − baseline; negative = arm better) and
     ``_improve_pct`` (positive = arm better) columns, so each preprocessing path
     is read directly against ``raw``.
@@ -550,6 +539,35 @@ def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def _apply_raw_relative_metrics(rows: list[dict[str, Any]]) -> None:
+    """Add arm errors relative to the matching raw backtest row."""
+    raw_by_key = {
+        (row.get("series"), row.get("regime"), row.get("model")): row
+        for row in rows
+        if row.get("arm") == RAW_ARM
+    }
+    for row in rows:
+        raw = raw_by_key.get((row.get("series"), row.get("regime"), row.get("model")))
+        if raw is None:
+            row["relmae"] = float("nan")
+            row["relrmse"] = float("nan")
+            continue
+        if row.get("arm") == RAW_ARM:
+            row["relmae"] = 1.0
+            row["relrmse"] = 1.0
+            continue
+        for metric, relative in (("_mae", "relmae"), ("_rmse", "relrmse")):
+            numerator = float(row.get(metric, float("nan")))
+            denominator = float(raw.get(metric, float("nan")))
+            row[relative] = (
+                numerator / denominator
+                if math.isfinite(numerator)
+                and math.isfinite(denominator)
+                and denominator != 0.0
+                else float("nan")
+            )
+
+
 def _cacheable_backtest(result: dict[str, Any]) -> bool:
     """Only persist complete runs; transient failures must be retried."""
     expected = int(result.get("n_expected_forecasts", 0))
@@ -557,7 +575,10 @@ def _cacheable_backtest(result: dict[str, Any]) -> bool:
         expected > 0
         and int(result.get("n_forecasts", 0)) == expected
         and int(result.get("n_test_predictions", 0)) > 0
-        and math.isfinite(float(result.get("rmse", float("nan"))))
+        and all(
+            math.isfinite(float(result.get(metric, float("nan"))))
+            for metric in ("_mae", "_rmse", "mase", "rmsse")
+        )
     )
 
 
@@ -565,8 +586,8 @@ def _cacheable_foundation_test(result: dict[str, Any], horizon: int) -> bool:
     """Persist only complete finite single-origin foundation forecasts."""
     return (
         int(result.get("n_test_predictions", 0)) == horizon
-        and math.isfinite(float(result.get("rmse", float("nan"))))
         and math.isfinite(float(result.get("mase", float("nan"))))
+        and math.isfinite(float(result.get("rmsse", float("nan"))))
     )
 
 
@@ -1120,10 +1141,8 @@ def _run_benchmark_from_config(
             window["test_target_end"],
         )
 
-        # One raw scale and MASE history are shared by every arm.
-        scale_ref = float(train_raw.std())
-        if not math.isfinite(scale_ref) or scale_ref <= 0.0:
-            scale_ref = float("nan")
+        # This reservoir is sliced before each origin for every arm's scaled metrics.
+        raw_reference = series.loc[: window["test_target_end"]]
         train_fp = series_fingerprint(train_raw)
         frozen_train_fp = series_fingerprint(train_frozen)
         support_fp = series_fingerprint(support)
@@ -1186,19 +1205,16 @@ def _run_benchmark_from_config(
                 "model": model_name,
                 "model_mode": model_mode,
                 # Timings are measured inside the worker around fit/predict only.
-                "rmse": result["rmse"] / scale_ref,
+                "_mae": result.get("_mae", float("nan")),
+                "_rmse": result.get("_rmse", float("nan")),
                 "mase": result["mase"],
+                "rmsse": result["rmsse"],
                 "train_seconds": result.get("train_seconds", float("nan")),
                 "inference_seconds": result.get("inference_seconds", float("nan")),
-                "scale_ref": scale_ref,
                 "n_test_predictions": result["n_test_predictions"],
                 "n_forecasts": result.get("n_forecasts", 0),
                 "n_expected_forecasts": result.get("n_expected_forecasts", 0),
                 "n_unique_targets": result.get("n_unique_targets", 0),
-                "origin_mae_mean": result.get("origin_mae_mean", float("nan")),
-                "origin_mae_std": result.get("origin_mae_std", float("nan")),
-                "origin_rmse_mean": result.get("origin_rmse_mean", float("nan")),
-                "origin_rmse_std": result.get("origin_rmse_std", float("nan")),
             }
             backtest_completed += 1
             status = "ok" if _cacheable_backtest(result) else "incomplete"
@@ -1343,7 +1359,7 @@ def _run_benchmark_from_config(
                                 _BacktestTask(
                                     train_series=arm_train,
                                     test_series=arm_test_series,
-                                    mase_insample=train_raw,
+                                    reference_insample=raw_reference,
                                     model_name=model_name,
                                     size_k=regime.horizon,
                                     test_target_start=test_target_start,
@@ -1395,9 +1411,9 @@ def _run_benchmark_from_config(
                             context_len=context_len,
                             cleanup_checkpoints=True,
                             model_config=forecast_model_config,
-                            # Shared raw history: every arm's MASE uses the SAME
-                            # seasonal-naive denominator (see METRIC_COLS).
-                            mase_insample=train_raw,
+                            # Every arm uses the primary raw history available
+                            # before each origin for its seasonal-naive scales.
+                            reference_insample=raw_reference,
                         )
                         if _cacheable_backtest(res):
                             cache.put("backtest", backtest_key, res)
@@ -1630,8 +1646,8 @@ def _run_benchmark_from_config(
                                     )
 
                                 result = {
-                                    "rmse": float("nan"),
                                     "mase": float("nan"),
+                                    "rmsse": float("nan"),
                                     "model_load_seconds": float("nan"),
                                     "inference_seconds": float("nan"),
                                     "n_test_predictions": 0,
@@ -1651,7 +1667,7 @@ def _run_benchmark_from_config(
                                                 scaler,
                                                 context,
                                                 case.target,
-                                                foundation_insample,
+                                                raw_reference,
                                                 seasonality_m=seasonality_m,
                                                 freq=freq,
                                             )
@@ -1679,7 +1695,7 @@ def _run_benchmark_from_config(
                                                         scaler,
                                                         filled,
                                                         case.target,
-                                                        foundation_insample,
+                                                        raw_reference,
                                                         seasonality_m=seasonality_m,
                                                         freq=freq,
                                                     )
@@ -1733,15 +1749,14 @@ def _run_benchmark_from_config(
                                         else "none"
                                     ),
                                     "n_imputed": int(result.get("n_imputed", 0)),
-                                    "rmse": result["rmse"] / scale_ref,
                                     "mase": result["mase"],
+                                    "rmsse": result["rmsse"],
                                     "model_load_seconds": result.get(
                                         "model_load_seconds", float("nan")
                                     ),
                                     "inference_seconds": result.get(
                                         "inference_seconds", float("nan")
                                     ),
-                                    "scale_ref": scale_ref,
                                     "n_test_predictions": result.get(
                                         "n_test_predictions", 0
                                     ),
@@ -1802,6 +1817,7 @@ def _run_benchmark_from_config(
     imputer_ref.clear()
     _release_cuda_memory()
     progress.update(stage="finalizing", detail="building CSV artifacts", pending=0)
+    _apply_raw_relative_metrics(rows)
     PROGRESS_LOGGER.info("[cache] %s", cache.stats())
     for namespace, counts in cache.stats_by_namespace().items():
         PROGRESS_LOGGER.info(

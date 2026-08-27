@@ -21,6 +21,8 @@ import pandas as pd
 
 from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
+from darts.metrics import mae as darts_mae
+from darts.metrics import rmse as darts_rmse
 from darts.utils.missing_values import extract_subseries
 from sklearn.preprocessing import StandardScaler
 
@@ -29,7 +31,7 @@ from airquality.forecasting.registry import (
     ForecastModelConfig,
     resolve_forecasting_model_configs,
 )
-from airquality.metrics import compute_mase
+from airquality.metrics import compute_mase, compute_rmsse
 from airquality.modeling.training import (
     DartsModelSeriesRequirements,
     fit_darts_model,
@@ -310,6 +312,19 @@ def _fit_forecast_model(
     )
 
 
+def _darts_error_metrics(
+    actual_values: np.ndarray,
+    predicted_values: np.ndarray,
+) -> tuple[float, float]:
+    """Compute pooled MAE and RMSE with Darts on positional forecast pairs."""
+    if len(actual_values) != len(predicted_values) or not len(actual_values):
+        return float("nan"), float("nan")
+    index = pd.RangeIndex(len(actual_values))
+    actual = TimeSeries.from_times_and_values(index, actual_values)
+    predicted = TimeSeries.from_times_and_values(index, predicted_values)
+    return float(darts_mae(actual, predicted)), float(darts_rmse(actual, predicted))
+
+
 def prepare_foundation_model(
     train_series: pd.Series,
     model_name: str,
@@ -320,7 +335,7 @@ def prepare_foundation_model(
     context_len: int = 72,
     model_config: ForecastModelConfig | None = None,
 ) -> tuple[object, Scaler, pd.Series, float]:
-    """Load one frozen foundation model and its shared raw-history scaler."""
+    """Load one frozen foundation model and return its training history."""
     if model_config is None:
         model_config = resolve_forecasting_model_configs(
             [model_name],
@@ -366,12 +381,16 @@ def forecast_foundation_context(
     scaler: Scaler,
     context: pd.Series,
     target: pd.Series,
-    mase_insample: pd.Series,
+    reference_insample: pd.Series,
     *,
     seasonality_m: int = 24,
     freq: str = "h",
 ) -> dict[str, float | int]:
-    """Forecast one exact target horizon from one as-of-origin context."""
+    """Forecast one exact target horizon from one as-of-origin context.
+
+    The reference reservoir is truncated before the target origin before its
+    MASE/RMSSE denominators are calculated.
+    """
     context_s = ensure_datetime_series(
         context, freq=freq, name=str(context.name or "series")
     )
@@ -402,17 +421,22 @@ def forecast_foundation_context(
     errors = target_s.to_numpy(dtype=float) - prediction.to_series().to_numpy(dtype=float)
     if not np.isfinite(errors).all():
         raise RuntimeError("El foundation devolvio predicciones no finitas")
-    insample = ensure_datetime_series(
-        mase_insample,
+    reference = ensure_datetime_series(
+        reference_insample,
         freq=freq,
-        name=str(mase_insample.name or context_s.name),
-    )
+        name=str(reference_insample.name or context_s.name),
+    ).loc[lambda values: values.index < target_s.index[0]]
     return {
-        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
         "mase": compute_mase(
             actual,
             prediction,
-            insample,
+            reference,
+            seasonality_m=seasonality_m,
+        ),
+        "rmsse": compute_rmsse(
+            actual,
+            prediction,
+            reference,
             seasonality_m=seasonality_m,
         ),
         "inference_seconds": inference_seconds,
@@ -429,7 +453,7 @@ def backtest_forecast(
     test_target_start: pd.Timestamp,
     seasonality_m: int = 24,
     freq: str = "h",
-    mase_insample: pd.Series | None = None,
+    reference_insample: pd.Series | None = None,
     validation_len: int = 48,
     validation_stride: int | None = None,
     forecast_stride: int | None = None,
@@ -443,19 +467,19 @@ def backtest_forecast(
     subseries for training. Trained global models use the causal validation split
     from :func:`split_train_val_subseries`; local statistical and zero-shot
     foundation models use the latest eligible block without validation.
-    ``test_series`` is the
-    contiguous observed block
-    (context + holdout) shared by both arms. Returns RMSE/MAE/MASE, the model
-    ``train_seconds`` (wall time of the ``fit`` only) and ``inference_seconds``
-    (wall time of ``historical_forecasts`` over the holdout), plus metadata.
+    ``test_series`` is the contiguous observed block (context + holdout) shared
+    by both arms. Returns internal pooled ``_mae``/``_rmse`` values, MASE and
+    RMSSE, the model ``train_seconds`` (wall time of the ``fit`` only) and
+    ``inference_seconds`` (wall time of ``historical_forecasts`` over the
+    holdout), plus metadata.
     Validation origins are explicit minimal windows separated by
     ``validation_stride``; test origins use ``forecast_stride`` and may overlap.
 
-    ``mase_insample`` overrides the in-sample history behind the MASE
-    seasonal-naive denominator (defaults to ``train_series``). When comparing
-    preprocessing arms, pass the shared RAW training series for every arm:
-    cleaning/imputation smooth the history and shrink its naive error, so
-    per-arm denominators would inflate the preprocessed arms' MASE.
+    ``reference_insample`` supplies the reference-series reservoir behind the
+    MASE and RMSSE seasonal-naive denominators. The reservoir is sliced strictly
+    before each forecast origin; when omitted, the train and test source are
+    combined. When comparing preprocessing arms, pass the primary RAW reservoir
+    for every arm so each origin uses the same reference history.
 
     """
     if model_config is None:
@@ -468,19 +492,16 @@ def backtest_forecast(
     result = {
         "model": model_name,
         "model_mode": model_config.mode,
-        "rmse": float("nan"),
-        "mae": float("nan"),
+        "_rmse": float("nan"),
+        "_mae": float("nan"),
         "mase": float("nan"),
+        "rmsse": float("nan"),
         "train_seconds": float("nan"),
         "inference_seconds": float("nan"),
         "n_test_predictions": 0,
         "n_forecasts": 0,
         "n_expected_forecasts": 0,
         "n_unique_targets": 0,
-        "origin_mae_mean": float("nan"),
-        "origin_mae_std": float("nan"),
-        "origin_rmse_mean": float("nan"),
-        "origin_rmse_std": float("nan"),
     }
 
     requirements = get_forecast_model_requirements(
@@ -523,6 +544,16 @@ def backtest_forecast(
 
     test_s = ensure_datetime_series(
         test_series, freq=freq, name=str(test_series.name or "series")
+    )
+    # Keep only the source values available at or before each origin below.
+    reference_s = (
+        pd.concat([train_s, test_s.loc[test_s.index > train_s.index.max()]])
+        if reference_insample is None
+        else ensure_datetime_series(
+            reference_insample,
+            freq=freq,
+            name=str(reference_insample.name or "series"),
+        )
     )
     try:
         test_target_pos = int(test_s.index.get_loc(test_target_start))
@@ -585,16 +616,10 @@ def backtest_forecast(
         return result
     predictions = [scaler.inverse_transform(forecast) for forecast in forecast_list]
 
-    insample = (
-        train_s
-        if mase_insample is None
-        else ensure_datetime_series(mase_insample, freq=freq, name=str(mase_insample.name or "series"))
-    )
     actual_values: list[np.ndarray] = []
     predicted_values: list[np.ndarray] = []
-    origin_mae: list[float] = []
-    origin_rmse: list[float] = []
     origin_mase: list[float] = []
+    origin_rmsse: list[float] = []
     origin_lengths: list[int] = []
     target_times: set[pd.Timestamp] = set()
     for prediction in predictions:
@@ -604,13 +629,19 @@ def backtest_forecast(
             continue
         actual_array = actual.to_series().to_numpy(dtype=float)
         predicted_array = pred.to_series().to_numpy(dtype=float)
-        errors = actual_array - predicted_array
+        insample = reference_s.loc[reference_s.index < actual.start_time()]
         actual_values.append(actual_array)
         predicted_values.append(predicted_array)
-        origin_mae.append(float(np.mean(np.abs(errors))))
-        origin_rmse.append(float(np.sqrt(np.mean(np.square(errors)))))
         origin_mase.append(
             compute_mase(
+                actual,
+                pred,
+                insample,
+                seasonality_m=seasonality_m,
+            )
+        )
+        origin_rmsse.append(
+            compute_rmsse(
                 actual,
                 pred,
                 insample,
@@ -625,9 +656,10 @@ def backtest_forecast(
 
     actual_array = np.concatenate(actual_values)
     predicted_array = np.concatenate(predicted_values)
-    errors = actual_array - predicted_array
-    result["mae"] = float(np.mean(np.abs(errors)))
-    result["rmse"] = float(np.sqrt(np.mean(np.square(errors))))
+    result["_mae"], result["_rmse"] = _darts_error_metrics(
+        actual_array,
+        predicted_array,
+    )
     finite_mase = np.isfinite(origin_mase)
     if np.any(finite_mase):
         result["mase"] = float(
@@ -636,13 +668,17 @@ def backtest_forecast(
                 weights=np.asarray(origin_lengths)[finite_mase],
             )
         )
-    result["n_test_predictions"] = int(len(errors))
-    result["n_forecasts"] = len(origin_mae)
+    finite_rmsse = np.isfinite(origin_rmsse)
+    if np.any(finite_rmsse):
+        result["rmsse"] = float(
+            np.average(
+                np.asarray(origin_rmsse)[finite_rmsse],
+                weights=np.asarray(origin_lengths)[finite_rmsse],
+            )
+        )
+    result["n_test_predictions"] = int(len(actual_array))
+    result["n_forecasts"] = len(actual_values)
     result["n_unique_targets"] = len(target_times)
-    result["origin_mae_mean"] = float(np.mean(origin_mae))
-    result["origin_mae_std"] = float(np.std(origin_mae))
-    result["origin_rmse_mean"] = float(np.mean(origin_rmse))
-    result["origin_rmse_std"] = float(np.std(origin_rmse))
     return result
 
 

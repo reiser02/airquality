@@ -50,8 +50,10 @@ import pandas as pd
 #: training stride is an explicit forecasting configuration. v15: centered
 #: Hampel uses an odd effective window for even nominal hourly spans. v16:
 #: common holdout support ignores abstentions and raw+frozen is a source arm. v17:
-#: inject-vote uses ranked pointwise backfill with its configured quorum.
-CACHE_VERSION = 17
+#: inject-vote uses ranked pointwise backfill with its configured quorum. v18:
+#: forecasting metrics use MASE/RMSSE plus raw-relative MAE/RMSE. v19: scaled
+#: metrics use the primary raw history available before each forecast origin.
+CACHE_VERSION = 19
 
 
 def series_fingerprint(series: pd.Series) -> str:
