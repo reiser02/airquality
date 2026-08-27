@@ -6,25 +6,24 @@ from one run directory and renders the
 report figures next to them — plots regenerate any time without recomputing
 detections or backtests:
 
-Both metrics are scale-free (see ``airquality.forecasting.pipeline.METRIC_COLS``):
-``rmse`` is the RMSE on standardized data and ``mase`` the scaled MAE, so
-values are comparable across series and can be averaged.
+The main benchmark reports ``rmsse`` and ``mase`` plus MAE/RMSE relative to the
+matching ``raw`` arm (see ``airquality.forecasting.pipeline.METRIC_COLS``).
 
-- ``arm_error_{rmse,mase}.png`` — per-arm error across series (dots) with the
+- ``arm_error_{rmsse,mase,relmae,relrmse}.png`` — per-arm error across series (dots) with the
   mean labeled, one panel per forecast model; the ``raw`` mean is the reference.
-- ``improvement_{rmse,mase}.png`` — series×arm heatmap of the % improvement vs
+- ``improvement_{rmsse,mase,relmae,relrmse}.png`` — series×arm heatmap of the % improvement vs
   ``raw`` (blue = the arm forecasts better, red = worse), every cell annotated.
 - ``detector_selection.png`` — how often each detector ends up in the final
   mask per strategy, plus each strategy's detection-rate distribution.
-- ``imputation_effect_{rmse,mase}.png`` — paired scatter (impute vs noimpute)
+- ``imputation_effect_{rmsse,mase,relmae,relrmse}.png`` — paired scatter (impute vs noimpute)
   per strategy; points below the diagonal mean imputation helped.
 - ``train_time.png`` / ``inference_time.png`` — per-arm training / holdout
   inference time across series (dots) with the mean labeled, one panel per
   forecast model (uses the ``train_seconds`` / ``inference_seconds`` columns).
-- ``{train,inference}_time_vs_{rmse,mase}.png`` — cost/accuracy scatter: mean
+- ``{train,inference}_time_vs_{rmsse,mase,relmae,relrmse}.png`` — cost/accuracy scatter: mean
   training / inference time vs mean error per (arm, model), so the bottom-left
   region is fast and precise.
-- ``foundation_preprocessing_recovery_{rmse,mase}.png`` — paired error recovered
+- ``foundation_preprocessing_recovery_{mase,rmsse}.png`` — paired error recovered
   after preprocessing synthetic context anomalies, by model, strategy and type.
 
 Arm colors follow the strategy *family* and stay fixed across figures
@@ -56,7 +55,8 @@ from airquality.visualizations.anomaly import (
     TEXT_COLOR,
     style_axis,
 )
-from airquality.forecasting.pipeline import RAW_ARM, RAW_FROZEN_ARM
+from airquality.forecasting.foundation_preprocessing import FOUNDATION_METRICS
+from airquality.forecasting.pipeline import METRIC_COLS, RAW_ARM, RAW_FROZEN_ARM
 
 MUTED_TEXT = "#6d6258"
 
@@ -81,10 +81,13 @@ IMPROVEMENT_CMAP = LinearSegmentedColormap.from_list(
 
 MODEL_MARKERS = ("o", "s", "^", "D", "v", "P")
 
-#: Display names for the benchmark's scale-free metrics: ``rmse`` is the RMSE
-#: on standardized data (divided by the raw series' std) and ``mase`` plays the
-#: role of the scaled MAE (MAE over the raw history's seasonal-naive MAE).
-METRIC_LABELS = {"rmse": "RMSE escalado", "mase": "MASE (MAE escalado)"}
+#: Display names for the benchmark metrics.
+METRIC_LABELS = {
+    "rmsse": "RMSSE",
+    "mase": "MASE",
+    "relmae": "MAE relativo a raw",
+    "relrmse": "RMSE relativo a raw",
+}
 
 
 def _metric_label(metric: str) -> str:
@@ -286,7 +289,7 @@ def _save_arm_dot_plot(
     return True
 
 
-def save_arm_error_plot(output_path: Path, results_df: pd.DataFrame, metric: str = "rmse") -> bool:
+def save_arm_error_plot(output_path: Path, results_df: pd.DataFrame, metric: str = "rmsse") -> bool:
     """Dot plot of ``metric`` per arm (points = series, tick = mean), per model."""
     return _save_arm_dot_plot(
         output_path,
@@ -418,7 +421,7 @@ def _save_time_vs_error_plot(
 
 
 def save_train_time_vs_error_plot(
-    output_path: Path, results_df: pd.DataFrame, metric: str = "rmse"
+    output_path: Path, results_df: pd.DataFrame, metric: str = "rmsse"
 ) -> bool:
     """Cost/accuracy scatter: mean training time (x) vs mean ``metric`` (y) per arm×model."""
     return _save_time_vs_error_plot(
@@ -429,7 +432,7 @@ def save_train_time_vs_error_plot(
 
 
 def save_inference_time_vs_error_plot(
-    output_path: Path, results_df: pd.DataFrame, metric: str = "rmse"
+    output_path: Path, results_df: pd.DataFrame, metric: str = "rmsse"
 ) -> bool:
     """Cost/accuracy scatter: mean inference time (x) vs mean ``metric`` (y) per arm×model."""
     return _save_time_vs_error_plot(
@@ -597,7 +600,7 @@ def save_detector_selection_plot(output_path: Path, detection_df: pd.DataFrame) 
 
 
 def save_imputation_effect_plot(
-    output_path: Path, results_df: pd.DataFrame, metric: str = "rmse"
+    output_path: Path, results_df: pd.DataFrame, metric: str = "rmsse"
 ) -> bool:
     """Paired scatter: ``metric`` with imputation (y) vs without (x), per strategy."""
     pairs = imputation_pairs(results_df, metric)
@@ -665,7 +668,7 @@ def save_imputation_effect_plot(
 def save_foundation_preprocessing_plot(
     output_path: Path,
     summary_df: pd.DataFrame,
-    metric: str = "rmse",
+    metric: str = "mase",
 ) -> bool:
     """Plot mean paired recovery from corrupted synthetic contexts."""
     value_col = f"{metric}_recovery"
@@ -755,26 +758,50 @@ def render_run_figures(run_dir: Path) -> list[Path]:
 
     saved: list[Path] = []
     jobs = [
-        (run_dir / "arm_error_rmse.png", lambda p: save_arm_error_plot(p, results_df, "rmse")),
-        (run_dir / "arm_error_mase.png", lambda p: save_arm_error_plot(p, results_df, "mase")),
-        (run_dir / "improvement_rmse.png", lambda p: save_improvement_heatmap(p, results_df, "rmse")),
-        (run_dir / "improvement_mase.png", lambda p: save_improvement_heatmap(p, results_df, "mase")),
-        (run_dir / "detector_selection.png", lambda p: save_detector_selection_plot(p, detection_df)),
-        (run_dir / "imputation_effect_rmse.png", lambda p: save_imputation_effect_plot(p, results_df, "rmse")),
-        (run_dir / "imputation_effect_mase.png", lambda p: save_imputation_effect_plot(p, results_df, "mase")),
-        (run_dir / "train_time.png", lambda p: save_train_time_plot(p, results_df)),
-        (run_dir / "train_time_vs_rmse.png", lambda p: save_train_time_vs_error_plot(p, results_df, "rmse")),
-        (run_dir / "train_time_vs_mase.png", lambda p: save_train_time_vs_error_plot(p, results_df, "mase")),
-        (run_dir / "inference_time.png", lambda p: save_inference_time_plot(p, results_df)),
-        (run_dir / "inference_time_vs_rmse.png", lambda p: save_inference_time_vs_error_plot(p, results_df, "rmse")),
-        (run_dir / "inference_time_vs_mase.png", lambda p: save_inference_time_vs_error_plot(p, results_df, "mase")),
-        (
-            run_dir / "foundation_preprocessing_recovery_rmse.png",
-            lambda p: save_foundation_preprocessing_plot(p, foundation_df, "rmse"),
+        *(
+            (
+                run_dir / f"arm_error_{metric}.png",
+                lambda path, metric=metric: save_arm_error_plot(path, results_df, metric),
+            )
+            for metric in METRIC_COLS
         ),
-        (
-            run_dir / "foundation_preprocessing_recovery_mase.png",
-            lambda p: save_foundation_preprocessing_plot(p, foundation_df, "mase"),
+        *(
+            (
+                run_dir / f"improvement_{metric}.png",
+                lambda path, metric=metric: save_improvement_heatmap(path, results_df, metric),
+            )
+            for metric in METRIC_COLS
+        ),
+        (run_dir / "detector_selection.png", lambda path: save_detector_selection_plot(path, detection_df)),
+        *(
+            (
+                run_dir / f"imputation_effect_{metric}.png",
+                lambda path, metric=metric: save_imputation_effect_plot(path, results_df, metric),
+            )
+            for metric in METRIC_COLS
+        ),
+        (run_dir / "train_time.png", lambda path: save_train_time_plot(path, results_df)),
+        *(
+            (
+                run_dir / f"train_time_vs_{metric}.png",
+                lambda path, metric=metric: save_train_time_vs_error_plot(path, results_df, metric),
+            )
+            for metric in METRIC_COLS
+        ),
+        (run_dir / "inference_time.png", lambda path: save_inference_time_plot(path, results_df)),
+        *(
+            (
+                run_dir / f"inference_time_vs_{metric}.png",
+                lambda path, metric=metric: save_inference_time_vs_error_plot(path, results_df, metric),
+            )
+            for metric in METRIC_COLS
+        ),
+        *(
+            (
+                run_dir / f"foundation_preprocessing_recovery_{metric}.png",
+                lambda path, metric=metric: save_foundation_preprocessing_plot(path, foundation_df, metric),
+            )
+            for metric in FOUNDATION_METRICS
         ),
     ]
     for path, job in jobs:
