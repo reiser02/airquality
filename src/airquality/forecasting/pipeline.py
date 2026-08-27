@@ -1845,6 +1845,9 @@ def _run_benchmark_from_config(
         ],
     )
     selection_df = pd.DataFrame(selection_rows, columns=SELECTION_COLUMNS)
+    excluded_df = selection_df.loc[
+        selection_df["selected"].eq(False)
+    ].reset_index(drop=True)
     foundation_preprocessing_df = pd.DataFrame(
         foundation_preprocessing_rows,
         columns=FOUNDATION_PREPROCESSING_COLUMNS,
@@ -1857,6 +1860,7 @@ def _run_benchmark_from_config(
     summary_df.to_csv(output_dir / "summary.csv", index=False)
     detection_df.to_csv(output_dir / "detection.csv", index=False)
     selection_df.to_csv(output_dir / "selection.csv", index=False)
+    excluded_df.to_csv(output_dir / "excluded_series.csv", index=False)
     foundation_preprocessing_df.to_csv(
         output_dir / "foundation_preprocessing_results.csv", index=False
     )
@@ -1882,6 +1886,7 @@ def _run_benchmark_from_config(
         "summary_df": summary_df,
         "detection_df": detection_df,
         "selection_df": selection_df,
+        "excluded_df": excluded_df,
         "foundation_preprocessing_df": foundation_preprocessing_df,
         "foundation_preprocessing_summary_df": foundation_preprocessing_summary_df,
     }
