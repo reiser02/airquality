@@ -659,15 +659,21 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     tmp_path, monkeypatch
 ):
     series = _seasonal_series(n=600, name="ST0", seed=8)
+    excluded_series = _seasonal_series(n=100, name="ST-short", seed=9)
     preserved = series + 100.0
+    preserved_excluded = excluded_series + 100.0
     seen_detection_index: list[pd.DatetimeIndex] = []
     seen_detection_values: list[pd.Series] = []
     seen_detection_context: dict[str, object] = {}
     test_indices: list[pd.DatetimeIndex] = []
 
     def fake_loader(**kwargs):
-        source = preserved if kwargs.get("preserve_frozen") else series
-        return [source.to_frame()]
+        sources = (
+            (preserved, preserved_excluded)
+            if kwargs.get("preserve_frozen")
+            else (series, excluded_series)
+        )
+        return [source.to_frame() for source in sources]
 
     monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     csv_map = {
@@ -712,7 +718,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
         out = {}
         for strategy, position in zip(strategies, (500, 550), strict=True):
             mask = pd.Series(False, index=full_series.index)
-            mask.iloc[position] = True
+            mask.iloc[min(position, len(full_series) - 1)] = True
             out[strategy.name] = DetectionResult(
                 strategy.name,
                 [],
@@ -746,9 +752,11 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
 
     artifacts = cp.run_benchmark_from_config()
 
-    assert len(seen_detection_index) == 1
+    assert len(seen_detection_index) == 2
     assert seen_detection_index[0].equals(series.index)
+    assert seen_detection_index[1].equals(excluded_series.index)
     pd.testing.assert_series_equal(seen_detection_values[0], series)
+    pd.testing.assert_series_equal(seen_detection_values[1], excluded_series)
     assert seen_detection_context["carla_stride"] == 7
     assert seen_detection_context["injection_variant"] == "drift"
     selection = artifacts["selection_df"].iloc[0]
@@ -757,6 +765,13 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
     assert pd.Timestamp(selection["test_target_end"]) == series.index[499]
     assert all(index.equals(test_indices[0]) for index in test_indices)
     assert series.index[500] not in test_indices[0]
+    excluded = artifacts["excluded_df"]
+    assert excluded["series"].tolist() == ["ST-short"]
+    assert excluded["exclusion_reason"].tolist() == [
+        "no_common_fixed_holdout_and_training_host"
+    ]
+    persisted_excluded = pd.read_csv(tmp_path / "excluded_series.csv")
+    assert persisted_excluded["series"].tolist() == ["ST-short"]
 
 
 def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
