@@ -48,7 +48,7 @@
 - Optional Hugging Face / `tsfm_public` imports in TSPulse modules are intentionally guarded; keep new imports optional there or tests and CPU-only workflows will break.
 - Darts model configs default to GPU/mixed precision in `training_config.py`, but `resolve_device()` falls back to CPU when CUDA is unavailable.
 - Darts train/validation geometry comes from `get_model_series_requirements()` and the model's native Darts properties; do not assume every model uses `input_chunk_length + horizon` (notably RNN/TCN).
-- Forecasting MASE uses the same raw training history for every arm. Rolling targets intentionally overlap and each origin-target pair is scored.
+- Forecasting MASE/RMSSE use the primary raw history available before each origin for every arm. Rolling targets intentionally overlap and each origin-target pair is scored; `relmae`/`relrmse` remain pooled ratios against the matching `raw` row.
 - Forecasting cache identity includes effective model/training config, local imputer artifact content, and mask-transform code/state; runtime device/accelerator is deliberately excluded.
 - TSPulse fine-tuning uses disjoint, non-overlapping reconstruction windows and excludes windows whose natural target values are unobserved.
 - Repo contains committed runtime artifacts like `models/` and `__pycache__/`; avoid treating them as source when searching or editing.

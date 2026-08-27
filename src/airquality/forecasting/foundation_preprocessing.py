@@ -15,7 +15,7 @@ from airquality.forecasting.detection import DetectionResult
 CLEAN_REFERENCE = "clean_reference"
 CORRUPTED = "corrupted"
 REFERENCE_CONDITIONS = (CLEAN_REFERENCE, CORRUPTED)
-FOUNDATION_METRICS = ("rmse", "mase")
+FOUNDATION_METRICS = ("mase", "rmsse")
 FOUNDATION_SUMMARY_COLUMNS = (
     "series",
     "regime",
