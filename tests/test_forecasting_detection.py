@@ -198,7 +198,7 @@ def test_injection_vote_uses_configured_quorum_with_pointwise_backfill():
         "B": _spike_scores(n, [5]),
         "C": _spike_scores(n, [10]),
         "D": _spike_scores(n, [15]),
-        "E": _spike_scores(n, [5]),
+        "E": _spike_scores(n, [25]),
     }
     scores["C"][5] = np.nan
     scores["D"][5] = np.nan
@@ -212,10 +212,11 @@ def test_injection_vote_uses_configured_quorum_with_pointwise_backfill():
         name="inject-vote", top_k=4, min_votes=3
     ).detect(context)
 
-    # With a 3-of-4 quorum, E is the pointwise fallback for C/D at position 5.
+    # At position 5, E backfills C/D but does not flag it. Only A and B vote,
+    # so the configured 3-of-4 quorum keeps the point supported but unflagged.
     assert result.selected_by_segment == [["A", "B", "C", "D", "E"]]
     assert result.scored_mask.iloc[5]
-    assert result.mask.iloc[5]
+    assert not result.mask.iloc[5]
     assert result.n_unscored == 0
 
 
