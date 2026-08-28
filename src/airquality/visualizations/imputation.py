@@ -18,7 +18,7 @@ Figures:
 
 - ``imputation_time_by_model.png`` — grouped horizontal bars of the mean
   training time and the mean imputation (inference) time per model.
-- ``imputation_time_vs_{mase,rmse,mae}.png`` — cost/accuracy scatter: mean
+- ``imputation_time_vs_{mase,rmsse,rmse,mae}.png`` — cost/accuracy scatter: mean
   imputation time (x, log) vs error (y) per model, so the bottom-left is best.
 
 All timings are means across series; plots regenerate from the CSVs without
@@ -68,7 +68,12 @@ MODEL_PALETTE = (
 )
 
 #: Display names of the imputation error metrics (upper-case CSV columns).
-METRIC_LABELS = {"MASE": "MASE", "RMSE": "RMSE", "MAE": "MAE"}
+METRIC_LABELS = {
+    "MASE": "MASE",
+    "RMSSE": "RMSSE",
+    "RMSE": "RMSE",
+    "MAE": "MAE",
+}
 
 
 def _metric_label(metric: str) -> str:
@@ -115,7 +120,8 @@ def summarize_timing(
     """Mean timing (and error metrics) per model from a raw benchmark results frame.
 
     Returns a frame with a ``Modelo`` column plus whichever of ``Train_Seconds`` /
-    ``Impute_Seconds`` / ``MAE`` / ``RMSE`` / ``MASE`` are present, one row per
+    ``Impute_Seconds`` / ``MAE`` / ``RMSE`` / ``MASE`` / ``RMSSE`` are present,
+    one row per
     model (input order preserved). Every value is the mean across series.
 
     ``darts_train_seconds`` (``{model: seconds}`` from
@@ -125,7 +131,7 @@ def summarize_timing(
     if results_df.empty or "Modelo" not in results_df.columns:
         return pd.DataFrame()
     value_cols = [
-        col for col in (TRAIN_COL, IMPUTE_COL, "MAE", "RMSE", "MASE")
+        col for col in (TRAIN_COL, IMPUTE_COL, "MAE", "RMSE", "MASE", "RMSSE")
         if col in results_df.columns
     ]
     if not value_cols:
@@ -276,7 +282,9 @@ def render_timing_figures(
 ) -> list[Path]:
     """Render every applicable timing figure for one results frame; return saved paths."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics = [m for m in ("MASE", "RMSE", "MAE") if m in results_df.columns]
+    metrics = [
+        m for m in ("MASE", "RMSSE", "RMSE", "MAE") if m in results_df.columns
+    ]
     jobs: list[tuple[Path, object]] = [
         (output_dir / "imputation_time_by_model.png",
          lambda p: save_time_by_model_plot(p, results_df, darts_train_seconds)),

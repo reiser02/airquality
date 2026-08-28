@@ -885,7 +885,7 @@ def _save_global_station_error_plots(
             f"{_metric_display_name(metric, scaled_errors=scaled_errors)} medio por estación"
         )
         ax.set_ylabel("Modelo")
-        if metric == "MASE":
+        if metric in {"MASE", "RMSSE"}:
             ax.axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
 
         display_metric = _metric_display_name(
@@ -1147,7 +1147,7 @@ def _save_tail_risk_plots(
         ax.invert_yaxis()
         ax.set_xlabel(_metric_display_name(metric, scaled_errors=scaled_errors))
         ax.set_ylabel("Modelo")
-        if metric == "MASE":
+        if metric in {"MASE", "RMSSE"}:
             ax.axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
         ax.legend(
             loc="center left",
@@ -1504,7 +1504,7 @@ def _save_overall_model_performance_plots(
             "Error medio (menor es mejor)"
         )
         axes[0].set_ylabel("Modelo")
-        if metric == "MASE":
+        if metric in {"MASE", "RMSSE"}:
             axes[0].axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
         for position, value in zip(positions, means, strict=True):
             axes[0].annotate(
@@ -1615,7 +1615,9 @@ def _save_metric_gap_plot(
     if not {"Modelo", "Gap_Size"}.issubset(results_mc_df.columns):
         return None
 
-    metrics = [m for m in ("MAE", "RMSE", "MASE") if m in results_mc_df.columns]
+    metrics = [
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_mc_df.columns
+    ]
     if not metrics:
         return None
 
@@ -1751,7 +1753,9 @@ def _save_montecarlo_diagnostic_plots(
         "diagnostic_table_paths": {},
     }
     metrics = [
-        metric for metric in ("MAE", "RMSE", "MASE") if metric in results_mc_df.columns
+        metric
+        for metric in ("MAE", "RMSE", "MASE", "RMSSE")
+        if metric in results_mc_df.columns
     ]
     if not metrics or results_mc_df.empty:
         return empty_artifacts
