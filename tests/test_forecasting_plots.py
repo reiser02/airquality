@@ -195,7 +195,6 @@ def test_save_foundation_preprocessing_plot(tmp_path):
     summary = pd.DataFrame(
         {
             "model": ["Chronos2"] * 4,
-            "regime": ["short"] * 4,
             "strategy": ["unlabeled"] * 4,
             "anomaly_type": ["spikes", "scale", "noise", "drift"],
             "rmsse_recovery": [0.2, -0.1, 0.3, 0.05],
@@ -208,17 +207,11 @@ def test_save_foundation_preprocessing_plot(tmp_path):
 
 
 def test_render_run_figures_from_csvs(tmp_path):
-    short = _results_df()
-    short["regime"] = "short"
-    long = short.copy()
-    long["regime"] = "long"
-    long[["rmsse", "mase", "relmae", "relrmse"]] *= 1.1
-    pd.concat([short, long], ignore_index=True).to_csv(tmp_path / "results.csv", index=False)
+    _results_df().to_csv(tmp_path / "results.csv", index=False)
     _detection_df().to_csv(tmp_path / "detection.csv", index=False)
     pd.DataFrame(
         {
             "model": ["Chronos2"] * 4,
-            "regime": ["short"] * 4,
             "strategy": ["unlabeled"] * 4,
             "anomaly_type": ["spikes", "scale", "noise", "drift"],
             "rmsse_recovery": [0.2, -0.1, 0.3, 0.05],
@@ -256,3 +249,9 @@ def test_render_run_figures_from_csvs(tmp_path):
         "foundation_preprocessing_recovery_mase.png",
         "foundation_preprocessing_recovery_rmsse.png",
     }
+
+    legacy = _results_df()
+    legacy["regime"] = "short"
+    legacy.to_csv(tmp_path / "results.csv", index=False)
+    with pytest.raises(ValueError, match="esquema antiguo con regímenes"):
+        render_run_figures(tmp_path)

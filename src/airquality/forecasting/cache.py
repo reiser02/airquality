@@ -37,7 +37,7 @@ import pandas as pd
 #: MASE switched to the shared raw-history insample. v3: causal train/val split
 #: (validation is the most recent block; posterior blocks dropped from train).
 #: v4: the entire variable-length evaluation block is excluded from training.
-#: v5: rolling validation/test origins use explicit per-regime strides. v6:
+#: v5: rolling validation/test origins use explicit strides. v6:
 #: keys include effective config, artifact content, and transform behavior. v7:
 #: forecasting-only local/foundation model definitions and Darts 0.46 support.
 #: v8: full-series detection and fixed holdout selected from common masks.
@@ -52,8 +52,10 @@ import pandas as pd
 #: common holdout support ignores abstentions and raw+frozen is a source arm. v17:
 #: inject-vote uses ranked pointwise backfill with its configured quorum. v18:
 #: forecasting metrics use MASE/RMSSE plus raw-relative MAE/RMSE. v19: scaled
-#: metrics use the primary raw history available before each forecast origin.
-CACHE_VERSION = 19
+#: metrics use the primary raw history available before each forecast origin. v20:
+#: the forecasting benchmark uses one scalar temporal protocol. v21: validation
+#: reserves every native model's target length across all protocol origins.
+CACHE_VERSION = 21
 
 
 def series_fingerprint(series: pd.Series) -> str:

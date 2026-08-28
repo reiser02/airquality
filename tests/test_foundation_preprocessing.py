@@ -36,8 +36,8 @@ def test_synthetic_cases_corrupt_only_context_and_keep_targets_paired() -> None:
         series,
         test_target_start=target_start,
         context_len=72,
-        horizon=8,
-        stride=4,
+        horizon=12,
+        stride=6,
         repeats=3,
         test_seed=1001,
     )
@@ -68,8 +68,8 @@ def test_preprocessing_contexts_mask_only_each_strategy_flags() -> None:
         _test_series(),
         test_target_start=_test_series().index[72],
         context_len=72,
-        horizon=8,
-        stride=4,
+        horizon=12,
+        stride=6,
         repeats=1,
         test_seed=1001,
     )[0]
@@ -173,8 +173,7 @@ def test_summary_reports_damage_recovery_and_residual() -> None:
     rows = []
     common = {
         "series": "ST",
-        "regime": "short",
-        "horizon": 8,
+        "horizon": 12,
         "model": "Chronos2",
         "case_id": "case",
         "anomaly_type": "spikes",
@@ -183,7 +182,7 @@ def test_summary_reports_damage_recovery_and_residual() -> None:
         "n_injected": 1,
         "n_injected_detected": 0,
         "imputation_applied": False,
-        "n_test_predictions": 8,
+        "n_test_predictions": 12,
     }
     for condition, mase, rmsse in (
         (CLEAN_REFERENCE, 1.0, 1.0),
@@ -355,11 +354,12 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         CORRUPTED,
         "inject-vote",
     }
-    assert len(results) == 24
+    assert "regime" not in results.columns
+    assert len(results) == 12
     assert set(results.loc[results["imputation_applied"], "condition"]) == {
         "inject-vote",
     }
-    assert prepare_calls == [8, 48]
+    assert prepare_calls == [12]
     assert synthetic_contexts
     assert all(context["carla_stride"] == 7 for context in synthetic_contexts)
     assert all(context["injection_variant"] == "drift" for context in synthetic_contexts)
@@ -379,6 +379,6 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         reference.equals(series)
         for reference in foundation_references
     )
-    assert len(artifacts["foundation_preprocessing_summary_df"]) == 8
+    assert len(artifacts["foundation_preprocessing_summary_df"]) == 4
     assert (tmp_path / "foundation_preprocessing_results.csv").exists()
     assert (tmp_path / "foundation_preprocessing_summary.csv").exists()

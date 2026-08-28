@@ -5,8 +5,8 @@ Run with::
     uv run python -m airquality.data.block_analysis
 
 The command preprocesses the raw 5-minute NO2/CO files, reserves one complete
-observed block for an exact 192-hour test, and audits rolling short/long
-validation requirements. It writes CSV tables plus figures under
+observed block for an exact 96-hour test, and audits the configured rolling
+validation requirement. It writes CSV tables plus figures under
 ``reports/data_blocks/<timestamp>/`` without running detectors or models, so its
 raw-support coverage is an upper bound for the detector-aware benchmark.
 """
@@ -44,11 +44,11 @@ def _worst_case_requirements(
     model_names: tuple[str, ...],
     *,
     context: int,
-    horizons: dict[str, int],
-    strides: dict[str, int],
-    validation_hours: dict[str, int],
+    horizon: int,
+    stride: int,
+    validation_hours: int,
     seasonality_m: int,
-) -> dict[str, dict[str, object]]:
+) -> dict[str, object]:
     """Return conservative native geometry among configured forecast models."""
     if not model_names:
         raise ValueError("Debe configurarse al menos un modelo de forecasting")
@@ -56,59 +56,53 @@ def _worst_case_requirements(
     configs = resolve_forecasting_model_configs(
         list(model_names), seasonality_m=seasonality_m, context_length=context
     )
-    out = {}
-    for regime, horizon in horizons.items():
-        strict = get_strict_forecast_requirements(
-            configs,
-            size_k=horizon,
-            validation_len=validation_hours[regime],
-            validation_stride=strides[regime],
-            seasonality_m=seasonality_m,
-            context_len=context,
+    strict = get_strict_forecast_requirements(
+        configs,
+        size_k=horizon,
+        validation_len=validation_hours,
+        validation_stride=stride,
+        seasonality_m=seasonality_m,
+        context_len=context,
+    )
+    return {
+        key: strict[key]
+        for key in (
+            "minimum_hours",
+            "prediction_context_hours",
+            "host_minimum_hours",
+            "validation_hours",
+            "validation_forecasts",
+            "limiting_models",
         )
-        out[regime] = {
-            key: strict[key]
-            for key in (
-                "minimum_hours",
-                "prediction_context_hours",
-                "host_minimum_hours",
-                "validation_hours",
-                "validation_forecasts",
-                "limiting_models",
-            )
-        }
-    return out
+    }
 
 
 def classify_blocks(
     blocks: pd.DataFrame,
-    regimes: dict[str, int],
-    validation_hours: dict[str, int],
-    host_minimum_hours: dict[str, int],
+    *,
+    minimum_hours: int,
+    validation_hours: int,
+    host_minimum_hours: int,
 ) -> pd.DataFrame:
     """Mark eligible, validation-host, and chronologically usable blocks."""
     out = blocks.copy()
     out["block_number"] = np.arange(1, len(out) + 1)
 
-    for regime, minimum in regimes.items():
-        validation = validation_hours[regime]
-        eligible = out["hours"].ge(minimum)
-        host_capable = out["hours"].ge(host_minimum_hours[regime])
-        out[f"{regime}_eligible"] = eligible
-        out[f"{regime}_host_capable"] = host_capable
-        out[f"{regime}_validation_host"] = False
-        out[f"{regime}_used"] = False
-        out[f"{regime}_training_hours"] = 0
+    eligible = out["hours"].ge(minimum_hours)
+    host_capable = out["hours"].ge(host_minimum_hours)
+    out["eligible"] = eligible
+    out["host_capable"] = host_capable
+    out["validation_host"] = False
+    out["used"] = False
+    out["training_hours"] = 0
 
-        if not host_capable.any():
-            continue
-
+    if host_capable.any():
         host = int(out.index[host_capable][-1])
         used = eligible & out.index.to_series().le(host).to_numpy()
-        out.loc[used, f"{regime}_used"] = True
-        out.loc[used, f"{regime}_training_hours"] = out.loc[used, "hours"]
-        out.loc[host, f"{regime}_validation_host"] = True
-        out.loc[host, f"{regime}_training_hours"] -= validation
+        out.loc[used, "used"] = True
+        out.loc[used, "training_hours"] = out.loc[used, "hours"]
+        out.loc[host, "validation_host"] = True
+        out.loc[host, "training_hours"] -= validation_hours
 
     return out
 
@@ -118,12 +112,9 @@ def analyze_raw_blocks(
     pollutants: tuple[str, ...],
     *,
     context: int,
-    short_horizon: int,
-    long_horizon: int,
-    short_stride: int,
-    long_stride: int,
-    short_validation_len: int,
-    long_validation_len: int,
+    horizon: int,
+    stride: int,
+    validation_len: int,
     holdout: int,
     min_run: int,
     min_useful: int,
@@ -131,45 +122,29 @@ def analyze_raw_blocks(
     seasonality_m: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build per-block, per-series, and excluded-series audit tables."""
-    regimes = {"short": context + short_horizon, "long": context + long_horizon}
-    horizons = {"short": short_horizon, "long": long_horizon}
-    strides = {"short": short_stride, "long": long_stride}
-    validation_hours = {"short": short_validation_len, "long": long_validation_len}
-    if holdout <= 0 or any(
-        min(horizons[regime], strides[regime], validation_hours[regime]) <= 0
-        or strides[regime] > horizons[regime]
-        or validation_hours[regime] < horizons[regime]
-        or (validation_hours[regime] - horizons[regime]) % strides[regime] != 0
-        or holdout < horizons[regime]
-        or (holdout - horizons[regime]) % strides[regime] != 0
-        for regime in regimes
+    if (
+        min(holdout, horizon, stride, validation_len) <= 0
+        or stride > horizon
+        or validation_len < horizon
+        or (validation_len - horizon) % stride != 0
+        or holdout < horizon
+        or (holdout - horizon) % stride != 0
     ):
         raise ValueError(
-            "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
+            "Holdout, horizonte, stride y validacion deben ser validos"
         )
     requirements = _worst_case_requirements(
         forecast_models,
         context=context,
-        horizons=horizons,
-        strides=strides,
-        validation_hours=validation_hours,
+        horizon=horizon,
+        stride=stride,
+        validation_hours=validation_len,
         seasonality_m=seasonality_m,
     )
-    regimes = {
-        regime: int(requirements[regime]["minimum_hours"]) for regime in requirements
-    }
-    host_minimum_hours = {
-        regime: int(requirements[regime]["host_minimum_hours"])
-        for regime in requirements
-    }
-    validation_reserves = {
-        regime: int(requirements[regime]["validation_hours"])
-        for regime in requirements
-    }
-    prediction_context = max(
-        int(requirements[regime]["prediction_context_hours"])
-        for regime in requirements
-    )
+    minimum_hours = int(requirements["minimum_hours"])
+    host_minimum_hours = int(requirements["host_minimum_hours"])
+    validation_reserve = int(requirements["validation_hours"])
+    prediction_context = max(context, int(requirements["prediction_context_hours"]))
     block_frames: list[pd.DataFrame] = []
     series_rows: list[dict[str, object]] = []
     excluded_rows: list[dict[str, object]] = []
@@ -198,9 +173,9 @@ def analyze_raw_blocks(
                 series,
                 holdout=holdout,
                 context_len=prediction_context,
-                train_min_len=max(regimes.values()),
-                validation_len=max(validation_hours.values()),
-                host_min_len=max(host_minimum_hours.values()),
+                train_min_len=minimum_hours,
+                validation_len=validation_len,
+                host_min_len=host_minimum_hours,
             )
             if window is None:
                 excluded_rows.append(
@@ -224,9 +199,9 @@ def analyze_raw_blocks(
             training_blocks = observed_blocks(train)
             blocks = classify_blocks(
                 training_blocks,
-                regimes,
-                validation_reserves,
-                host_minimum_hours,
+                minimum_hours=minimum_hours,
+                validation_hours=validation_reserve,
+                host_minimum_hours=host_minimum_hours,
             )
             blocks.insert(0, "station", station)
             blocks.insert(0, "pollutant", pollutant)
@@ -246,39 +221,32 @@ def analyze_raw_blocks(
                 "total_blocks": len(blocks),
                 "max_block_hours": int(blocks["hours"].max()),
             }
-            for regime in regimes:
-                eligible = blocks[f"{regime}_eligible"]
-                used = blocks[f"{regime}_used"]
-                host = blocks[f"{regime}_validation_host"]
-                row |= {
-                    f"{regime}_minimum_hours": regimes[regime],
-                    f"{regime}_horizon_hours": horizons[regime],
-                    f"{regime}_stride_hours": strides[regime],
-                    f"{regime}_host_minimum_hours": host_minimum_hours[regime],
-                    f"{regime}_limiting_models": requirements[regime]["limiting_models"],
-                    f"{regime}_requested_validation_hours": validation_hours[regime],
-                    f"{regime}_validation_reserve_hours": validation_reserves[regime],
-                    f"{regime}_validation_forecasts": requirements[regime][
-                        "validation_forecasts"
-                    ],
-                    f"{regime}_eligible_blocks": int(eligible.sum()),
-                    f"{regime}_host_candidates": int(blocks[f"{regime}_host_capable"].sum()),
-                    f"{regime}_used_blocks": int(used.sum()),
-                    f"{regime}_unused_eligible_blocks": int((eligible & ~used).sum()),
-                    f"{regime}_eligible_hours": int(blocks.loc[eligible, "hours"].sum()),
-                    f"{regime}_effective_training_hours": int(
-                        blocks[f"{regime}_training_hours"].sum()
-                    ),
-                    f"{regime}_validation_hours": (
-                        validation_reserves[regime] if host.any() else 0
-                    ),
-                    f"{regime}_trainable": bool(host.any()),
-                }
-                row[f"{regime}_retained_pct"] = (
-                    100.0 * row[f"{regime}_effective_training_hours"] / row["observed_hours"]
-                    if row["observed_hours"]
-                    else 0.0
-                )
+            eligible = blocks["eligible"]
+            used = blocks["used"]
+            host = blocks["validation_host"]
+            row |= {
+                "minimum_hours": minimum_hours,
+                "horizon_hours": horizon,
+                "stride_hours": stride,
+                "host_minimum_hours": host_minimum_hours,
+                "limiting_models": requirements["limiting_models"],
+                "requested_validation_hours": validation_len,
+                "validation_reserve_hours": validation_reserve,
+                "validation_forecasts": requirements["validation_forecasts"],
+                "eligible_blocks": int(eligible.sum()),
+                "host_candidates": int(blocks["host_capable"].sum()),
+                "used_blocks": int(used.sum()),
+                "unused_eligible_blocks": int((eligible & ~used).sum()),
+                "eligible_hours": int(blocks.loc[eligible, "hours"].sum()),
+                "effective_training_hours": int(blocks["training_hours"].sum()),
+                "validation_hours": validation_reserve if host.any() else 0,
+                "trainable": bool(host.any()),
+            }
+            row["retained_pct"] = (
+                100.0 * row["effective_training_hours"] / row["observed_hours"]
+                if row["observed_hours"]
+                else 0.0
+            )
             series_rows.append(row)
 
     blocks_df = pd.concat(block_frames, ignore_index=True) if block_frames else pd.DataFrame()
@@ -300,49 +268,42 @@ def summarize_blocks(blocks: pd.DataFrame, series: pd.DataFrame) -> pd.DataFrame
             "total_blocks": len(group),
             "observed_hours": int(group["hours"].sum()),
         }
-        for regime in ("short", "long"):
-            eligible = group[f"{regime}_eligible"]
-            used = group[f"{regime}_used"]
-            eligible_hours = int(group.loc[eligible, "hours"].sum())
-            effective_hours = int(group[f"{regime}_training_hours"].sum())
-            validation = int(selected_series[f"{regime}_validation_hours"].sum())
-            row |= {
-                f"{regime}_minimum_hours": int(
-                    selected_series[f"{regime}_minimum_hours"].iloc[0]
-                ),
-                f"{regime}_horizon_hours": int(
-                    selected_series[f"{regime}_horizon_hours"].iloc[0]
-                ),
-                f"{regime}_stride_hours": int(
-                    selected_series[f"{regime}_stride_hours"].iloc[0]
-                ),
-                f"{regime}_limiting_models": selected_series[
-                    f"{regime}_limiting_models"
-                ].iloc[0],
-                f"{regime}_requested_validation_hours": int(
-                    selected_series[f"{regime}_requested_validation_hours"].iloc[0]
-                ),
-                f"{regime}_validation_reserve_hours": int(
-                    selected_series[f"{regime}_validation_reserve_hours"].iloc[0]
-                ),
-                f"{regime}_validation_forecasts": int(
-                    selected_series[f"{regime}_validation_forecasts"].iloc[0]
-                ),
-                f"{regime}_host_minimum_hours": int(
-                    selected_series[f"{regime}_host_minimum_hours"].iloc[0]
-                ),
-                f"{regime}_eligible_blocks": int(eligible.sum()),
-                f"{regime}_used_blocks": int(used.sum()),
-                f"{regime}_host_candidates": int(group[f"{regime}_host_capable"].sum()),
-                f"{regime}_unused_eligible_blocks": int((eligible & ~used).sum()),
-                f"{regime}_too_short_blocks": int((~eligible).sum()),
-                f"{regime}_eligible_hours": eligible_hours,
-                f"{regime}_effective_training_hours": effective_hours,
-                f"{regime}_validation_hours": validation,
-                f"{regime}_unused_eligible_hours": eligible_hours - effective_hours - validation,
-                f"{regime}_too_short_hours": int(group.loc[~eligible, "hours"].sum()),
-                f"{regime}_retained_pct": 100.0 * effective_hours / row["observed_hours"],
-            }
+        eligible = group["eligible"]
+        used = group["used"]
+        eligible_hours = int(group.loc[eligible, "hours"].sum())
+        effective_hours = int(group["training_hours"].sum())
+        validation = int(selected_series["validation_hours"].sum())
+        row |= {
+            "minimum_hours": int(selected_series["minimum_hours"].iloc[0]),
+            "horizon_hours": int(selected_series["horizon_hours"].iloc[0]),
+            "stride_hours": int(selected_series["stride_hours"].iloc[0]),
+            "limiting_models": selected_series["limiting_models"].iloc[0],
+            "requested_validation_hours": int(
+                selected_series["requested_validation_hours"].iloc[0]
+            ),
+            "validation_reserve_hours": int(
+                selected_series["validation_reserve_hours"].iloc[0]
+            ),
+            "validation_forecasts": int(
+                selected_series["validation_forecasts"].iloc[0]
+            ),
+            "host_minimum_hours": int(selected_series["host_minimum_hours"].iloc[0]),
+            "eligible_blocks": int(eligible.sum()),
+            "used_blocks": int(used.sum()),
+            "host_candidates": int(group["host_capable"].sum()),
+            "unused_eligible_blocks": int((eligible & ~used).sum()),
+            "too_short_blocks": int((~eligible).sum()),
+            "eligible_hours": eligible_hours,
+            "effective_training_hours": effective_hours,
+            "validation_hours": validation,
+            "unused_eligible_hours": eligible_hours - effective_hours - validation,
+            "too_short_hours": int(group.loc[~eligible, "hours"].sum()),
+            "retained_pct": (
+                100.0 * effective_hours / row["observed_hours"]
+                if row["observed_hours"]
+                else 0.0
+            ),
+        }
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -353,13 +314,10 @@ def run_analysis(
     output_dir: str | Path,
     pollutants: tuple[str, ...] = ("NO2", "CO"),
     context: int = 72,
-    short_horizon: int = 8,
-    long_horizon: int = 48,
-    short_stride: int = 4,
-    long_stride: int = 24,
-    short_validation_len: int = 48,
-    long_validation_len: int = 96,
-    holdout: int = 192,
+    horizon: int = 12,
+    stride: int = 6,
+    validation_len: int = 48,
+    holdout: int = 96,
     min_run: int = MIN_RUN,
     min_useful: int = MIN_USEFUL,
     forecast_models: tuple[str, ...] | None = None,
@@ -385,12 +343,9 @@ def run_analysis(
         base_dir,
         pollutants,
         context=context,
-        short_horizon=short_horizon,
-        long_horizon=long_horizon,
-        short_stride=short_stride,
-        long_stride=long_stride,
-        short_validation_len=short_validation_len,
-        long_validation_len=long_validation_len,
+        horizon=horizon,
+        stride=stride,
+        validation_len=validation_len,
         holdout=holdout,
         min_run=min_run,
         min_useful=min_useful,
@@ -424,15 +379,13 @@ def run_analysis(
     block_table = summary[
         [
             "pollutant", "series", "total_blocks",
-            "short_eligible_blocks", "short_used_blocks",
-            "long_eligible_blocks", "long_used_blocks",
+            "eligible_blocks", "used_blocks",
         ]
     ]
     hour_table = summary[
         [
             "pollutant", "observed_hours",
-            "short_effective_training_hours", "short_retained_pct",
-            "long_effective_training_hours", "long_retained_pct",
+            "effective_training_hours", "retained_pct",
         ]
     ]
     print("\nBLOQUES\n" + block_table.to_markdown(index=False))
@@ -445,7 +398,7 @@ def run_analysis(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze contiguous hourly blocks available for short/long forecasting"
+        description="Analyze contiguous hourly blocks available for forecasting"
     )
     parser.add_argument("--base-dir", default="data/raw/datos_estaciones_5m")
     parser.add_argument("--output-dir", default=None)
@@ -454,37 +407,22 @@ def main() -> None:
         "--context", type=int, default=cfg_get_int("forecasting", "context_len", 72)
     )
     parser.add_argument(
-        "--short-horizon",
+        "--horizon",
         type=int,
-        default=cfg_get_int("forecasting", "short_horizon", 8),
+        default=cfg_get_int("forecasting", "horizon", 12),
     )
     parser.add_argument(
-        "--long-horizon",
+        "--stride",
         type=int,
-        default=cfg_get_int("forecasting", "long_horizon", 48),
+        default=cfg_get_int("forecasting", "stride", 6),
     )
     parser.add_argument(
-        "--short-stride",
+        "--validation-len",
         type=int,
-        default=cfg_get_int("forecasting", "short_stride", 4),
+        default=cfg_get_int("forecasting", "validation_len", 48),
     )
     parser.add_argument(
-        "--long-stride",
-        type=int,
-        default=cfg_get_int("forecasting", "long_stride", 24),
-    )
-    parser.add_argument(
-        "--short-validation-len",
-        type=int,
-        default=cfg_get_int("forecasting", "short_validation_len", 48),
-    )
-    parser.add_argument(
-        "--long-validation-len",
-        type=int,
-        default=cfg_get_int("forecasting", "long_validation_len", 96),
-    )
-    parser.add_argument(
-        "--holdout", type=int, default=cfg_get_int("forecasting", "holdout", 192)
+        "--holdout", type=int, default=cfg_get_int("forecasting", "holdout", 96)
     )
     parser.add_argument("--min-run", type=int, default=MIN_RUN)
     parser.add_argument("--min-useful", type=int, default=MIN_USEFUL)
@@ -504,12 +442,9 @@ def main() -> None:
         output_dir=output_dir,
         pollutants=tuple(args.pollutants),
         context=args.context,
-        short_horizon=args.short_horizon,
-        long_horizon=args.long_horizon,
-        short_stride=args.short_stride,
-        long_stride=args.long_stride,
-        short_validation_len=args.short_validation_len,
-        long_validation_len=args.long_validation_len,
+        horizon=args.horizon,
+        stride=args.stride,
+        validation_len=args.validation_len,
         holdout=args.holdout,
         min_run=args.min_run,
         min_useful=args.min_useful,

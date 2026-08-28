@@ -80,12 +80,9 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
         ("forecasting", "holdout"): 4,
         ("forecasting", "context_len"): 2,
         ("forecasting", "carla_stride"): 3,
-        ("forecasting", "short_horizon"): 2,
-        ("forecasting", "short_stride"): 1,
-        ("forecasting", "short_validation_len"): 2,
-        ("forecasting", "long_horizon"): 4,
-        ("forecasting", "long_stride"): 2,
-        ("forecasting", "long_validation_len"): 4,
+        ("forecasting", "horizon"): 2,
+        ("forecasting", "stride"): 1,
+        ("forecasting", "validation_len"): 2,
     }
     monkeypatch.setattr(
         analysis,
@@ -155,19 +152,19 @@ def test_run_analysis_writes_raw_detected_and_imputed_stages(tmp_path, monkeypat
     artifacts = analysis.run_analysis(output_dir=tmp_path, pollutant="co")
     results = artifacts["series_summary_df"]
 
-    assert len(results) == 6
+    assert len(results) == 3
     assert set(results["arm"]) == {
         "raw",
         "unlabeled+noimpute",
         "unlabeled+impute",
     }
     assert set(results["stage"]) == {"raw", "detected", "imputed"}
-    assert set(results["regime"]) == {"short", "long"}
+    assert "regime" not in results.columns
     assert not results["arm"].eq("raw+impute").any()
     assert results.loc[results["stage"] == "imputed", "imputed"].all()
     assert set(results["minimum_hours"]) == {4}
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["analysis_version"] == 5
+    assert manifest["analysis_version"] == 6
     assert manifest["pollutant"] == "CO"
     assert manifest["injection_variant"] == "combined"
     assert manifest["injection_seed"] == analysis.DEFAULT_INJECTION_SEED

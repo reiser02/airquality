@@ -183,7 +183,7 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cp.SeriesDetectionContext, "real_scores", counting_scores)
 
     first = cp.run_benchmark_from_config()
-    assert calls["backtest"] == 6  # three arms x short/long
+    assert calls["backtest"] == 3  # three arms x one forecast protocol
     assert calls["detect"] > 0
 
     calls["backtest"] = 0
@@ -205,5 +205,5 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     (tmp_path / "run3").mkdir()
     cp.run_benchmark_from_config()
 
-    assert calls["backtest"] == 2  # only raw+frozen, short and long
+    assert calls["backtest"] == 1  # only raw+frozen, one forecast protocol
     assert calls["detect"] == 0

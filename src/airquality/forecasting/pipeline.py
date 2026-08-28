@@ -4,8 +4,8 @@ Measures whether anomaly detection (and the subsequent imputation) improves
 multi-step forecasting. For every configured series the pipeline builds one
 training *arm* per (detection strategy, imputation) combination — plus the
 ``raw`` and ``raw+frozen`` source baselines — and backtests the same forecasting
-models on each arm over the **same timestamps** in short (8 h, stride 4 h) and
-long (48 h, stride 24 h) regimes:
+models on each arm over the **same timestamps** using the configured horizon and
+ rolling stride:
 
 - ``raw``: the hourly-mean series as loaded (gaps + anomalies kept).
 - ``raw+frozen``: the parallel hourly series without either frozen-value filter.
@@ -140,7 +140,7 @@ DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote")
 IMPUTATION_CHOICES = ("both", "impute", "none")
 #: Public forecasting metrics. ``mase`` and ``rmsse`` use the primary raw
 #: history available before each origin; the relative metrics compare each arm
-#: with its matching ``raw`` result for the same series, regime and model.
+#: with its matching ``raw`` result for the same series and model.
 METRIC_COLS = ("rmsse", "mase", "relmae", "relrmse")
 PROGRESS_LOGGER = get_progress_logger()
 _ACTIVE_PROGRESS: BenchmarkProgress | None = None
@@ -148,7 +148,7 @@ _ACTIVE_GPU_EXECUTOR: ProcessPoolExecutor | None = None
 _ACTIVE_DEVICE_QUEUE: Any | None = None
 
 RESULT_COLUMNS = (
-    "regime", "horizon", "forecast_stride", "validation_len",
+    "horizon", "forecast_stride", "validation_len",
     "validation_stride", "series", "arm", "strategy", "imputed",
     "imputation_model", "detectors", "n_anomalies", "n_anomalies_full",
     "detection_scope", "split_basis", "split_n_flagged", "split_n_unscored",
@@ -168,7 +168,7 @@ SELECTION_COLUMNS = (
 )
 
 FOUNDATION_PREPROCESSING_COLUMNS = (
-    "series", "regime", "horizon", "model", "case_id", "anomaly_type",
+    "series", "horizon", "model", "case_id", "anomaly_type",
     "test_seed", "test_target_start", "condition", "detectors", "n_injected",
     "n_context_flagged", "n_injected_detected", "n_context_nan",
     "imputation_applied", "imputation_model", "n_imputed", "mase", "rmsse",
@@ -224,16 +224,6 @@ class ForecastArm:
 
 
 @dataclass(frozen=True)
-class ForecastRegime:
-    """Forecast horizon, rolling cadence, and validation target span."""
-
-    name: str
-    horizon: int
-    stride: int
-    validation_len: int
-
-
-@dataclass(frozen=True)
 class _BacktestTask:
     """CPU inputs for one forecast backtest executed by a GPU worker."""
 
@@ -251,7 +241,6 @@ class _BacktestTask:
     context_len: int
     series_name: str = ""
     arm_name: str = ""
-    regime_name: str = ""
     ordinal: int = 0
     total: int = 0
 
@@ -315,11 +304,10 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
     )[task.model_name]
     started = time.perf_counter()
     PROGRESS_LOGGER.info(
-        "[backtest task=%d/%d][%s][%s][%s][%s] start device=cuda:%d",
+        "[backtest task=%d/%d][%s][%s][%s] start device=cuda:%d",
         task.ordinal,
         task.total,
         task.series_name,
-        task.regime_name,
         task.arm_name,
         task.model_name,
         _FORECAST_WORKER_GPU,
@@ -343,11 +331,10 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
         )
     except Exception:
         PROGRESS_LOGGER.exception(
-            "[backtest task=%d/%d][%s][%s][%s][%s] failed device=cuda:%d",
+            "[backtest task=%d/%d][%s][%s][%s] failed device=cuda:%d",
             task.ordinal,
             task.total,
             task.series_name,
-            task.regime_name,
             task.arm_name,
             task.model_name,
             _FORECAST_WORKER_GPU,
@@ -356,11 +343,10 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
     finally:
         _release_cuda_memory()
     PROGRESS_LOGGER.info(
-        "[backtest task=%d/%d][%s][%s][%s][%s] worker-finish device=cuda:%d elapsed=%.1fs",
+        "[backtest task=%d/%d][%s][%s][%s] worker-finish device=cuda:%d elapsed=%.1fs",
         task.ordinal,
         task.total,
         task.series_name,
-        task.regime_name,
         task.arm_name,
         task.model_name,
         _FORECAST_WORKER_GPU,
@@ -509,18 +495,18 @@ def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.Data
     is read directly against ``raw``.
     """
     if results_df.empty:
-        return pd.DataFrame(columns=["regime", "series", "model"])
+        return pd.DataFrame(columns=["series", "model"])
 
     arm_order = list(dict.fromkeys(results_df["arm"]))
     wide = results_df.pivot_table(
-        index=["regime", "series", "model"],
+        index=["series", "model"],
         columns="arm",
         values=list(METRIC_COLS),
         aggfunc="first",
     )
     rows: list[dict[str, Any]] = []
-    for (regime, series, model), row in wide.iterrows():
-        entry: dict[str, Any] = {"regime": regime, "series": series, "model": model}
+    for (series, model), row in wide.iterrows():
+        entry: dict[str, Any] = {"series": series, "model": model}
         for metric in METRIC_COLS:
             baseline_val = row.get((metric, baseline_arm))
             for arm in arm_order:
@@ -542,12 +528,12 @@ def _summarize(results_df: pd.DataFrame, baseline_arm: str = RAW_ARM) -> pd.Data
 def _apply_raw_relative_metrics(rows: list[dict[str, Any]]) -> None:
     """Add arm errors relative to the matching raw backtest row."""
     raw_by_key = {
-        (row.get("series"), row.get("regime"), row.get("model")): row
+        (row.get("series"), row.get("model")): row
         for row in rows
         if row.get("arm") == RAW_ARM
     }
     for row in rows:
-        raw = raw_by_key.get((row.get("series"), row.get("regime"), row.get("model")))
+        raw = raw_by_key.get((row.get("series"), row.get("model")))
         if raw is None:
             row["relmae"] = float("nan")
             row["relrmse"] = float("nan")
@@ -607,34 +593,20 @@ def _run_benchmark_from_config(
     imputation_size_k = cfg_get_int("benchmark", "size_k", 5)
     seasonality_m = cfg_get_int("benchmark", "seasonality_m", 24)
 
-    holdout = cfg_get_int("forecasting", "holdout", 192)
+    holdout = cfg_get_int("forecasting", "holdout", 96)
     context_len = cfg_get_int("forecasting", "context_len", 72)
-    regimes = (
-        ForecastRegime(
-            "short",
-            cfg_get_int("forecasting", "short_horizon", 8),
-            cfg_get_int("forecasting", "short_stride", 4),
-            cfg_get_int("forecasting", "short_validation_len", 48),
-        ),
-        ForecastRegime(
-            "long",
-            cfg_get_int("forecasting", "long_horizon", 48),
-            cfg_get_int("forecasting", "long_stride", 24),
-            cfg_get_int("forecasting", "long_validation_len", 96),
-        ),
-    )
-    if holdout <= 0 or any(
-        min(regime.horizon, regime.stride, regime.validation_len) <= 0
-        or regime.stride > regime.horizon
-        or regime.validation_len < regime.horizon
-        or (regime.validation_len - regime.horizon) % regime.stride != 0
-        or holdout < regime.horizon
-        or (holdout - regime.horizon) % regime.stride != 0
-        for regime in regimes
+    horizon = cfg_get_int("forecasting", "horizon", 12)
+    stride = cfg_get_int("forecasting", "stride", 6)
+    validation_len = cfg_get_int("forecasting", "validation_len", 48)
+    if (
+        min(holdout, horizon, stride, validation_len) <= 0
+        or stride > horizon
+        or validation_len < horizon
+        or (validation_len - horizon) % stride != 0
+        or holdout < horizon
+        or (holdout - horizon) % stride != 0
     ):
-        raise ValueError(
-            "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
-        )
+        raise ValueError("Holdout, horizonte, stride y validacion deben ser validos")
     seed = cfg_get_int("forecasting", "seed", 13)
     device_request = cfg_get_str("forecasting", "device", "multi-gpu")
     forecast_devices = resolve_forecasting_devices(device_request)
@@ -670,31 +642,20 @@ def _run_benchmark_from_config(
         for name, config in forecast_model_configs.items()
         if config.mode == "foundation"
     }
-    strict_requirements = {
-        regime.name: get_strict_forecast_requirements(
-            forecast_model_configs,
-            size_k=regime.horizon,
-            validation_len=regime.validation_len,
-            validation_stride=regime.stride,
-            seasonality_m=seasonality_m,
-            context_len=context_len,
-        )
-        for regime in regimes
-    }
+    strict_requirements = get_strict_forecast_requirements(
+        forecast_model_configs,
+        size_k=horizon,
+        validation_len=validation_len,
+        validation_stride=stride,
+        seasonality_m=seasonality_m,
+        context_len=context_len,
+    )
     context_requirement = max(
         context_len,
-        *(
-            int(requirement["prediction_context_hours"])
-            for requirement in strict_requirements.values()
-        ),
+        int(strict_requirements["prediction_context_hours"]),
     )
-    train_requirement = max(
-        int(requirement["minimum_hours"]) for requirement in strict_requirements.values()
-    )
-    host_requirement = max(
-        int(requirement["host_minimum_hours"])
-        for requirement in strict_requirements.values()
-    )
+    train_requirement = int(strict_requirements["minimum_hours"])
+    host_requirement = int(strict_requirements["host_minimum_hours"])
     strategy_specs = [
         spec.strip().lower()
         for spec in cfg_get_csv_list("forecasting", "strategies", DEFAULT_STRATEGIES)
@@ -830,8 +791,10 @@ def _run_benchmark_from_config(
             "raw_base_dir": raw_base_dir,
             "holdout": holdout,
             "context_len": context_len,
+            "horizon": horizon,
+            "stride": stride,
+            "validation_len": validation_len,
             "split_policy": "fixed-anomaly-mask-support-v2",
-            "regimes": [asdict(regime) for regime in regimes],
             "seed": seed,
             "device": device_request,
             "threshold_k": threshold_k,
@@ -901,20 +864,21 @@ def _run_benchmark_from_config(
     ).start()
     _ACTIVE_PROGRESS = progress
     run_started = time.perf_counter()
-    backtests_per_station = len(regimes) * sum(
+    backtests_per_station = sum(
         len(arms)
         if config.uses_training_arms
         else sum(arm.name in RAW_SOURCE_ARMS for arm in arms)
         for config in forecast_model_configs.values()
     )
     PROGRESS_LOGGER.info(
-        "[run] start stations=%d devices=%s models=%s arms=%s regimes=%s "
+        "[run] start stations=%d devices=%s models=%s arms=%s horizon=%d stride=%d "
         "backtests_per_station=%d cache=%s output=%s",
         len(series_dfs),
         ",".join(forecast_devices),
         ",".join(forecast_models),
         ",".join(arm.name for arm in arms),
-        ",".join(regime.name for regime in regimes),
+        horizon,
+        stride,
         backtests_per_station,
         cache.root if cache.enabled else "off",
         output_dir,
@@ -925,13 +889,13 @@ def _run_benchmark_from_config(
         "total=tasks for the current station; pending_gpu=queued GPU tasks"
     )
     PROGRESS_LOGGER.info(
-        "[log-guide] backtest identity is [series][regime][branch][model]; "
-        "series=station/series name, regime=short or long, "
+        "[log-guide] backtest identity is [series][branch][model]; "
+        "series=station/series name, "
         "branch=forecast arm (raw, unlabeled+impute, etc.), model=model name"
     )
     PROGRESS_LOGGER.info(
-        "[log-guide] example: [backtest task=18/172 completed=7/172]"
-        "[AQN1 - Puerto][long][unlabeled+impute][TiDE]"
+        "[log-guide] example: [backtest task=18/total completed=7/total]"
+        "[AQN1 - Puerto][unlabeled+impute][TiDE]"
     )
 
     rows: list[dict[str, Any]] = []
@@ -986,7 +950,9 @@ def _run_benchmark_from_config(
             "injection_policy": INJECTION_POLICY_VERSION,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
-            "regimes": [asdict(regime) for regime in regimes],
+            "horizon": horizon,
+            "stride": stride,
+            "validation_len": validation_len,
         }
         detections = _detect_for_strategies(
             series,
@@ -1071,7 +1037,7 @@ def _run_benchmark_from_config(
             holdout=holdout,
             context_len=context_requirement,
             train_min_len=train_requirement,
-            validation_len=max(regime.validation_len for regime in regimes),
+            validation_len=validation_len,
             freq=freq,
             host_min_len=host_requirement,
         )
@@ -1219,14 +1185,13 @@ def _run_benchmark_from_config(
             backtest_completed += 1
             status = "ok" if _cacheable_backtest(result) else "incomplete"
             PROGRESS_LOGGER.info(
-                "[backtest task=%d/%d completed=%d/%d][%s][%s][%s][%s] "
+                "[backtest task=%d/%d completed=%d/%d][%s][%s][%s] "
                 "done cache=%s status=%s train=%.1fs inference=%.1fs wall=%.1fs",
                 ordinal + 1,
                 backtests_per_station,
                 backtest_completed,
                 backtests_per_station,
                 common["series"],
-                common["regime"],
                 common["arm"],
                 model_name,
                 cache_state,
@@ -1240,192 +1205,185 @@ def _run_benchmark_from_config(
                 pending=len(pending_gpu),
                 detail=(
                     f"station={station_index}/{len(series_dfs)} name={name} "
-                    f"last={common['regime']}/{common['arm']}/{model_name}"
+                    f"last={common['arm']}/{model_name}"
                 ),
             )
 
-        for regime in regimes:
-            for arm in arms:
-                detection = detections.get(arm.strategy) if arm.strategy else None
-                n_train_anomalies = (
-                    int(
-                        (
-                            detection.mask.reindex(train_raw.index, fill_value=False).astype(bool)
-                            & train_raw.notna()
-                        ).sum()
-                    )
-                    if detection
-                    else 0
+        for arm in arms:
+            detection = detections.get(arm.strategy) if arm.strategy else None
+            n_train_anomalies = (
+                int(
+                    (
+                        detection.mask.reindex(train_raw.index, fill_value=False).astype(bool)
+                        & train_raw.notna()
+                    ).sum()
                 )
-                common = {
-                    "regime": regime.name,
-                    "horizon": regime.horizon,
-                    "forecast_stride": regime.stride,
-                    "validation_len": regime.validation_len,
-                    "validation_stride": regime.stride,
-                    "series": name,
+                if detection
+                else 0
+            )
+            common = {
+                "horizon": horizon,
+                "forecast_stride": stride,
+                "validation_len": validation_len,
+                "validation_stride": stride,
+                "series": name,
+                "arm": arm.name,
+                "strategy": arm.strategy or "none",
+                "imputed": arm.impute,
+                "imputation_model": imputation_model if arm.impute else "none",
+                "detectors": ",".join(detection.detectors) if detection else "",
+                "n_anomalies": n_train_anomalies,
+                "n_anomalies_full": detection.n_flagged if detection else 0,
+                "detection_scope": "full_series" if detection else "none",
+                "split_basis": "common_anomaly_mask_support" if detections else "raw",
+                "split_n_flagged": split_n_flagged,
+                "split_n_unscored": split_n_unscored,
+                "test_context_start": str(window["test_context_start"]),
+                "test_target_start": str(test_target_start),
+                "test_target_end": str(window["test_target_end"]),
+                "test_target_hours": window["test_target_hours"],
+            }
+            arm_strategy_key = (
+                asdict(strategy_by_spec[arm.strategy]) if arm.strategy else None
+            )
+            arm_test_series = test_for(arm)
+            arm_train_fp = (
+                frozen_train_fp if arm.name == RAW_FROZEN_ARM else train_fp
+            )
+            arm_test_fp = series_fingerprint(arm_test_series)
+            for model_name in forecast_models:
+                forecast_model_config = forecast_model_configs[model_name]
+                if (
+                    not forecast_model_config.uses_training_arms
+                    and arm.name not in RAW_SOURCE_ARMS
+                ):
+                    continue
+                ordinal = backtest_ordinal
+                backtest_ordinal += 1
+                backtest_key = {
+                    **base_key,
+                    "train_fp": arm_train_fp,
+                    "support_fp": support_fp,
+                    "stage": "backtest",
                     "arm": arm.name,
-                    "strategy": arm.strategy or "none",
-                    "imputed": arm.impute,
-                    "imputation_model": imputation_model if arm.impute else "none",
-                    "detectors": ",".join(detection.detectors) if detection else "",
-                    "n_anomalies": n_train_anomalies,
-                    "n_anomalies_full": detection.n_flagged if detection else 0,
-                    "detection_scope": "full_series" if detection else "none",
-                    "split_basis": "common_anomaly_mask_support" if detections else "raw",
-                    "split_n_flagged": split_n_flagged,
-                    "split_n_unscored": split_n_unscored,
-                    "test_context_start": str(window["test_context_start"]),
+                    "strategy": arm_strategy_key,
+                    "impute": arm.impute,
+                    "imputation_model": imputation_model if arm.impute else None,
+                    "model": model_name,
+                    "model_config": training_model_config,
+                    "forecast_model": effective_config(
+                        forecast_model_cache_identity(forecast_model_config)
+                    ),
+                    "imputer": imputer_identity if arm.impute else None,
+                    "seasonality_m": seasonality_m,
                     "test_target_start": str(test_target_start),
-                    "test_target_end": str(window["test_target_end"]),
-                    "test_target_hours": window["test_target_hours"],
+                    "test_fp": arm_test_fp,
                 }
-                arm_strategy_key = (
-                    asdict(strategy_by_spec[arm.strategy]) if arm.strategy else None
+                task_number = ordinal + 1
+                task_started = time.perf_counter()
+                res = cache.get("backtest", backtest_key)
+                cache_state = (
+                    "hit" if res is not None else ("miss" if cache.enabled else "off")
                 )
-                arm_test_series = test_for(arm)
-                arm_train_fp = (
-                    frozen_train_fp if arm.name == RAW_FROZEN_ARM else train_fp
-                )
-                arm_test_fp = series_fingerprint(arm_test_series)
-                for model_name in forecast_models:
-                    forecast_model_config = forecast_model_configs[model_name]
-                    if (
-                        not forecast_model_config.uses_training_arms
-                        and arm.name not in RAW_SOURCE_ARMS
-                    ):
-                        continue
-                    ordinal = backtest_ordinal
-                    backtest_ordinal += 1
-                    backtest_key = {
-                        **base_key,
-                        "train_fp": arm_train_fp,
-                        "support_fp": support_fp,
-                        "stage": "backtest",
-                        "arm": arm.name,
-                        "strategy": arm_strategy_key,
-                        "impute": arm.impute,
-                        "imputation_model": imputation_model if arm.impute else None,
-                        "model": model_name,
-                        "model_config": training_model_config,
-                        "forecast_model": effective_config(
-                            forecast_model_cache_identity(forecast_model_config)
-                        ),
-                        "imputer": imputer_identity if arm.impute else None,
-                        "regime": asdict(regime),
-                        "seasonality_m": seasonality_m,
-                        "test_target_start": str(test_target_start),
-                        "test_fp": arm_test_fp,
-                    }
-                    task_number = ordinal + 1
-                    task_started = time.perf_counter()
-                    res = cache.get("backtest", backtest_key)
-                    cache_state = (
-                        "hit" if res is not None else ("miss" if cache.enabled else "off")
-                    )
-                    if res is None:
-                        PROGRESS_LOGGER.info(
-                            "[backtest task=%d/%d][%s][%s][%s][%s] prepare cache=%s",
-                            task_number,
-                            backtests_per_station,
-                            name,
-                            regime.name,
-                            arm.name,
-                            model_name,
-                            cache_state,
-                        )
-                        progress.update(
-                            detail=(
-                                f"station={station_index}/{len(series_dfs)} name={name} "
-                                f"prepare={regime.name}/{arm.name}/{model_name}"
-                            )
-                        )
-                        arm_train = train_for(arm)
-                        if gpu_executor is not None and _uses_gpu_worker(
-                            forecast_model_config
-                        ):
-                            PROGRESS_LOGGER.info(
-                                "[backtest task=%d/%d][%s][%s][%s][%s] queued cache=%s",
-                                task_number,
-                                backtests_per_station,
-                                name,
-                                regime.name,
-                                arm.name,
-                                model_name,
-                                cache_state,
-                            )
-                            future = gpu_executor.submit(
-                                _run_gpu_backtest,
-                                _BacktestTask(
-                                    train_series=arm_train,
-                                    test_series=arm_test_series,
-                                    reference_insample=raw_reference,
-                                    model_name=model_name,
-                                    size_k=regime.horizon,
-                                    test_target_start=test_target_start,
-                                    seasonality_m=seasonality_m,
-                                    freq=freq,
-                                    validation_len=regime.validation_len,
-                                    validation_stride=regime.stride,
-                                    forecast_stride=regime.stride,
-                                    context_len=context_len,
-                                    series_name=name,
-                                    arm_name=arm.name,
-                                    regime_name=regime.name,
-                                    ordinal=task_number,
-                                    total=backtests_per_station,
-                                ),
-                            )
-                            pending_gpu[future] = (
-                                ordinal,
-                                common,
-                                model_name,
-                                forecast_model_config.mode,
-                                backtest_key,
-                                cache_state,
-                                task_started,
-                            )
-                            progress.update(pending=len(pending_gpu))
-                            continue
-                        PROGRESS_LOGGER.info(
-                            "[backtest task=%d/%d][%s][%s][%s][%s] start cache=%s device=cpu",
-                            task_number,
-                            backtests_per_station,
-                            name,
-                            regime.name,
-                            arm.name,
-                            model_name,
-                            cache_state,
-                        )
-                        res = backtest_forecast(
-                            arm_train,
-                            arm_test_series,
-                            model_name,
-                            size_k=regime.horizon,
-                            test_target_start=test_target_start,
-                            seasonality_m=seasonality_m,
-                            freq=freq,
-                            validation_len=regime.validation_len,
-                            validation_stride=regime.stride,
-                            forecast_stride=regime.stride,
-                            context_len=context_len,
-                            cleanup_checkpoints=True,
-                            model_config=forecast_model_config,
-                            # Every arm uses the primary raw history available
-                            # before each origin for its seasonal-naive scales.
-                            reference_insample=raw_reference,
-                        )
-                        if _cacheable_backtest(res):
-                            cache.put("backtest", backtest_key, res)
-                    store_backtest_row(
-                        ordinal,
-                        common,
+                if res is None:
+                    PROGRESS_LOGGER.info(
+                        "[backtest task=%d/%d][%s][%s][%s] prepare cache=%s",
+                        task_number,
+                        backtests_per_station,
+                        name,
+                        arm.name,
                         model_name,
-                        forecast_model_config.mode,
-                        res,
-                        cache_state=cache_state,
-                        wall_seconds=time.perf_counter() - task_started,
+                        cache_state,
                     )
+                    progress.update(
+                        detail=(
+                            f"station={station_index}/{len(series_dfs)} name={name} "
+                            f"prepare={arm.name}/{model_name}"
+                        )
+                    )
+                    arm_train = train_for(arm)
+                    if gpu_executor is not None and _uses_gpu_worker(
+                        forecast_model_config
+                    ):
+                        PROGRESS_LOGGER.info(
+                            "[backtest task=%d/%d][%s][%s][%s] queued cache=%s",
+                            task_number,
+                            backtests_per_station,
+                            name,
+                            arm.name,
+                            model_name,
+                            cache_state,
+                        )
+                        future = gpu_executor.submit(
+                            _run_gpu_backtest,
+                            _BacktestTask(
+                                train_series=arm_train,
+                                test_series=arm_test_series,
+                                reference_insample=raw_reference,
+                                model_name=model_name,
+                                size_k=horizon,
+                                test_target_start=test_target_start,
+                                seasonality_m=seasonality_m,
+                                freq=freq,
+                                validation_len=validation_len,
+                                validation_stride=stride,
+                                forecast_stride=stride,
+                                context_len=context_len,
+                                series_name=name,
+                                arm_name=arm.name,
+                                ordinal=task_number,
+                                total=backtests_per_station,
+                            ),
+                        )
+                        pending_gpu[future] = (
+                            ordinal,
+                            common,
+                            model_name,
+                            forecast_model_config.mode,
+                            backtest_key,
+                            cache_state,
+                            task_started,
+                        )
+                        progress.update(pending=len(pending_gpu))
+                        continue
+                    PROGRESS_LOGGER.info(
+                        "[backtest task=%d/%d][%s][%s][%s] start cache=%s device=cpu",
+                        task_number,
+                        backtests_per_station,
+                        name,
+                        arm.name,
+                        model_name,
+                        cache_state,
+                    )
+                    res = backtest_forecast(
+                        arm_train,
+                        arm_test_series,
+                        model_name,
+                        size_k=horizon,
+                        test_target_start=test_target_start,
+                        seasonality_m=seasonality_m,
+                        freq=freq,
+                        validation_len=validation_len,
+                        validation_stride=stride,
+                        forecast_stride=stride,
+                        context_len=context_len,
+                        cleanup_checkpoints=True,
+                        model_config=forecast_model_config,
+                        # Every arm uses the primary raw history available
+                        # before each origin for its seasonal-naive scales.
+                        reference_insample=raw_reference,
+                    )
+                    if _cacheable_backtest(res):
+                        cache.put("backtest", backtest_key, res)
+                store_backtest_row(
+                    ordinal,
+                    common,
+                    model_name,
+                    forecast_model_config.mode,
+                    res,
+                    cache_state=cache_state,
+                    wall_seconds=time.perf_counter() - task_started,
+                )
 
         for gpu_completed, future in enumerate(as_completed(pending_gpu), start=1):
             (
@@ -1453,39 +1411,37 @@ def _run_benchmark_from_config(
         rows.extend(series_backtest_rows[index] for index in sorted(series_backtest_rows))
 
         if foundation_test_enabled:
-            for regime in regimes:
+            for _ in (None,):
                 cases = build_synthetic_context_cases(
                     test_series,
                     test_target_start=test_target_start,
                     context_len=context_len,
-                    horizon=regime.horizon,
-                    stride=regime.stride,
+                    horizon=horizon,
+                    stride=stride,
                     repeats=foundation_test_repeats,
                     test_seed=series_foundation_test_seed,
                     freq=freq,
                 )
                 progress.update(
                     stage="foundation-prepare",
-                    detail=f"station={name} regime={regime.name}",
+                    detail=f"station={name}",
                     completed=0,
                     total=len(cases),
                     pending=0,
                 )
                 PROGRESS_LOGGER.info(
-                    "[foundation][%s][%s] prepare-cases start cases=%d",
+                    "[foundation][%s] prepare-cases start cases=%d",
                     name,
-                    regime.name,
                     len(cases),
                 )
                 prepared_cases = []
                 for case_index, case in enumerate(cases, start=1):
                     case_started = time.perf_counter()
                     PROGRESS_LOGGER.info(
-                        "[foundation-case %d/%d][%s][%s][%s] start origin=%s",
+                        "[foundation-case %d/%d][%s][%s] start origin=%s",
                         case_index,
                         len(cases),
                         name,
-                        regime.name,
                         case.anomaly_type,
                         case.origin,
                     )
@@ -1538,11 +1494,10 @@ def _run_benchmark_from_config(
                         )
                     )
                     PROGRESS_LOGGER.info(
-                        "[foundation-case %d/%d][%s][%s][%s] done elapsed=%.1fs",
+                        "[foundation-case %d/%d][%s][%s] done elapsed=%.1fs",
                         case_index,
                         len(cases),
                         name,
-                        regime.name,
                         case.anomaly_type,
                         time.perf_counter() - case_started,
                     )
@@ -1554,7 +1509,7 @@ def _run_benchmark_from_config(
                 foundation_completed = 0
                 progress.update(
                     stage="foundation-forecast",
-                    detail=f"station={name} regime={regime.name}",
+                    detail=f"station={name}",
                     completed=0,
                     total=foundation_total,
                     pending=0,
@@ -1585,7 +1540,9 @@ def _run_benchmark_from_config(
                                     forecast_model_cache_identity(model_config)
                                 ),
                                 "model_config": training_model_config,
-                                "regime": asdict(regime),
+                                "horizon": horizon,
+                                "stride": stride,
+                                "validation_len": validation_len,
                                 "condition": condition,
                                 "anomaly_type": case.anomaly_type,
                                 "test_seed": case.test_seed,
@@ -1605,12 +1562,11 @@ def _run_benchmark_from_config(
                             )
                             if result is None:
                                 PROGRESS_LOGGER.info(
-                                    "[foundation task=%d/%d][%s][%s][%s][%s][%s] "
+                                    "[foundation task=%d/%d][%s][%s][%s][%s] "
                                     "start cache=%s",
                                     task_number,
                                     foundation_total,
                                     name,
-                                    regime.name,
                                     model_name,
                                     case.anomaly_type,
                                     condition,
@@ -1618,16 +1574,15 @@ def _run_benchmark_from_config(
                                 )
                                 if prepared_model is None and prepare_error is None:
                                     PROGRESS_LOGGER.info(
-                                        "[foundation-model][%s][%s][%s] load start",
+                                        "[foundation-model][%s][%s] load start",
                                         name,
-                                        regime.name,
                                         model_name,
                                     )
                                     try:
                                         prepared_model = prepare_foundation_model(
                                             train_raw,
                                             model_name,
-                                            size_k=regime.horizon,
+                                            size_k=horizon,
                                             seasonality_m=seasonality_m,
                                             freq=freq,
                                             context_len=context_len,
@@ -1636,10 +1591,9 @@ def _run_benchmark_from_config(
                                     except Exception as exc:
                                         prepare_error = f"{type(exc).__name__}: {exc}"
                                     PROGRESS_LOGGER.info(
-                                        "[foundation-model][%s][%s][%s] load done "
+                                        "[foundation-model][%s][%s] load done "
                                         "status=%s elapsed=%.1fs",
                                         name,
-                                        regime.name,
                                         model_name,
                                         "failed" if prepare_error else "ok",
                                         time.perf_counter() - task_started,
@@ -1711,7 +1665,7 @@ def _run_benchmark_from_config(
                                                 f"{first_error}"
                                             )
                                     if _cacheable_foundation_test(
-                                        result, regime.horizon
+                                        result, horizon
                                     ):
                                         result["failure_reason"] = ""
                                         cache.put(
@@ -1723,8 +1677,7 @@ def _run_benchmark_from_config(
                             foundation_preprocessing_rows.append(
                                 {
                                     "series": name,
-                                    "regime": regime.name,
-                                    "horizon": regime.horizon,
+                                    "horizon": horizon,
                                     "model": model_name,
                                     "case_id": case.case_id,
                                     "anomaly_type": case.anomaly_type,
@@ -1768,19 +1721,18 @@ def _run_benchmark_from_config(
                             foundation_completed += 1
                             status = (
                                 "ok"
-                                if _cacheable_foundation_test(result, regime.horizon)
+                                if _cacheable_foundation_test(result, horizon)
                                 else "failed"
                             )
                             PROGRESS_LOGGER.info(
                                 "[foundation task=%d/%d completed=%d/%d]"
-                                "[%s][%s][%s][%s][%s] done cache=%s status=%s "
+                                "[%s][%s][%s][%s] done cache=%s status=%s "
                                 "load=%.1fs inference=%.1fs wall=%.1fs imputed=%s",
                                 task_number,
                                 foundation_total,
                                 foundation_completed,
                                 foundation_total,
                                 name,
-                                regime.name,
                                 model_name,
                                 case.anomaly_type,
                                 condition,
@@ -1794,7 +1746,7 @@ def _run_benchmark_from_config(
                             progress.update(
                                 completed=foundation_completed,
                                 detail=(
-                                    f"station={name} regime={regime.name} "
+                                    f"station={name} "
                                     f"last={model_name}/{case.anomaly_type}/{condition}"
                                 ),
                             )
@@ -1916,7 +1868,7 @@ def main() -> None:
         print("[info] Benchmark sin filas (revisa los bloques de train/validacion/test).")
     else:
         macro = (
-            results_df.groupby(["regime", "arm", "model"], sort=False)[list(METRIC_COLS)]
+            results_df.groupby(["arm", "model"], sort=False)[list(METRIC_COLS)]
             .mean()
             .reset_index()
         )
