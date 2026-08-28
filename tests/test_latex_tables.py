@@ -28,7 +28,7 @@ def _overall_frame() -> pd.DataFrame:
                 "N_Gaps": 2,
                 "N_Contexts": 4,
             }
-            for metric in ("MAE", "RMSE", "MASE")
+            for metric in ("MAE", "RMSE", "MASE", "RMSSE")
             for model, mean, rank in (("A_Model", 1.0, 1.0), ("B_Model", 2.0, 2.0))
         ]
     )
@@ -38,14 +38,14 @@ def test_summary_tables_select_and_sort_models() -> None:
     overall = _overall_frame()
     summary = build_overall_summary(overall, top_k=1)
 
-    assert len(summary) == 3
-    assert summary["Modelo"].tolist() == ["A_Model"] * 3
-    assert summary["Rank_Mean"].tolist() == [1, 1, 1]
+    assert summary["Metric"].tolist() == ["MAE", "RMSE", "MASE", "RMSSE"]
+    assert summary["Modelo"].tolist() == ["A_Model"] * 4
+    assert summary["Rank_Mean"].tolist() == [1] * 4
 
     by_gap = overall.assign(Gap_Size=1).rename(columns={"Mean_Rank": "Mean_Rank"})
     gap_summary = build_gap_summary(by_gap, top_k=1)
-    assert len(gap_summary) == 3
-    assert gap_summary["Modelo"].tolist() == ["A_Model"] * 3
+    assert len(gap_summary) == 4
+    assert gap_summary["Modelo"].tolist() == ["A_Model"] * 4
 
 
 def test_profile_summary_keeps_relative_tolerances() -> None:
@@ -60,7 +60,7 @@ def test_profile_summary_keeps_relative_tolerances() -> None:
                 "Tolerance_Percent": tolerance,
                 "Context_Percent": 100.0 if model == "A_Model" else 50.0,
             }
-            for metric in ("MAE", "RMSE", "MASE")
+            for metric in ("MAE", "RMSE", "MASE", "RMSSE")
             for model in ("A_Model", "B_Model")
             for tolerance in (0.0, 5.0, 10.0, 25.0, 50.0)
         ]
@@ -85,7 +85,7 @@ def test_export_latex_tables_reads_run_csvs(tmp_path: Path) -> None:
                 "Tolerance_Percent": tolerance,
                 "Context_Percent": 100.0,
             }
-            for metric in ("MAE", "RMSE", "MASE")
+            for metric in ("MAE", "RMSE", "MASE", "RMSSE")
             for model in ("A_Model", "B_Model")
             for tolerance in (0.0, 5.0, 10.0, 25.0, 50.0)
         ]
@@ -100,5 +100,8 @@ def test_export_latex_tables_reads_run_csvs(tmp_path: Path) -> None:
     assert len(outputs) == 6
     assert (tmp_path / "latex_tables/overall_model_summary.tex").exists()
     assert "A\\_Model" in (
+        tmp_path / "latex_tables/overall_model_summary.tex"
+    ).read_text(encoding="utf-8")
+    assert "RMSSE" in (
         tmp_path / "latex_tables/overall_model_summary.tex"
     ).read_text(encoding="utf-8")

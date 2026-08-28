@@ -106,12 +106,14 @@ def test_summarize_results_by_model_groups_and_sorts() -> None:
             "MAE": [1.0, 2.0, 0.5],
             "RMSE": [1.2, 2.2, 0.4],
             "MASE": [1.1, 2.1, 0.3],
+            "RMSSE": [1.3, 2.3, 0.2],
         }
     )
 
     out = summarize_results_by_model(df)
 
     assert list(out["Modelo"]) == ["B", "A"]
+    assert out.loc[out["Modelo"] == "A", "RMSSE"].item() == pytest.approx(1.8)
 
 
 def test_summarize_results_by_model_averages_impute_seconds() -> None:
@@ -473,6 +475,7 @@ def test_summarize_montecarlo_rankings_aggregates_and_sorts() -> None:
             "MAE": [2.0, 4.0, 1.0, 1.0],
             "RMSE": [2.0, 4.0, 1.0, 1.0],
             "MASE": [2.0, 4.0, 1.0, 1.0],
+            "RMSSE": [3.0, 5.0, 2.0, 2.0],
         }
     )
 
@@ -481,6 +484,7 @@ def test_summarize_montecarlo_rankings_aggregates_and_sorts() -> None:
     assert list(out["Modelo"]) == ["B", "A"]
     assert list(out["Runs"]) == [2, 2]
     assert out.loc[out["Modelo"] == "A", "MASE_Mean"].item() == 3.0
+    assert out.loc[out["Modelo"] == "A", "RMSSE_Mean"].item() == 4.0
 
 
 def test_load_darts_models_from_artifacts_loads_cpu_model_and_skips_missing(

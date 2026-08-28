@@ -187,6 +187,7 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
                             "MAE": base,
                             "RMSE": base + 0.4,
                             "MASE": base / 5.0,
+                            "RMSSE": base / 6.0,
                             "Test_Block_Points": 100 if station != "C" else 80,
                             "Test_Hours": 200 if station != "C" else 160,
                         }
@@ -222,7 +223,7 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         "tail_risk_plot_paths",
         "error_correlation_plot_paths",
     ):
-        assert set(artifacts[key]) == {"MAE", "RMSE", "MASE"}
+        assert set(artifacts[key]) == {"MAE", "RMSE", "MASE", "RMSSE"}
         assert all(path.exists() for path in artifacts[key].values())
 
     expected_tables = (
@@ -242,6 +243,6 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         tmp_path / filename for filename in expected_tables
     }
     gap_table = pd.read_csv(tmp_path / "model_performance_by_gap.csv")
-    assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE"}
+    assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE"}
     assert gap_table["N_Stations"].eq(3).all()
     assert all(not (tmp_path / filename).exists() for filename in obsolete_plots)

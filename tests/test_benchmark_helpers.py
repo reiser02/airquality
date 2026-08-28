@@ -335,7 +335,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         ):
             del series_name, all_series_map, test_index, scaler, freq, config_workers
             mask_index = _gap_windows_to_mask_index(gap_windows)
-            return pd.Series([30.0, 40.0], index=mask_index, dtype=float), []
+            return pd.Series([30.0, 50.0], index=mask_index, dtype=float), []
 
     full = _series([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], name="S")
     frame = full.to_frame(name="S")
@@ -356,7 +356,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         gap_sizes=(2,),
         num_gaps=1,
         gap_spec_by_series={"S": [(gap_start, 2)]},
-        metrics=("mae", "rmse", "mase"),
+        metrics=("mae", "rmse", "mase", "rmsse"),
         seasonality_m=1,
         freq="h",
         random_seed=123,
@@ -382,14 +382,16 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         "MAE",
         "RMSE",
         "MASE",
+        "RMSSE",
     ]
     assert results_df.loc[0, "Modelo"] == "Stub"
     assert results_df.loc[0, "Serie"] == "S"
     assert results_df.loc[0, "Gap_Size"] == 2
     assert results_df.loc[0, "Impute_Seconds"] >= 0.0
-    assert results_df.loc[0, "MAE"] == pytest.approx(20.0)
-    assert results_df.loc[0, "RMSE"] == pytest.approx(((20.0**2 + 20.0**2) / 2) ** 0.5)
-    assert results_df.loc[0, "MASE"] == pytest.approx(2.0)
+    assert results_df.loc[0, "MAE"] == pytest.approx(15.0)
+    assert results_df.loc[0, "RMSE"] == pytest.approx(((20.0**2 + 10.0**2) / 2) ** 0.5)
+    assert results_df.loc[0, "MASE"] == pytest.approx(1.5)
+    assert results_df.loc[0, "RMSSE"] == pytest.approx(10**0.5 / 2)
     assert results_df.loc[0, "N_Gaps_Target"] == 1
     assert results_df.loc[0, "N_Gaps_Scored"] == 1
     assert results_df.loc[0, "N_Target_Points"] == 2
@@ -404,10 +406,10 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     )
     pred = plot_store[2]["series"]["S"]["preds"]["Stub"]
     assert list(pred.index) == list(pd.date_range(gap_start, periods=2, freq="h"))
-    assert list(pred.values) == [30.0, 40.0]
+    assert list(pred.values) == [30.0, 50.0]
 
 
-def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
+def test_scaled_metrics_per_gap_advancing_context_and_weighted_average() -> None:
     class MockMultiGapImputer:
         model_name = "Mock"
 
@@ -459,7 +461,7 @@ def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
         gap_sizes=(5,),
         num_gaps=2,
         gap_spec_by_series={"S": gap_spec},
-        metrics=("mae", "rmse", "mase"),
+        metrics=("mae", "rmse", "mase", "rmsse"),
         seasonality_m=5,
         freq="h",
         random_seed=123,
@@ -469,3 +471,4 @@ def test_mase_per_gap_advancing_context_and_weighted_average() -> None:
     assert results_df.loc[0, "MAE"] == pytest.approx(16.0)
     assert results_df.loc[0, "RMSE"] == pytest.approx(16.73320053068151)
     assert results_df.loc[0, "MASE"] == pytest.approx(0.4)
+    assert results_df.loc[0, "RMSSE"] == pytest.approx(0.4)

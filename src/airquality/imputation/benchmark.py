@@ -11,7 +11,7 @@ import pandas as pd  # Time-indexed series/dataframe processing.
 from darts import TimeSeries  # Darts time series container used across the module.
 from airquality.data.series import ensure_datetime_series, to_pd_series
 from airquality.modeling.training_config import BenchmarkDatasetBundle
-from airquality.metrics import compute_mase
+from airquality.metrics import compute_mase, compute_rmsse
 
 
 DEFAULT_CONFIG_WORKERS = {
@@ -640,8 +640,8 @@ def _build_metric_row(
     n_scored_points = int(valid_pairs.sum())
     scale_std = _scaler_standard_deviation(metric_scaler)
 
-    # MAE and RMSE use the station's train-only standard scale. MASE retains
-    # its seasonal-naive scale and remains directly comparable to prior runs.
+    # MAE and RMSE use the station's train-only standard scale. MASE and RMSSE
+    # retain their seasonal-naive scales and remain directly comparable to prior runs.
     mae_rmse_metrics = [m for m in metric_list if m in ("mae", "rmse")]
     row: dict[str, Any] = {
         "Modelo": str(model_name),
@@ -670,10 +670,19 @@ def _build_metric_row(
         )
         row.update(mae_rmse_values)
 
-    if "mase" in metric_list:
-        gap_mases: list[float] = []
-        gap_lengths: list[int] = []
-
+    scaled_metric_functions = {
+        "mase": compute_mase,
+        "rmsse": compute_rmsse,
+    }
+    scaled_values: dict[str, list[float]] = {
+        metric: []
+        for metric in scaled_metric_functions
+        if metric in metric_list
+    }
+    scaled_lengths: dict[str, list[int]] = {
+        metric: [] for metric in scaled_values
+    }
+    if scaled_values:
         full_series = all_series_map[series_name]
 
         for gap_idx in gap_windows:
@@ -681,31 +690,31 @@ def _build_metric_row(
                 continue
 
             gap_start = pd.Timestamp(gap_idx.min())
-
             actual_gap = ts_test_unscaled.reindex(gap_idx)
             pred_gap = pred_mask.reindex(gap_idx)
-
             insample = full_series.loc[full_series.index < gap_start].copy()
 
-            gap_mase = compute_mase(
-                actual=actual_gap,
-                pred=pred_gap,
-                insample=insample,
-                seasonality_m=seasonality_m,
-            )
+            for metric_name, metric_function in scaled_metric_functions.items():
+                if metric_name not in scaled_values:
+                    continue
+                value = metric_function(
+                    actual=actual_gap,
+                    pred=pred_gap,
+                    insample=insample,
+                    seasonality_m=seasonality_m,
+                )
+                if np.isfinite(value):
+                    scaled_values[metric_name].append(value)
+                    scaled_lengths[metric_name].append(len(gap_idx))
 
-            if np.isfinite(gap_mase):
-                gap_mases.append(gap_mase)
-                gap_lengths.append(len(gap_idx))
-
-        if len(gap_mases) > 0:
-            total_len = sum(gap_lengths)
-            weighted_sum = sum(m * l for m, l in zip(gap_mases, gap_lengths))
-            final_mase = weighted_sum / total_len
-        else:
-            final_mase = float("nan")
-
-        row["MASE"] = final_mase
+        for metric_name, values in scaled_values.items():
+            lengths = scaled_lengths[metric_name]
+            if values:
+                row[metric_name.upper()] = sum(
+                    value * length for value, length in zip(values, lengths)
+                ) / sum(lengths)
+            else:
+                row[metric_name.upper()] = float("nan")
 
     return row
 
@@ -801,7 +810,7 @@ def execute_complete_pipeline(
     gap_strategy: str = "block",
     hybrid_random_fraction: float = 0.75,
     gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None = None,
-    metrics: Sequence[str] = ("mae", "rmse", "mase"),
+    metrics: Sequence[str] = ("mae", "rmse", "mase", "rmsse"),
     seasonality_m: int = 24,
     freq: str = "h",
     random_seed: int = 42,
@@ -815,13 +824,14 @@ def execute_complete_pipeline(
     - Receive one dataset bundle and already-loaded models.
     - Generate (or receive) artificial gaps compatible with TSPulse notebook ideas.
     - Impute with TSPulse and Darts.
-    - Evaluate train-standardized MAE/RMSE and MASE strictly on missing points.
+    - Evaluate train-standardized MAE/RMSE and seasonal-scaled MASE/RMSSE strictly
+      on missing points.
     - Scale-sensitive models (those without `requires_unscaled_input`) predict on
       scaled values and their output is inverse-transformed before applying the
       common train-only station scale; models that require unscaled input consume
       the original scale directly.
     - `dataset_bundle.all_series_unscaled` is required and used as the source of
-      pre-test history for context/MASE.
+      pre-test history for context/MASE/RMSSE.
     - Return predictions, metrics, and plotting payload.
 
     Returns
@@ -836,7 +846,7 @@ def execute_complete_pipeline(
 
     metric_list = [str(m).strip().lower() for m in metrics]
     for m in metric_list:
-        if m not in {"mae", "rmse", "mase"}:
+        if m not in {"mae", "rmse", "mase", "rmsse"}:
             raise ValueError(f"Metrica no soportada: {m}")
 
     if config_workers is None:

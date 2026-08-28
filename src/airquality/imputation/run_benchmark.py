@@ -88,7 +88,9 @@ def _default_gap_counts() -> tuple[int, ...] | None:
 
 def _default_metrics() -> tuple[str, ...]:
     """Return the default metric names computed by the benchmark."""
-    return cfg_get_csv_list("benchmark", "metrics", ("mae", "rmse", "mase"))
+    return cfg_get_csv_list(
+        "benchmark", "metrics", ("mae", "rmse", "mase", "rmsse")
+    )
 
 
 def _default_strict_artifacts() -> bool:
@@ -576,7 +578,9 @@ def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
     imputation wall time), when present, are averaged alongside the error metrics
     but never used for ordering.
     """
-    metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in results_df.columns]
+    metric_cols = [
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_df.columns
+    ]
     if not metric_cols:
         return pd.DataFrame(columns=["Modelo"])
 
@@ -585,7 +589,9 @@ def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
     ranking_df = (
         results_df.groupby("Modelo", as_index=False)[avg_cols]
         .mean(numeric_only=True)
-        .sort_values([c for c in ("MASE", "RMSE", "MAE") if c in metric_cols])
+        .sort_values(
+            [c for c in ("MASE", "RMSSE", "RMSE", "MAE") if c in metric_cols]
+        )
         .reset_index(drop=True)
     )
     return ranking_df
@@ -1080,7 +1086,9 @@ def _build_montecarlo_seed_list(
 
 def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFrame:
     """Summarize per-seed rankings with mean, spread, and quantiles by model."""
-    metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in ranking_by_seed_df.columns]
+    metric_cols = [
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in ranking_by_seed_df.columns
+    ]
     if ranking_by_seed_df.empty or not metric_cols:
         return pd.DataFrame(columns=["Modelo", "Runs"])
 
@@ -1101,7 +1109,11 @@ def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFr
         rows.append(row)
 
     summary_df = pd.DataFrame(rows)
-    sort_cols = [c for c in ("MASE_Mean", "RMSE_Mean", "MAE_Mean") if c in summary_df.columns]
+    sort_cols = [
+        c
+        for c in ("MASE_Mean", "RMSSE_Mean", "RMSE_Mean", "MAE_Mean")
+        if c in summary_df.columns
+    ]
     if sort_cols:
         summary_df = summary_df.sort_values(sort_cols).reset_index(drop=True)
     return summary_df
@@ -1321,7 +1333,9 @@ def run_imputation_benchmark_parallel_montecarlo(
                         )
 
     results_mc_df = pd.concat(results_runs, ignore_index=True)
-    metric_cols = [m for m in ("MAE", "RMSE", "MASE") if m in results_mc_df.columns]
+    metric_cols = [
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_mc_df.columns
+    ]
     if metric_cols:
         ranking_by_seed_df = (
             results_mc_df.groupby(["Seed", "MonteCarlo_Run", "Modelo"], as_index=False)[metric_cols]

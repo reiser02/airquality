@@ -36,6 +36,7 @@ def _results_df(n_series: int = 3, gap_sizes: tuple[int, ...] = (1, 5)) -> pd.Da
                         "MAE": 1.0 + rng.uniform(0, 0.5),
                         "RMSE": 1.2 + rng.uniform(0, 0.6),
                         "MASE": 0.8 + rng.uniform(0, 0.6),
+                        "RMSSE": 0.9 + rng.uniform(0, 0.7),
                     }
                 )
     return pd.DataFrame(rows)
@@ -104,6 +105,7 @@ def test_render_timing_figures_names(tmp_path):
     assert names == {
         "imputation_time_by_model.png",
         "imputation_time_vs_mase.png",
+        "imputation_time_vs_rmsse.png",
         "imputation_time_vs_rmse.png",
         "imputation_time_vs_mae.png",
     }

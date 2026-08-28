@@ -16,7 +16,7 @@ from typing import Final
 import pandas as pd
 
 
-METRIC_ORDER: Final[tuple[str, ...]] = ("MAE", "RMSE", "MASE")
+METRIC_ORDER: Final[tuple[str, ...]] = ("MAE", "RMSE", "MASE", "RMSSE")
 PROFILE_TOLERANCES: Final[tuple[float, ...]] = (0.0, 5.0, 10.0, 25.0, 50.0)
 
 
