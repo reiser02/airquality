@@ -16,8 +16,7 @@ from airquality.visualizations.anomaly import (
 )
 
 
-SHORT_COLOR = "#3d7ab5"
-LONG_COLOR = "#cf6f1e"
+PROTOCOL_COLOR = "#3d7ab5"
 
 
 def _requirement_note(table: pd.DataFrame) -> str:
@@ -27,17 +26,12 @@ def _requirement_note(table: pd.DataFrame) -> str:
         if "TOTAL" in table["pollutant"].values
         else table.iloc[0]
     )
-    parts = [
-        f"{regime} {int(row[f'{regime}_host_minimum_hours'])} h "
-        f"({row[f'{regime}_limiting_models']})"
-        for regime in ("short", "long")
-    ]
     model_count = len(
         [name for name in str(row["forecast_models"]).split(",") if name.strip()]
     )
     return (
         f"Peor caso entre {model_count} modelos configurados: "
-        + "; ".join(parts)
+        f"{int(row['host_minimum_hours'])} h ({row['limiting_models']})"
         + "."
     )
 
@@ -68,33 +62,24 @@ def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
 def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
     """Contrast the share of usable blocks with their retained hour share."""
     total = summary.loc[summary["pollutant"] == "TOTAL"].iloc[0]
-    regimes = ("short", "long")
-    labels = []
-    validation_labels = []
-    for regime, display in (("short", "Short"), ("long", "Long")):
-        minimum = int(total[f"{regime}_minimum_hours"])
-        stride = int(total[f"{regime}_stride_hours"])
-        host_minimum = int(total[f"{regime}_host_minimum_hours"])
-        validation = int(total[f"{regime}_validation_reserve_hours"])
-        forecasts = int(total[f"{regime}_validation_forecasts"])
-        labels.append(
-            f"{display}\ntrain mínimo nativo: {minimum} h\n"
-            f"validación: +{validation} h, stride {stride} ({forecasts} ventanas; "
-            f"anfitrión: {host_minimum} h)"
-        )
-        validation_labels.append(f"{display.lower()} {validation} h ({forecasts} ventanas)")
-    block_counts = np.asarray(
-        [total[f"{regime}_used_blocks"] for regime in regimes], dtype=int
-    )
-    hour_counts = np.asarray(
-        [total[f"{regime}_effective_training_hours"] for regime in regimes],
-        dtype=int,
-    )
+    minimum = int(total["minimum_hours"])
+    stride = int(total["stride_hours"])
+    host_minimum = int(total["host_minimum_hours"])
+    validation = int(total["validation_reserve_hours"])
+    forecasts = int(total["validation_forecasts"])
+    labels = [
+        f"Protocolo\ntrain mínimo nativo: {minimum} h\n"
+        f"validación: +{validation} h, stride {stride} ({forecasts} ventanas; "
+        f"anfitrión: {host_minimum} h)"
+    ]
+    validation_labels = [f"validación {validation} h ({forecasts} ventanas)"]
+    block_counts = np.asarray([total["used_blocks"]], dtype=int)
+    hour_counts = np.asarray([total["effective_training_hours"]], dtype=int)
     block_pct = 100.0 * block_counts / float(total["total_blocks"])
     hour_pct = 100.0 * hour_counts / float(total["observed_hours"])
 
     figure, axis = plt.subplots(figsize=(10, 6.5), facecolor=FIGURE_FACE)
-    x = np.arange(len(regimes))
+    x = np.arange(1)
     width = 0.32
     block_bars = axis.bar(
         x - width / 2,
@@ -161,18 +146,14 @@ def save_block_length_distribution(
     """Plot the distribution of contiguous block lengths and model minima."""
     lengths = blocks["hours"].to_numpy(dtype=float)
     bins = np.geomspace(1, lengths.max() + 1, 45)
-    short_min = int(series["short_minimum_hours"].iloc[0])
-    long_min = int(series["long_minimum_hours"].iloc[0])
-    short_host = int(series["short_host_minimum_hours"].iloc[0])
-    long_host = int(series["long_host_minimum_hours"].iloc[0])
+    minimum = int(series["minimum_hours"].iloc[0])
+    host_minimum = int(series["host_minimum_hours"].iloc[0])
 
     figure, axis = plt.subplots(figsize=(11, 6), facecolor=FIGURE_FACE)
     axis.hist(lengths, bins=bins, color="#8c6d4b", edgecolor="#fffaf2", alpha=0.9)
     lines = (
-        (short_min, SHORT_COLOR, f"Short train: {short_min} h"),
-        (short_host, SHORT_COLOR, f"Short + validación: {short_host} h"),
-        (long_min, LONG_COLOR, f"Long train: {long_min} h"),
-        (long_host, LONG_COLOR, f"Long + validación: {long_host} h"),
+        (minimum, PROTOCOL_COLOR, f"Train: {minimum} h"),
+        (host_minimum, PROTOCOL_COLOR, f"Train + validación: {host_minimum} h"),
     )
     for value, color, label in lines:
         axis.axvline(
@@ -205,14 +186,13 @@ def _save_series_comparison(
     path: Path,
     series: pd.DataFrame,
     *,
-    short_column: str,
-    long_column: str,
+    value_column: str,
     title: str,
     subtitle: str,
     xlabel: str,
     xlim: tuple[float, float] | None = None,
 ) -> None:
-    """Compare short and long regime values for every pollutant series."""
+    """Compare one protocol value for every pollutant series."""
     pollutants = list(dict.fromkeys(series["pollutant"]))
     figure, axes = plt.subplots(
         1,
@@ -222,27 +202,15 @@ def _save_series_comparison(
         squeeze=False,
     )
     for axis, pollutant in zip(axes[0], pollutants, strict=True):
-        subset = series.loc[series["pollutant"] == pollutant].sort_values(long_column)
+        subset = series.loc[series["pollutant"] == pollutant].sort_values(value_column)
         y = np.arange(len(subset))
-        short = subset[short_column].to_numpy(dtype=float)
-        long = subset[long_column].to_numpy(dtype=float)
-        axis.hlines(y, long, short, color="#b8aa99", linewidth=1.2)
         axis.scatter(
-            short,
+            subset[value_column].to_numpy(dtype=float),
             y,
-            color=SHORT_COLOR,
+            color=PROTOCOL_COLOR,
             edgecolor=EDGE_COLOR,
             s=34,
-            label="Short",
-            zorder=3,
-        )
-        axis.scatter(
-            long,
-            y,
-            color=LONG_COLOR,
-            edgecolor=EDGE_COLOR,
-            s=34,
-            label="Long",
+            label="Protocolo",
             zorder=3,
         )
         axis.set_yticks(y, subset["station"], fontsize=8)
@@ -280,8 +248,7 @@ def save_figures(
     _save_series_comparison(
         paths[2],
         series,
-        short_column="short_retained_pct",
-        long_column="long_retained_pct",
+        value_column="retained_pct",
         title="Horas de entrenamiento retenidas por serie",
         subtitle="Porcentaje del historial observado anterior al holdout, después de reservar validación.",
         xlabel="Horas retenidas (%)",
@@ -290,8 +257,7 @@ def save_figures(
     _save_series_comparison(
         paths[3],
         series,
-        short_column="short_used_blocks",
-        long_column="long_used_blocks",
+        value_column="used_blocks",
         title="Bloques utilizables por serie",
         subtitle="El prefijo del bloque anfitrión cuenta como train; los bloques posteriores se excluyen.",
         xlabel="Número de bloques efectivos",

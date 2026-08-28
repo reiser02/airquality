@@ -142,7 +142,7 @@ def improvement_table(results_df: pd.DataFrame, metric: str, model: str) -> pd.D
     ``100 * (raw - arm) / raw`` — positive means the arm forecasts better.
     """
     subset = results_df[results_df["model"] == model]
-    wide = subset.pivot_table(index="series", columns="arm", values=metric, aggfunc="first")
+    wide = subset.pivot(index="series", columns="arm", values=metric)
     if RAW_ARM not in wide.columns:
         return pd.DataFrame()
     arms = [arm for arm in dict.fromkeys(subset["arm"]) if arm != RAW_ARM]
@@ -178,8 +178,8 @@ def imputation_pairs(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
     if subset.empty:
         return pd.DataFrame()
     subset["variant"] = np.where(subset["imputed"], "impute", "noimpute")
-    wide = subset.pivot_table(
-        index=["series", "model", "strategy"], columns="variant", values=metric, aggfunc="first"
+    wide = subset.pivot(
+        index=["series", "model", "strategy"], columns="variant", values=metric
     )
     if not {"impute", "noimpute"} <= set(wide.columns):
         return pd.DataFrame()
@@ -672,16 +672,14 @@ def save_foundation_preprocessing_plot(
 ) -> bool:
     """Plot mean paired recovery from corrupted synthetic contexts."""
     value_col = f"{metric}_recovery"
-    required = {"model", "regime", "strategy", "anomaly_type", value_col}
+    required = {"model", "strategy", "anomaly_type", value_col}
     if summary_df.empty or not required <= set(summary_df.columns):
         return False
 
     data = summary_df.copy()
     data["row"] = (
         data["model"].astype(str)
-        + " ["
-        + data["regime"].astype(str)
-        + "] / "
+        + " / "
         + data["strategy"].astype(str)
     )
     table = data.pivot_table(
@@ -726,7 +724,7 @@ def save_foundation_preprocessing_plot(
                     color=TEXT_COLOR,
                 )
     axis.set_xlabel("Tipo de anomalia sintetica")
-    axis.set_ylabel("Foundation [regimen] / estrategia")
+    axis.set_ylabel("Foundation / estrategia")
     style_axis(axis)
     top = _add_header(
         figure,
@@ -744,17 +742,16 @@ def save_foundation_preprocessing_plot(
 def render_run_figures(run_dir: Path) -> list[Path]:
     """Render every applicable figure for one run directory; return saved paths."""
     results_df = pd.read_csv(run_dir / "results.csv")
-    if "regime" in results_df.columns:
-        results_df = results_df.copy()
-        results_df["model"] = (
-            results_df["model"].astype(str) + " [" + results_df["regime"].astype(str) + "]"
-        )
     detection_path = run_dir / "detection.csv"
     detection_df = pd.read_csv(detection_path) if detection_path.exists() else pd.DataFrame()
     foundation_path = run_dir / "foundation_preprocessing_summary.csv"
     foundation_df = (
         pd.read_csv(foundation_path) if foundation_path.exists() else pd.DataFrame()
     )
+    if any("regime" in table.columns for table in (results_df, detection_df, foundation_df)):
+        raise ValueError(
+            "El run usa el esquema antiguo con regímenes; vuelve a ejecutar el benchmark"
+        )
 
     saved: list[Path] = []
     jobs = [

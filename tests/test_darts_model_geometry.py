@@ -45,29 +45,30 @@ def test_model_requirements_use_native_darts_geometry(
 @pytest.mark.parametrize(
     ("model_cls", "model_kwargs"),
     [
-        (NLinearModel, {"input_chunk_length": 12}),
-        (TCNModel, {"input_chunk_length": 12, "output_chunk_shift": 3}),
-        (RNNModel, {"input_chunk_length": 5, "training_length": 12}),
+        (NLinearModel, {"input_chunk_length": 72}),
+        (TCNModel, {"input_chunk_length": 72}),
+        (RNNModel, {"input_chunk_length": 48, "training_length": 72}),
     ],
 )
-def test_split_uses_one_native_window_with_targets_after_train(
+def test_split_uses_all_native_windows_with_targets_after_train(
     model_cls, model_kwargs
 ) -> None:
-    requirements = get_model_series_requirements(model_cls, model_kwargs, size_k=4)
-    index = pd.date_range("2024-01-01", periods=100, freq="h")
-    train_ts = TimeSeries.from_series(pd.Series(np.arange(100.0), index=index))
+    requirements = get_model_series_requirements(model_cls, model_kwargs, size_k=12)
+    index = pd.date_range("2024-01-01", periods=250, freq="h")
+    train_ts = TimeSeries.from_series(pd.Series(np.arange(250.0), index=index))
 
     split = split_train_val_subseries(
         train_ts,
         input_chunk=requirements.prediction_context_length,
-        size_k=4,
-        validation_len=12,
+        size_k=12,
+        validation_len=48,
+        validation_stride=6,
         requirements=requirements,
     )
 
     assert split is not None
     train_subs, val_subs = split
-    assert val_subs
+    assert len(val_subs) == 7
     assert all(len(val) == requirements.min_train_series_length for val in val_subs)
     first_validation_target = val_subs[0].time_index[
         requirements.validation_target_offset

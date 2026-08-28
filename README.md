@@ -166,7 +166,7 @@ uv run python -m airquality.data.block_analysis
 
 This is the fast pre-study for NO2 and CO. It reserves the fixed test, measures
 contiguous observed blocks before it, and reports whether
-each block can support the configured short/long forecasting and validation
+each block can support the configured forecasting protocol and validation
 geometry. It does not run anomaly detectors or forecasting models, so the
 reported support is an upper bound for detector-aware runs.
 
@@ -178,9 +178,9 @@ The default output is `reports/data_blocks/YYYYMMDD_HHMMSS/` and contains:
 - `excluded_series.csv`: series that could not provide the required holdout or training history
 - `retention_overview.png`, `block_length_distribution.png`, `retained_hours_by_series.png`, and `usable_blocks_by_series.png`
 
-Useful options include `--pollutants`, `--context`, short/long horizon, stride,
-and validation lengths, `--holdout`, and `--forecast-models`. Defaults are read
-from the forecasting configuration where applicable.
+Useful options include `--pollutants`, `--context`, `--horizon`, `--stride`,
+`--validation-len`, `--holdout`, and `--forecast-models`. Defaults are read from
+the forecasting configuration where applicable.
 
 #### Raw, detection and imputation support
 
@@ -204,9 +204,10 @@ It compares the same training prefix in the real benchmark states:
 
 There is no `raw+impute` arm. Detection runs on the full series, all states use
 the same common test, and support is measured only before the first test target.
-Short and long each use the strictest native requirement among configured models
-that participate in training arms. Foundation models still affect common-test
-selection but do not distort the training-arm comparison.
+The report uses one shared horizon/stride/validation protocol and the strictest
+native requirement among configured models that participate in training arms.
+Foundation models still affect common-test selection but do not distort the
+training-arm comparison.
 
 The command reuses the forecasting cache and writes under:
 
@@ -219,9 +220,9 @@ With the current configuration, `<POLLUTANT>` is `NO2` unless overridden by
 
 The persisted report contains:
 
-- `summary.csv`: aggregate support and deltas against raw by arm and regime
-- `series_summary.csv`: support per station, arm and short/long regime
-- `blocks.csv`: every resulting block, its provenance and short/long eligibility
+- `summary.csv`: aggregate support and deltas against raw by arm
+- `series_summary.csv`: support per station and arm
+- `blocks.csv`: every resulting block, its provenance and protocol eligibility
 - `gaps.csv`: actual gap origin, length, eligibility and filled hours
 - `detection.csv`: coverage and anomaly rate per strategy
 - `excluded_series.csv`: stations without a viable common test and training host
@@ -284,13 +285,13 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
-- `model_performance_by_gap_{mae,rmse,mase}.png`: error, mean rank, and top-three frequency for every gap size
-- `overall_model_performance_{mae,rmse,mase}.png`: compact global scorecards
-- `global_station_error_{mae,rmse,mase}.png`: distributions of gap-averaged error across stations
-- `pairwise_win_rate_{mae,rmse,mase}.png`: matched head-to-head win rates for every model pair
-- `gap_degradation_{mae,rmse,mase}.png`: relative degradation from each model's shortest gap
-- `tail_risk_{mae,rmse,mase}.png`: mean error versus the hardest 10% of stations
-- `error_correlation_{mae,rmse,mase}.png`: similarity of station-level error patterns between models
+- `model_performance_by_gap_{mae,rmse,mase,rmsse}.png`: error, mean rank, and top-three frequency for every gap size
+- `overall_model_performance_{mae,rmse,mase,rmsse}.png`: compact global scorecards
+- `global_station_error_{mae,rmse,mase,rmsse}.png`: distributions of gap-averaged error across stations
+- `pairwise_win_rate_{mae,rmse,mase,rmsse}.png`: matched head-to-head win rates for every model pair
+- `gap_degradation_{mae,rmse,mase,rmsse}.png`: relative degradation from each model's shortest gap
+- `tail_risk_{mae,rmse,mase,rmsse}.png`: mean error versus the hardest 10% of stations
+- `error_correlation_{mae,rmse,mase,rmsse}.png`: similarity of station-level error patterns between models
 - `model_performance_by_gap.csv`, `overall_model_performance.csv`, and the corresponding diagnostic CSVs: data behind the summaries
 - `plot_store.csv.gz`: compressed actual values and per-model predictions used by the plots
 - `plot_images.csv`: manifest of saved plot images

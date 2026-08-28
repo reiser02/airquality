@@ -33,7 +33,6 @@ from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_wi
 
 _PIPELINE_EXPORTS = {
     "ForecastArm",
-    "ForecastRegime",
     "build_arms",
     "run_benchmark_from_config",
 }
@@ -51,7 +50,6 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "run_benchmark_from_config",
     "ForecastArm",
-    "ForecastRegime",
     "build_arms",
     "remove_anomalies",
     "DetectionResult",

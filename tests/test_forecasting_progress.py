@@ -17,7 +17,7 @@ def test_progress_writes_structured_records_and_heartbeat(tmp_path) -> None:
         stream=stream,
     ).start()
     try:
-        get_progress_logger().info("[backtest task=2/10][ST0][short][raw][TiDE] start")
+        get_progress_logger().info("[backtest task=2/10][ST0][raw][TiDE] start")
         progress.update(
             stage="backtest",
             detail="station=ST0 model=TiDE",
@@ -30,7 +30,7 @@ def test_progress_writes_structured_records_and_heartbeat(tmp_path) -> None:
         progress.close()
 
     logged = (tmp_path / "benchmark.log").read_text(encoding="utf-8")
-    assert "[backtest task=2/10][ST0][short][raw][TiDE] start" in logged
+    assert "[backtest task=2/10][ST0][raw][TiDE] start" in logged
     assert "[heartbeat] stage=backtest completed=2 total=10 progress=2/10 pending_gpu=3" in logged
     assert "detail=station=ST0 model=TiDE" in logged
     assert "[heartbeat]" in stream.getvalue()

@@ -55,6 +55,21 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.getint("forecasting", "max_imputation_gap") == 5
     assert cfg.get("forecasting", "pollutant") == "NO2"
     assert cfg.get("forecasting", "device") == "multi-gpu"
+    assert cfg.getint("forecasting", "horizon") == 12
+    assert cfg.getint("forecasting", "stride") == 6
+    assert cfg.getint("forecasting", "validation_len") == 48
+    assert cfg.getint("forecasting", "holdout") == 96
+    assert not any(
+        cfg.has_option("forecasting", option)
+        for option in (
+            "short_horizon",
+            "short_stride",
+            "short_validation_len",
+            "long_horizon",
+            "long_stride",
+            "long_validation_len",
+        )
+    )
     assert not cfg.has_option("forecasting", "raw_base_dir")
     assert cfg.getboolean("forecasting", "foundation_preprocessing_test") is True
     assert cfg.getint("forecasting", "foundation_test_seed") == 1001

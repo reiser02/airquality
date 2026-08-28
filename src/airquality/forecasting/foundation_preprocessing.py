@@ -18,7 +18,6 @@ REFERENCE_CONDITIONS = (CLEAN_REFERENCE, CORRUPTED)
 FOUNDATION_METRICS = ("mase", "rmsse")
 FOUNDATION_SUMMARY_COLUMNS = (
     "series",
-    "regime",
     "horizon",
     "model",
     "case_id",
@@ -151,7 +150,6 @@ def summarize_foundation_preprocessing(results: pd.DataFrame) -> pd.DataFrame:
 
     case_keys = [
         "series",
-        "regime",
         "horizon",
         "model",
         "case_id",

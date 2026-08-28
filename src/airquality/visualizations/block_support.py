@@ -34,7 +34,6 @@ SERIES_REQUIRED = {
     "arm",
     "stage",
     "strategy",
-    "regime",
     "minimum_hours",
     "host_minimum_hours",
     "observed_hours",
@@ -54,12 +53,12 @@ SERIES_REQUIRED = {
 
 PLOT_GUIDE = """## Figuras
 
-- `retention_overview.png`: resume el historial raw. Compara, para short y long, el porcentaje y la cantidad absoluta de bloques usados y horas efectivas de entrenamiento; las horas ya descuentan la reserva de validación.
+- `retention_overview.png`: resume el historial raw. Muestra el porcentaje y la cantidad absoluta de bloques usados y horas efectivas de entrenamiento; las horas ya descuentan la reserva de validación.
 - `block_length_distribution.png`: distribución de longitudes de los bloques raw. Las líneas verticales marcan el mínimo de entrenamiento y el mínimo del bloque anfitrión que además debe alojar la validación.
 - `detected_block_length_distribution.png`: compara la distribución raw con la resultante tras retirar las anomalías de cada estrategia. Un desplazamiento hacia bloques cortos indica fragmentación del historial.
-- `support_overview.png`: horas observadas e imputadas dentro de bloques válidos para cada brazo. La etiqueta indica también cuántos bloques alcanzan el mínimo del régimen.
+- `support_overview.png`: horas observadas e imputadas dentro de bloques válidos para cada brazo. La etiqueta indica también cuántos bloques alcanzan el mínimo del protocolo.
 - `support_by_series.png`: soporte válido de cada brazo respecto a raw para cada serie. Un valor de 100 conserva el mismo número de horas; menos de 100 pierde soporte y más de 100 lo amplía.
-- `valid_blocks_by_series.png`: cantidad absoluta de bloques que alcanzan el mínimo short o long en cada serie y brazo. Más bloques no implica necesariamente más horas, porque sus longitudes difieren.
+- `valid_blocks_by_series.png`: cantidad absoluta de bloques que alcanzan el mínimo del protocolo en cada serie y brazo. Más bloques no implica necesariamente más horas, porque sus longitudes difieren.
 - `block_length_survival.png`: para cada longitud del eje X muestra cuántos bloques tienen al menos esa duración. Permite ver cómo detección e imputación fragmentan o conectan el historial.
 - `gap_recovery.png`: descompone las horas válidas ganadas por imputación entre horas observadas desbloqueadas, anomalías imputadas y huecos previos imputados; las etiquetas muestran el total y el reparto porcentual.
 - `detection_strategy_summary.png`: muestra qué porcentaje del historial pudo puntuar cada estrategia y qué porcentaje terminó retirando como anomalía. Una hora recibe score cuando hay suficientes salidas válidas de detectores para que la estrategia pueda clasificarla.
@@ -101,18 +100,15 @@ def _save_retention_overview(
     raw = table.loc[table["arm"] == "raw"]
     if raw.empty:
         return False
-    totals = raw.groupby("regime", sort=False).agg(
-        total_blocks=("total_blocks", "sum"),
-        used_blocks=("used_blocks", "sum"),
-        observed_hours=("observed_hours", "sum"),
-        effective_hours=("effective_training_hours", "sum"),
-        minimum_hours=("minimum_hours", "first"),
-        host_minimum_hours=("host_minimum_hours", "first"),
-    )
-    regimes = list(totals.index)
-    block_pct = 100.0 * totals["used_blocks"] / totals["total_blocks"]
-    hour_pct = 100.0 * totals["effective_hours"] / totals["observed_hours"]
-    positions = np.arange(len(regimes))
+    total_blocks = int(raw["total_blocks"].sum())
+    used_blocks = int(raw["used_blocks"].sum())
+    observed_hours = int(raw["observed_hours"].sum())
+    effective_hours = int(raw["effective_training_hours"].sum())
+    minimum_hours = int(raw["minimum_hours"].iloc[0])
+    host_minimum_hours = int(raw["host_minimum_hours"].iloc[0])
+    block_pct = np.asarray([100.0 * used_blocks / total_blocks])
+    hour_pct = np.asarray([100.0 * effective_hours / observed_hours])
+    positions = np.arange(1)
     width = 0.32
 
     figure, axis = plt.subplots(figsize=(10, 6.5), facecolor=FIGURE_FACE)
@@ -134,8 +130,8 @@ def _save_retention_overview(
         label="Horas efectivas",
     )
     for bars, percentages, counts, unit in (
-        (block_bars, block_pct, totals["used_blocks"], "bloques"),
-        (hour_bars, hour_pct, totals["effective_hours"], "horas"),
+        (block_bars, block_pct, np.asarray([used_blocks]), "bloques"),
+        (hour_bars, hour_pct, np.asarray([effective_hours]), "horas"),
     ):
         axis.bar_label(
             bars,
@@ -150,9 +146,8 @@ def _save_retention_overview(
     axis.set_xticks(
         positions,
         [
-            f"{regime.capitalize()}\ntrain >= {int(row.minimum_hours)} h; "
-            f"anfitrión >= {int(row.host_minimum_hours)} h"
-            for regime, row in totals.iterrows()
+            f"Protocolo\ntrain >= {minimum_hours} h; "
+            f"anfitrión >= {host_minimum_hours} h"
         ],
     )
     axis.set_ylim(0, 105)
@@ -162,7 +157,7 @@ def _save_retention_overview(
     _figure_header(
         figure,
         "Retención del historial raw para entrenamiento",
-        "Compara cuántos bloques se usan y cuántas horas efectivas conservan short y long; "
+        "Compara cuántos bloques se usan y cuántas horas efectivas conserva el protocolo; "
         "las horas descuentan la reserva de validación.",
         pollutant,
     )
@@ -180,32 +175,24 @@ def _save_block_distribution(
         return False
     lengths = raw.to_numpy(dtype=float)
     bins = np.geomspace(1, lengths.max() + 1, 45)
-    requirements = (
-        table.loc[table["arm"] == "raw"]
-        .groupby("regime", sort=False)
-        .agg(
-            minimum_hours=("minimum_hours", "first"),
-            host_minimum_hours=("host_minimum_hours", "first"),
-        )
-    )
+    raw_table = table.loc[table["arm"] == "raw"]
+    minimum_hours = int(raw_table["minimum_hours"].iloc[0])
+    host_minimum_hours = int(raw_table["host_minimum_hours"].iloc[0])
 
     figure, axis = plt.subplots(figsize=(11, 6), facecolor=FIGURE_FACE)
     style_axis(axis)
     axis.hist(lengths, bins=bins, color="#8c6d4b", edgecolor="#fffaf2", alpha=0.9)
-    colors = {"short": DETECTED_COLOR, "long": IMPUTED_COLOR}
-    for regime, row in requirements.iterrows():
-        color = colors.get(regime, TEXT_COLOR)
-        axis.axvline(
-            row["minimum_hours"],
-            color=color,
-            label=f"{regime.capitalize()} train: {int(row['minimum_hours'])} h",
-        )
-        axis.axvline(
-            row["host_minimum_hours"],
-            color=color,
-            linestyle="--",
-            label=f"{regime.capitalize()} + validación: {int(row['host_minimum_hours'])} h",
-        )
+    axis.axvline(
+        minimum_hours,
+        color=DETECTED_COLOR,
+        label=f"Train: {minimum_hours} h",
+    )
+    axis.axvline(
+        host_minimum_hours,
+        color=DETECTED_COLOR,
+        linestyle="--",
+        label=f"Train + validación: {host_minimum_hours} h",
+    )
     axis.set_xscale("log")
     axis.set_yscale("log")
     axis.set_xlabel("Longitud del bloque raw (horas, escala log)")
@@ -216,7 +203,7 @@ def _save_block_distribution(
         figure,
         "Distribución de las longitudes de bloque del historial raw",
         "Cada hueco temporal o valor ausente rompe un bloque; las líneas marcan los mínimos "
-        "de entrenamiento y de bloque anfitrión.",
+        "de entrenamiento y de bloque anfitrión del protocolo único.",
         pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.86))
@@ -235,11 +222,7 @@ def _save_detected_block_distribution(
         return False
     maximum = max(float(blocks["hours"].max()), 2.0)
     bins = np.geomspace(1, maximum + 1, 45)
-    requirements = (
-        table.loc[table["arm"] == "raw"]
-        .groupby("regime", sort=False)["minimum_hours"]
-        .first()
-    )
+    minimum = int(table.loc[table["arm"] == "raw", "minimum_hours"].iloc[0])
 
     figure, axes = plt.subplots(
         1,
@@ -271,13 +254,12 @@ def _save_detected_block_distribution(
             linewidth=1.8,
             label="Raw",
         )
-        for regime, minimum in requirements.items():
-            axis.axvline(
-                minimum,
-                color=IMPUTED_COLOR if regime == "long" else RECOVERED_COLOR,
-                linestyle="--",
-                label=f"Mínimo {regime}: {int(minimum)} h",
-            )
+        axis.axvline(
+            minimum,
+            color=RECOVERED_COLOR,
+            linestyle="--",
+            label=f"Mínimo: {minimum} h",
+        )
         axis.set_xscale("log")
         axis.set_yscale("log")
         axis.set_xlabel("Longitud del bloque (h, escala log)")
@@ -304,52 +286,47 @@ def _save_support_overview(
 ) -> bool:
     if table.empty:
         return False
-    totals = (
-        table.groupby(["regime", "arm"], sort=False)
-        .agg(
-            valid_real_hours=("valid_real_hours", "sum"),
-            valid_imputed_hours=("valid_imputed_hours", "sum"),
-            valid_blocks=("valid_blocks", "sum"),
-        )
-        .reset_index()
+    totals = table.groupby("arm", sort=False).agg(
+        valid_real_hours=("valid_real_hours", "sum"),
+        valid_imputed_hours=("valid_imputed_hours", "sum"),
+        valid_blocks=("valid_blocks", "sum"),
     )
-    regimes = list(dict.fromkeys(totals["regime"]))
     arms = _arm_order(table)
     figure, axes = plt.subplots(
-        1, len(regimes), figsize=(7.2 * len(regimes), 3.8 + 0.48 * len(arms)),
+        1, figsize=(7.2, 3.8 + 0.48 * len(arms)),
         facecolor=FIGURE_FACE, squeeze=False,
     )
-    for axis, regime in zip(axes[0], regimes, strict=True):
-        style_axis(axis)
-        selected = totals.loc[totals["regime"] == regime].set_index("arm").reindex(arms)
-        positions = np.arange(len(arms))
-        real = selected["valid_real_hours"].fillna(0).to_numpy(dtype=float)
-        imputed = selected["valid_imputed_hours"].fillna(0).to_numpy(dtype=float)
-        axis.barh(positions, real, color=RAW_COLOR, edgecolor=EDGE_COLOR, label="Observado")
-        axis.barh(
-            positions, imputed, left=real, color=IMPUTED_COLOR,
-            edgecolor=EDGE_COLOR, label="Imputado",
+    axis = axes[0, 0]
+    style_axis(axis)
+    selected = totals.reindex(arms)
+    positions = np.arange(len(arms))
+    real = selected["valid_real_hours"].fillna(0).to_numpy(dtype=float)
+    imputed = selected["valid_imputed_hours"].fillna(0).to_numpy(dtype=float)
+    axis.barh(positions, real, color=RAW_COLOR, edgecolor=EDGE_COLOR, label="Observado")
+    axis.barh(
+        positions, imputed, left=real, color=IMPUTED_COLOR,
+        edgecolor=EDGE_COLOR, label="Imputado",
+    )
+    for position, total, blocks in zip(
+        positions,
+        real + imputed,
+        selected["valid_blocks"].fillna(0).to_numpy(dtype=int),
+        strict=True,
+    ):
+        axis.text(
+            total, position, f"  {int(total):,} h | {blocks} bloques",
+            va="center", fontsize=8, color=TEXT_COLOR,
         )
-        for position, total, blocks in zip(
-            positions,
-            real + imputed,
-            selected["valid_blocks"].fillna(0).to_numpy(dtype=int),
-            strict=True,
-        ):
-            axis.text(
-                total, position, f"  {int(total):,} h | {blocks} bloques",
-                va="center", fontsize=8, color=TEXT_COLOR,
-            )
-        minimum = int(table.loc[table["regime"] == regime, "minimum_hours"].iloc[0])
-        axis.set_yticks(positions, arms, fontsize=8)
-        axis.invert_yaxis()
-        axis.set_xlabel("Horas en bloques validos")
-        axis.set_title(
-            f"{regime.capitalize()} (minimo {minimum} h)",
-            loc="left", fontweight="bold", color=TEXT_COLOR,
-        )
-        axis.grid(axis="x", color=GRID_COLOR, linestyle="--", alpha=0.6)
-        axis.margins(x=0.2)
+    minimum = int(table["minimum_hours"].iloc[0])
+    axis.set_yticks(positions, arms, fontsize=8)
+    axis.invert_yaxis()
+    axis.set_xlabel("Horas en bloques validos")
+    axis.set_title(
+        f"Protocolo (minimo {minimum} h)",
+        loc="left", fontweight="bold", color=TEXT_COLOR,
+    )
+    axis.grid(axis="x", color=GRID_COLOR, linestyle="--", alpha=0.6)
+    axis.margins(x=0.2)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncols=2)
     _figure_header(
@@ -380,7 +357,6 @@ def _save_matrix(
     selected = table.loc[table["arm"] != "raw"] if exclude_raw else table
     if selected.empty:
         return False
-    regimes = list(dict.fromkeys(selected["regime"]))
     arms = _arm_order(selected)
     series = list(dict.fromkeys(selected["series"]))
     finite = pd.to_numeric(selected[value], errors="coerce").dropna()
@@ -390,39 +366,30 @@ def _save_matrix(
         color_max = color_min + 1.0
     figure, axes = plt.subplots(
         1,
-        len(regimes),
         figsize=(max(16, 2.0 * len(arms) + 7), 3.4 + 0.42 * len(series)),
         facecolor=FIGURE_FACE, squeeze=False,
     )
-    images = []
-    for index, (axis, regime) in enumerate(zip(axes[0], regimes, strict=True)):
-        values = (
-            selected.loc[selected["regime"] == regime]
-            .pivot(index="series", columns="arm", values=value)
-            .reindex(index=series, columns=arms)
-        )
-        array = values.to_numpy(dtype=float)
-        image = axis.imshow(
-            array,
-            aspect="auto",
-            cmap="YlGnBu",
-            vmin=color_min,
-            vmax=color_max,
-        )
-        images.append(image)
-        for row, col in np.ndindex(array.shape):
-            if np.isfinite(array[row, col]):
-                axis.text(col, row, format(array[row, col], fmt), ha="center", va="center", fontsize=7)
-        axis.set_xticks(np.arange(len(arms)), arms, rotation=35, ha="right", fontsize=8)
-        axis.set_yticks(np.arange(len(series)))
-        if index == 0:
-            axis.set_yticklabels(series, fontsize=8)
-        else:
-            axis.set_yticklabels([])
-        axis.set_title(regime.capitalize(), loc="left", fontweight="bold", color=TEXT_COLOR)
-        axis.set_facecolor("#fffaf2")
+    axis = axes[0, 0]
+    values = selected.pivot(index="series", columns="arm", values=value).reindex(
+        index=series, columns=arms
+    )
+    array = values.to_numpy(dtype=float)
+    image = axis.imshow(
+        array,
+        aspect="auto",
+        cmap="YlGnBu",
+        vmin=color_min,
+        vmax=color_max,
+    )
+    for row, col in np.ndindex(array.shape):
+        if np.isfinite(array[row, col]):
+            axis.text(col, row, format(array[row, col], fmt), ha="center", va="center", fontsize=7)
+    axis.set_xticks(np.arange(len(arms)), arms, rotation=35, ha="right", fontsize=8)
+    axis.set_yticks(np.arange(len(series)), series, fontsize=8)
+    axis.set_title("Protocolo", loc="left", fontweight="bold", color=TEXT_COLOR)
+    axis.set_facecolor("#fffaf2")
     color_axis = figure.add_axes((0.925, 0.23, 0.015, 0.52))
-    figure.colorbar(images[-1], cax=color_axis, label=label)
+    figure.colorbar(image, cax=color_axis, label=label)
     _figure_header(figure, title, subtitle, pollutant)
     figure.subplots_adjust(left=0.2, right=0.9, bottom=0.2, top=0.84, wspace=0.08)
     figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -435,40 +402,39 @@ def _save_block_survival(
 ) -> bool:
     if blocks.empty:
         return False
-    regimes = list(dict.fromkeys(table["regime"]))
     arms = _arm_order(table)
     colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(arms)))
     maximum = max(int(blocks["hours"].max()), 2)
     x = np.unique(np.geomspace(1, maximum, 120).astype(int))
     figure, axes = plt.subplots(
-        1, len(regimes), figsize=(7 * len(regimes), 5.5),
+        1, figsize=(7, 5.5),
         facecolor=FIGURE_FACE, squeeze=False,
     )
-    for axis, regime in zip(axes[0], regimes, strict=True):
-        style_axis(axis)
-        for arm, color in zip(arms, colors, strict=True):
-            lengths = blocks.loc[blocks["arm"] == arm, "hours"].to_numpy(dtype=int)
-            axis.plot(x, [(lengths >= value).sum() for value in x], label=arm, color=color)
-        minimum = int(table.loc[table["regime"] == regime, "minimum_hours"].iloc[0])
-        axis.axvline(
-            minimum,
-            color="#bd3b37",
-            linestyle="--",
-            label="Mínimo del régimen",
-        )
-        axis.set_xscale("log")
-        axis.set_yscale("log")
-        axis.set_xlabel("Longitud mínima del bloque (h)")
-        axis.set_ylabel("Bloques con al menos esa longitud")
-        axis.set_title(regime.capitalize(), loc="left", fontweight="bold")
-        axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
+    axis = axes[0, 0]
+    style_axis(axis)
+    for arm, color in zip(arms, colors, strict=True):
+        lengths = blocks.loc[blocks["arm"] == arm, "hours"].to_numpy(dtype=int)
+        axis.plot(x, [(lengths >= value).sum() for value in x], label=arm, color=color)
+    minimum = int(table["minimum_hours"].iloc[0])
+    axis.axvline(
+        minimum,
+        color="#bd3b37",
+        linestyle="--",
+        label="Mínimo del protocolo",
+    )
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel("Longitud mínima del bloque (h)")
+    axis.set_ylabel("Bloques con al menos esa longitud")
+    axis.set_title("Protocolo", loc="left", fontweight="bold")
+    axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncols=min(4, len(labels)), fontsize=8)
     _figure_header(
         figure,
         "Cuántos bloques sobreviven a cada longitud mínima",
         "Cada curva cuenta bloques con al menos la duración del eje X; la línea roja marca "
-        "el mínimo exigido por el régimen.",
+        "el mínimo exigido por el protocolo.",
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.12, 1, 0.86))
@@ -485,7 +451,7 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
         selected["imputation_gain_valid_hours"] - selected["valid_imputed_hours"]
     ).clip(lower=0)
     totals = (
-        selected.groupby(["regime", "arm"], sort=False)[
+        selected.groupby("arm", sort=False)[
             [
                 "observed_unlocked",
                 "valid_imputed_anomaly_hours",
@@ -493,55 +459,53 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
             ]
         ]
         .sum()
-        .reset_index()
     )
-    regimes = list(dict.fromkeys(totals["regime"]))
     figure, axes = plt.subplots(
-        1, len(regimes), figsize=(7 * len(regimes), 5.5),
+        1, figsize=(7, 5.5),
         facecolor=FIGURE_FACE, squeeze=False,
     )
-    for axis, regime in zip(axes[0], regimes, strict=True):
-        style_axis(axis)
-        current = totals.loc[totals["regime"] == regime]
-        positions = np.arange(len(current))
-        bottom = np.zeros(len(current))
-        for column, label, color in (
-            ("observed_unlocked", "Observado desbloqueado", RECOVERED_COLOR),
-            ("valid_imputed_anomaly_hours", "Anomalia imputada", IMPUTED_COLOR),
-            ("valid_imputed_preexisting_gap_hours", "Gap previo imputado", PREEXISTING_COLOR),
-        ):
-            values = current[column].to_numpy(dtype=float)
-            axis.bar(positions, values, bottom=bottom, color=color, edgecolor=EDGE_COLOR, label=label)
-            bottom += values
-        for position, (_, row) in zip(positions, current.iterrows(), strict=True):
-            total = float(
-                row["observed_unlocked"]
-                + row["valid_imputed_anomaly_hours"]
-                + row["valid_imputed_preexisting_gap_hours"]
-            )
-            if total <= 0:
-                continue
-            observed_pct = 100.0 * float(row["observed_unlocked"]) / total
-            anomaly_pct = 100.0 * float(row["valid_imputed_anomaly_hours"]) / total
-            gap_pct = 100.0 * float(row["valid_imputed_preexisting_gap_hours"]) / total
-            axis.text(
-                position,
-                total,
-                (
-                    f"{int(total):,} h\n"
-                    f"Obs. {observed_pct:.1f}%\n"
-                    f"Anom. {anomaly_pct:.1f}% | Gap {gap_pct:.1f}%"
-                ).replace(",", "."),
-                ha="center",
-                va="bottom",
-                fontsize=7,
-                color=TEXT_COLOR,
-            )
-        axis.set_xticks(positions, current["arm"], rotation=30, ha="right", fontsize=8)
-        axis.set_ylabel("Horas validas ganadas")
-        axis.set_title(regime.capitalize(), loc="left", fontweight="bold")
-        axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.55)
-        axis.margins(y=0.22)
+    axis = axes[0, 0]
+    style_axis(axis)
+    current = totals
+    positions = np.arange(len(current))
+    bottom = np.zeros(len(current))
+    for column, label, color in (
+        ("observed_unlocked", "Observado desbloqueado", RECOVERED_COLOR),
+        ("valid_imputed_anomaly_hours", "Anomalia imputada", IMPUTED_COLOR),
+        ("valid_imputed_preexisting_gap_hours", "Gap previo imputado", PREEXISTING_COLOR),
+    ):
+        values = current[column].to_numpy(dtype=float)
+        axis.bar(positions, values, bottom=bottom, color=color, edgecolor=EDGE_COLOR, label=label)
+        bottom += values
+    for position, (_, row) in zip(positions, current.iterrows(), strict=True):
+        total = float(
+            row["observed_unlocked"]
+            + row["valid_imputed_anomaly_hours"]
+            + row["valid_imputed_preexisting_gap_hours"]
+        )
+        if total <= 0:
+            continue
+        observed_pct = 100.0 * float(row["observed_unlocked"]) / total
+        anomaly_pct = 100.0 * float(row["valid_imputed_anomaly_hours"]) / total
+        gap_pct = 100.0 * float(row["valid_imputed_preexisting_gap_hours"]) / total
+        axis.text(
+            position,
+            total,
+            (
+                f"{int(total):,} h\n"
+                f"Obs. {observed_pct:.1f}%\n"
+                f"Anom. {anomaly_pct:.1f}% | Gap {gap_pct:.1f}%"
+            ).replace(",", "."),
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color=TEXT_COLOR,
+        )
+    axis.set_xticks(positions, current.index, rotation=30, ha="right", fontsize=8)
+    axis.set_ylabel("Horas validas ganadas")
+    axis.set_title("Protocolo", loc="left", fontweight="bold")
+    axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.55)
+    axis.margins(y=0.22)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncols=3, fontsize=8)
     _figure_header(
@@ -605,13 +569,13 @@ def _save_imputation_age(
     if selected.empty:
         return False
     selected["age_months"] = selected["imputed_valid_age_hours_median"] / (24.0 * 30.44)
-    groups = list(selected.groupby(["regime", "strategy"], sort=False))
+    groups = list(selected.groupby("strategy", sort=False))
     figure, axis = plt.subplots(
         figsize=(9, 3 + 0.45 * len(groups)), facecolor=FIGURE_FACE
     )
     style_axis(axis)
     values = [group["age_months"].to_numpy(dtype=float) for _, group in groups]
-    labels = [f"{regime} | {strategy}" for (regime, strategy), _ in groups]
+    labels = [strategy for strategy, _ in groups]
     axis.boxplot(values, orientation="horizontal", tick_labels=labels, showfliers=False)
     axis.set_xlabel("Meses antes del inicio del test")
     _figure_header(
@@ -639,6 +603,10 @@ def render_plots(run_dir: Path) -> list[Path]:
             raise FileNotFoundError(f"No existe {path}")
     pollutant = str(json.loads(manifest_path.read_text(encoding="utf-8"))["pollutant"])
     series = pd.read_csv(series_path)
+    if "regime" in series.columns:
+        raise ValueError(
+            "El reporte usa el esquema antiguo con regímenes; vuelve a ejecutar el análisis"
+        )
     missing = sorted(SERIES_REQUIRED - set(series.columns))
     if missing:
         raise ValueError(f"Faltan columnas en series_summary.csv: {', '.join(missing)}")
@@ -680,7 +648,7 @@ def render_plots(run_dir: Path) -> list[Path]:
                 p, series, value="valid_blocks",
                 title="Bloques válidos disponibles por serie y estrategia",
                 label="Bloques", fmt=".0f",
-                subtitle="Cantidad absoluta de bloques que alcanzan el mínimo short o long; "
+                subtitle="Cantidad absoluta de bloques que alcanzan el mínimo del protocolo; "
                 "el número de bloques no representa su longitud total.",
                 pollutant=pollutant,
             ),

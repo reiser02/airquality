@@ -66,7 +66,6 @@ from airquality.forecasting.fill import (
 )
 from airquality.forecasting.pipeline import (
     DEFAULT_STRATEGIES,
-    ForecastRegime,
     _detect_for_strategies,
     _load_raw_hourly_series,
     resolve_forecasting_devices,
@@ -75,8 +74,7 @@ from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
 from airquality.paths import create_run_dir
 
-ANALYSIS_VERSION = 5
-REGIME_NAMES = ("short", "long")
+ANALYSIS_VERSION = 6
 
 
 def _normalize_pollutant(value: str) -> str:
@@ -156,15 +154,15 @@ def _analyze_arm(
     imputed_mask: pd.Series,
     anomaly_imputed_mask: pd.Series,
     preexisting_imputed_mask: pd.Series,
-    requirements: dict[str, dict[str, object]],
+    requirements: dict[str, object],
     test_target_start: pd.Timestamp,
     common: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], pd.DataFrame]:
     blocks = classify_blocks(
         observed_blocks(series),
-        {name: int(req["minimum_hours"]) for name, req in requirements.items()},
-        {name: int(req["validation_hours"]) for name, req in requirements.items()},
-        {name: int(req["host_minimum_hours"]) for name, req in requirements.items()},
+        minimum_hours=int(requirements["minimum_hours"]),
+        validation_hours=int(requirements["validation_hours"]),
+        host_minimum_hours=int(requirements["host_minimum_hours"]),
     )
     blocks.insert(0, "strategy", strategy)
     blocks.insert(0, "stage", stage)
@@ -193,62 +191,58 @@ def _analyze_arm(
         if detection is not None
         else pd.Series(False, index=raw_train.index)
     )
-    for regime, req in requirements.items():
-        eligible = blocks[f"{regime}_eligible"]
-        valid_index = _block_index(blocks, eligible)
-        valid_imputed = valid_index.intersection(imputed_mask.index[imputed_mask])
-        valid_anomaly_imputed = valid_index.intersection(
-            anomaly_imputed_mask.index[anomaly_imputed_mask]
-        )
-        valid_preexisting_imputed = valid_index.intersection(
-            preexisting_imputed_mask.index[preexisting_imputed_mask]
-        )
-        valid_real = valid_index.difference(valid_imputed)
-        imputed_age_median, imputed_age_max = _age_stats(
-            valid_imputed, test_target_start
-        )
-        rows.append(
-            {
-                **common,
-                "arm": arm,
-                "stage": stage,
-                "strategy": strategy,
-                "imputed": stage == "imputed",
-                "imputation_model": imputation_model,
-                "detectors": (
-                    ",".join(detection.detectors) if detection is not None else ""
-                ),
-                "regime": regime,
-                "horizon_hours": int(req["horizon_hours"]),
-                "stride_hours": int(req["stride_hours"]),
-                "minimum_hours": int(req["minimum_hours"]),
-                "minimum_models": str(req["minimum_models"]),
-                "prediction_context_hours": int(req["prediction_context_hours"]),
-                "host_minimum_hours": int(req["host_minimum_hours"]),
-                "limiting_models": str(req["limiting_models"]),
-                "validation_hours": int(req["validation_hours"]),
-                "validation_forecasts": int(req["validation_forecasts"]),
-                "observed_hours": int(series.notna().sum()),
-                "real_observed_hours": int((series.notna() & ~imputed_mask).sum()),
-                "imputed_hours": int(imputed_mask.sum()),
-                "detected_anomalies": int((anomaly_mask & raw_train.notna()).sum()),
-                "total_blocks": len(blocks),
-                "valid_blocks": int(eligible.sum()),
-                "valid_hours": len(valid_index),
-                "valid_real_hours": len(valid_real),
-                "valid_imputed_hours": len(valid_imputed),
-                "valid_imputed_anomaly_hours": len(valid_anomaly_imputed),
-                "valid_imputed_preexisting_gap_hours": len(valid_preexisting_imputed),
-                "host_capable_blocks": int(blocks[f"{regime}_host_capable"].sum()),
-                "used_blocks": int(blocks[f"{regime}_used"].sum()),
-                "effective_training_hours": int(
-                    blocks[f"{regime}_training_hours"].sum()
-                ),
-                "trainable": bool(blocks[f"{regime}_validation_host"].any()),
-                "imputed_valid_age_hours_median": imputed_age_median,
-                "imputed_valid_age_hours_max": imputed_age_max,
-            }
-        )
+    eligible = blocks["eligible"]
+    valid_index = _block_index(blocks, eligible)
+    valid_imputed = valid_index.intersection(imputed_mask.index[imputed_mask])
+    valid_anomaly_imputed = valid_index.intersection(
+        anomaly_imputed_mask.index[anomaly_imputed_mask]
+    )
+    valid_preexisting_imputed = valid_index.intersection(
+        preexisting_imputed_mask.index[preexisting_imputed_mask]
+    )
+    valid_real = valid_index.difference(valid_imputed)
+    imputed_age_median, imputed_age_max = _age_stats(
+        valid_imputed, test_target_start
+    )
+    rows.append(
+        {
+            **common,
+            "arm": arm,
+            "stage": stage,
+            "strategy": strategy,
+            "imputed": stage == "imputed",
+            "imputation_model": imputation_model,
+            "detectors": (
+                ",".join(detection.detectors) if detection is not None else ""
+            ),
+            "horizon_hours": int(requirements["horizon_hours"]),
+            "stride_hours": int(requirements["stride_hours"]),
+            "minimum_hours": int(requirements["minimum_hours"]),
+            "minimum_models": str(requirements["minimum_models"]),
+            "prediction_context_hours": int(requirements["prediction_context_hours"]),
+            "host_minimum_hours": int(requirements["host_minimum_hours"]),
+            "limiting_models": str(requirements["limiting_models"]),
+            "validation_hours": int(requirements["validation_hours"]),
+            "validation_forecasts": int(requirements["validation_forecasts"]),
+            "observed_hours": int(series.notna().sum()),
+            "real_observed_hours": int((series.notna() & ~imputed_mask).sum()),
+            "imputed_hours": int(imputed_mask.sum()),
+            "detected_anomalies": int((anomaly_mask & raw_train.notna()).sum()),
+            "total_blocks": len(blocks),
+            "valid_blocks": int(eligible.sum()),
+            "valid_hours": len(valid_index),
+            "valid_real_hours": len(valid_real),
+            "valid_imputed_hours": len(valid_imputed),
+            "valid_imputed_anomaly_hours": len(valid_anomaly_imputed),
+            "valid_imputed_preexisting_gap_hours": len(valid_preexisting_imputed),
+            "host_capable_blocks": int(blocks["host_capable"].sum()),
+            "used_blocks": int(blocks["used"].sum()),
+            "effective_training_hours": int(blocks["training_hours"].sum()),
+            "trainable": bool(blocks["validation_host"].any()),
+            "imputed_valid_age_hours_median": imputed_age_median,
+            "imputed_valid_age_hours_max": imputed_age_max,
+        }
+    )
     return rows, blocks
 
 
@@ -295,7 +289,8 @@ def _add_comparisons(table: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     if table.empty:
         return table
     out = table.copy()
-    for _, indexes in out.groupby(keys, sort=False).groups.items():
+    groups = out.groupby(keys, sort=False).groups if keys else {None: out.index}
+    for indexes in groups.values():
         group = out.loc[indexes]
         raw = group.loc[group["arm"] == "raw"]
         if raw.empty:
@@ -331,7 +326,7 @@ def _summarize(series_summary: pd.DataFrame) -> pd.DataFrame:
     if series_summary.empty:
         return pd.DataFrame()
     totals = (
-        series_summary.groupby(["regime", "arm", "stage", "strategy"], sort=False)
+        series_summary.groupby(["arm", "stage", "strategy"], sort=False)
         .agg(
             series=("series", "nunique"),
             trainable_series=("trainable", "sum"),
@@ -358,7 +353,7 @@ def _summarize(series_summary: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    return _add_comparisons(totals, ["regime"])
+    return _add_comparisons(totals, [])
 
 
 def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
@@ -372,21 +367,20 @@ def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
         "## Requisitos estrictos",
         "",
     ]
-    for name in REGIME_NAMES:
-        req = requirements[name]
-        lines.append(
-            f"- `{name}`: bloque valido >= {req['minimum_hours']} h; "
-            f"anfitrion de validacion >= {req['host_minimum_hours']} h "
-            f"({req['limiting_models']})."
-        )
+    lines.append(
+        f"- Horizonte {requirements['horizon_hours']} h, stride "
+        f"{requirements['stride_hours']} h: bloque valido >= "
+        f"{requirements['minimum_hours']} h; anfitrion de validacion >= "
+        f"{requirements['host_minimum_hours']} h ({requirements['limiting_models']})."
+    )
     lines.extend(
         [
             "",
             "## Artefactos",
             "",
             "- `summary.csv`: comparacion agregada frente a raw.",
-            "- `series_summary.csv`: soporte por serie, brazo y regimen.",
-            "- `blocks.csv`: bloques resultantes y elegibilidad short/long.",
+            "- `series_summary.csv`: soporte por serie y brazo.",
+            "- `blocks.csv`: bloques resultantes y elegibilidad del protocolo.",
             "- `gaps.csv`: origen, longitud y resultado real de cada gap.",
             "- `detection.csv`: cobertura y tasa por estrategia.",
             "- `excluded_series.csv`: series sin test comun viable.",
@@ -414,36 +408,22 @@ def run_analysis(
     raw_base_dir = cfg_get_str(
         "data", "raw_base_dir", "data/raw/datos_estaciones_5m"
     )
-    holdout = cfg_get_int("forecasting", "holdout", 192)
+    holdout = cfg_get_int("forecasting", "holdout", 96)
     context_len = cfg_get_int("forecasting", "context_len", 72)
     seasonality_m = cfg_get_int("benchmark", "seasonality_m", 24)
     imputation_size_k = cfg_get_int("benchmark", "size_k", 5)
-    regimes = (
-        ForecastRegime(
-            "short",
-            cfg_get_int("forecasting", "short_horizon", 8),
-            cfg_get_int("forecasting", "short_stride", 4),
-            cfg_get_int("forecasting", "short_validation_len", 48),
-        ),
-        ForecastRegime(
-            "long",
-            cfg_get_int("forecasting", "long_horizon", 48),
-            cfg_get_int("forecasting", "long_stride", 24),
-            cfg_get_int("forecasting", "long_validation_len", 96),
-        ),
-    )
-    if holdout <= 0 or any(
-        min(regime.horizon, regime.stride, regime.validation_len) <= 0
-        or regime.stride > regime.horizon
-        or regime.validation_len < regime.horizon
-        or (regime.validation_len - regime.horizon) % regime.stride != 0
-        or holdout < regime.horizon
-        or (holdout - regime.horizon) % regime.stride != 0
-        for regime in regimes
+    horizon = cfg_get_int("forecasting", "horizon", 12)
+    stride = cfg_get_int("forecasting", "stride", 6)
+    validation_len = cfg_get_int("forecasting", "validation_len", 48)
+    if (
+        min(holdout, horizon, stride, validation_len) <= 0
+        or stride > horizon
+        or validation_len < horizon
+        or (validation_len - horizon) % stride != 0
+        or holdout < horizon
+        or (holdout - horizon) % stride != 0
     ):
-        raise ValueError(
-            "Holdout, horizonte, stride y validacion de cada regimen deben ser validos"
-        )
+        raise ValueError("Holdout, horizonte, stride y validacion deben ser validos")
 
     model_names = list(
         cfg_get_csv_list("forecasting", "forecast_models", ("NLinear", "TiDE"))
@@ -454,46 +434,36 @@ def run_analysis(
         context_length=context_len,
     )
     all_requirements = {
-        regime.name: {
-            **get_strict_forecast_requirements(
-                model_configs,
-                size_k=regime.horizon,
-                validation_len=regime.validation_len,
-                validation_stride=regime.stride,
-                seasonality_m=seasonality_m,
-                context_len=context_len,
-            ),
-            "horizon_hours": regime.horizon,
-            "stride_hours": regime.stride,
-        }
-        for regime in regimes
+        **get_strict_forecast_requirements(
+            model_configs,
+            size_k=horizon,
+            validation_len=validation_len,
+            validation_stride=stride,
+            seasonality_m=seasonality_m,
+            context_len=context_len,
+        ),
+        "horizon_hours": horizon,
+        "stride_hours": stride,
     }
     comparative_requirements = {
-        regime.name: {
-            **get_strict_forecast_requirements(
-                model_configs,
-                size_k=regime.horizon,
-                validation_len=regime.validation_len,
-                validation_stride=regime.stride,
-                seasonality_m=seasonality_m,
-                context_len=context_len,
-                training_arms_only=True,
-            ),
-            "horizon_hours": regime.horizon,
-            "stride_hours": regime.stride,
-        }
-        for regime in regimes
+        **get_strict_forecast_requirements(
+            model_configs,
+            size_k=horizon,
+            validation_len=validation_len,
+            validation_stride=stride,
+            seasonality_m=seasonality_m,
+            context_len=context_len,
+            training_arms_only=True,
+        ),
+        "horizon_hours": horizon,
+        "stride_hours": stride,
     }
     context_requirement = max(
         context_len,
-        *(int(req["prediction_context_hours"]) for req in all_requirements.values()),
+        int(all_requirements["prediction_context_hours"]),
     )
-    train_requirement = max(
-        int(req["minimum_hours"]) for req in all_requirements.values()
-    )
-    host_requirement = max(
-        int(req["host_minimum_hours"]) for req in all_requirements.values()
-    )
+    train_requirement = int(all_requirements["minimum_hours"])
+    host_requirement = int(all_requirements["host_minimum_hours"])
 
     strategy_specs = [
         spec.strip().lower()
@@ -602,6 +572,11 @@ def run_analysis(
             "injection_policy": INJECTION_POLICY_VERSION,
             "min_selection_points": min_selection_points,
             "transforms": transform_names,
+            "holdout": holdout,
+            "context_len": context_len,
+            "horizon": horizon,
+            "stride": stride,
+            "validation_len": validation_len,
         }
         detections = _detect_for_strategies(
             series,
@@ -636,7 +611,7 @@ def run_analysis(
             holdout=holdout,
             context_len=context_requirement,
             train_min_len=train_requirement,
-            validation_len=max(regime.validation_len for regime in regimes),
+            validation_len=validation_len,
             freq=freq,
             host_min_len=host_requirement,
         )
@@ -782,9 +757,7 @@ def run_analysis(
                 )
             )
 
-    series_summary = _add_comparisons(
-        pd.DataFrame(series_rows), ["series", "regime"]
-    )
+    series_summary = _add_comparisons(pd.DataFrame(series_rows), ["series"])
     summary = _summarize(series_summary)
     blocks = pd.concat(block_frames, ignore_index=True) if block_frames else pd.DataFrame()
     gaps = pd.DataFrame(gap_rows)
@@ -804,6 +777,9 @@ def run_analysis(
         "max_imputation_gap": max_imputation_gap,
         "holdout": holdout,
         "context_len": context_len,
+        "horizon": horizon,
+        "stride": stride,
+        "validation_len": validation_len,
         "all_model_requirements": all_requirements,
         "comparative_requirements": comparative_requirements,
     }

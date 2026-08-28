@@ -297,6 +297,25 @@ def test_select_holdout_window_uses_same_run_prefix_as_validation_host():
     assert window["train_end"] == series.index[459]
 
 
+def test_select_holdout_window_uses_96_targets_and_keeps_prefix_before_target():
+    series = _seasonal_series(n=400, seed=12)
+    window = select_holdout_window(
+        series,
+        holdout=96,
+        context_len=72,
+        train_min_len=84,
+        validation_len=48,
+        host_min_len=132,
+    )
+
+    assert window is not None
+    assert len(window["test_target_index"]) == 96
+    assert len(window["test_index"]) == 168
+    assert window["train_index"][-1] == window["test_target_start"] - pd.Timedelta(hours=1)
+    assert window["train_index"].intersection(window["test_target_index"]).empty
+    assert len(window["train_index"].intersection(window["context_index"])) == 72
+
+
 def test_backtest_forecast_returns_finite_metrics():
     series = _seasonal_series(n=600, seed=2)
     series.iloc[200:240] = np.nan
@@ -330,21 +349,21 @@ def test_train_val_split_keeps_train_before_validation():
     series.iloc[400:430] = np.nan  # gap splits into [0:400] and [430:600]
     train_ts = TimeSeries.from_series(series, freq="h")
 
-    input_chunk, size_k = 72, 8
+    input_chunk, size_k = 72, 12
     split = split_train_val_subseries(
         train_ts,
         input_chunk=input_chunk,
         size_k=size_k,
         validation_len=48,
-        validation_stride=4,
+        validation_stride=6,
     )
     assert split is not None
     train_subs, val_subs = split
-    assert len(val_subs) == 11
+    assert len(val_subs) == 7
     assert all(len(val) == input_chunk + size_k for val in val_subs)
     assert all(
         later.time_index[input_chunk] - earlier.time_index[input_chunk]
-        == pd.Timedelta(hours=4)
+        == pd.Timedelta(hours=6)
         for earlier, later in zip(val_subs, val_subs[1:])
     )
 
@@ -356,20 +375,6 @@ def test_train_val_split_keeps_train_before_validation():
     # allowed is the val context (< val_block_start).
     for ts in train_subs:
         assert ts.end_time() < val_block_start
-
-    long_split = split_train_val_subseries(
-        train_ts,
-        input_chunk=72,
-        size_k=48,
-        validation_len=96,
-        validation_stride=24,
-    )
-    assert long_split is not None
-    long_train, long_val = long_split
-    assert len(long_val) == 3
-    assert all(len(val) == 120 for val in long_val)
-    assert all(ts.end_time() < long_val[0].time_index[72] for ts in long_train)
-
 
 def test_train_val_split_returns_none_when_no_block_fits():
     idx = pd.date_range("2024-01-01", periods=50, freq="h")
@@ -535,7 +540,6 @@ def test_relative_metrics_pair_each_arm_with_matching_raw_result():
     rows = [
         {
             "series": "ST0",
-            "regime": "short",
             "model": "NLinear",
             "arm": "raw+frozen",
             "_mae": 1.5,
@@ -543,7 +547,6 @@ def test_relative_metrics_pair_each_arm_with_matching_raw_result():
         },
         {
             "series": "ST0",
-            "regime": "short",
             "model": "NLinear",
             "arm": "raw",
             "_mae": 2.0,
@@ -551,7 +554,6 @@ def test_relative_metrics_pair_each_arm_with_matching_raw_result():
         },
         {
             "series": "ST0",
-            "regime": "short",
             "model": "LinearRegression",
             "arm": "raw",
             "_mae": 5.0,
@@ -574,7 +576,6 @@ def test_relative_metrics_are_nan_when_pooled_raw_error_is_zero():
     rows = [
         {
             "series": "ST0",
-            "regime": "short",
             "model": "NLinear",
             "arm": "raw",
             "_mae": 0.0,
@@ -582,7 +583,6 @@ def test_relative_metrics_are_nan_when_pooled_raw_error_is_zero():
         },
         {
             "series": "ST0",
-            "regime": "short",
             "model": "NLinear",
             "arm": "unlabeled+impute",
             "_mae": 1.0,
@@ -838,20 +838,19 @@ def test_raw_frozen_uses_own_train_and_test_on_common_timestamps(
 
     assert set(artifacts["results_df"]["arm"]) == {"raw", "raw+frozen"}
     assert artifacts["results_df"].groupby("arm")["relrmse"].mean().nunique() == 2
-    assert len(seen) == 4
-    for raw_call, frozen_call in ((seen[0], seen[1]), (seen[2], seen[3])):
-        raw_train, raw_test, raw_mase = raw_call
-        frozen_train, frozen_test, frozen_mase = frozen_call
-        assert frozen_train.notna().sum() > raw_train.notna().sum()
-        assert raw_test.index.equals(frozen_test.index)
-        assert not raw_test.equals(frozen_test)
-        pd.testing.assert_series_equal(
-            raw_mase,
-            primary.loc[: raw_test.index[-1]],
-        )
-        pd.testing.assert_series_equal(raw_mase, frozen_mase)
-        assert raw_train.index.max() < raw_test.index[72]
-        assert frozen_train.index.max() < frozen_test.index[72]
+    assert len(seen) == 2
+    raw_train, raw_test, raw_mase = seen[0]
+    frozen_train, frozen_test, frozen_mase = seen[1]
+    assert frozen_train.notna().sum() > raw_train.notna().sum()
+    assert raw_test.index.equals(frozen_test.index)
+    assert not raw_test.equals(frozen_test)
+    pd.testing.assert_series_equal(
+        raw_mase,
+        primary.loc[: raw_test.index[-1]],
+    )
+    pd.testing.assert_series_equal(raw_mase, frozen_mase)
+    assert raw_train.index.max() < raw_test.index[72]
+    assert frozen_train.index.max() < frozen_test.index[72]
 
 
 def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
@@ -926,7 +925,10 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         "origin_rmse_mean",
         "origin_rmse_std",
     } & set(results_df.columns)
-    assert set(results_df["regime"]) == {"short", "long"}
+    assert "regime" not in results_df.columns
+    assert (results_df["horizon"] == 12).all()
+    assert (results_df["forecast_stride"] == 6).all()
+    assert (results_df["validation_len"] == 48).all()
     trainable = ~results_df["arm"].str.endswith("+noimpute")
     assert np.isfinite(results_df.loc[trainable, "rmsse"]).all()
     assert np.isfinite(results_df.loc[trainable, "mase"]).all()
@@ -935,21 +937,16 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     raw_rows = results_df[results_df["arm"] == "raw"]
     assert np.allclose(raw_rows["relmae"], 1.0)
     assert np.allclose(raw_rows["relrmse"], 1.0)
-    for regime, horizon, stride in (("short", 8, 4), ("long", 48, 24)):
-        subset = results_df.loc[(results_df["regime"] == regime) & trainable]
-        assert (subset["horizon"] == horizon).all()
-        assert (subset["forecast_stride"] == stride).all()
-        assert (
-            subset["n_forecasts"]
-            == (subset["test_target_hours"] - horizon) // stride + 1
-        ).all()
-        assert (subset["n_expected_forecasts"] == subset["n_forecasts"]).all()
-        assert (
-            subset["n_test_predictions"] == subset["n_forecasts"] * horizon
-        ).all()
-        assert (
-            subset["n_unique_targets"] == subset["test_target_hours"]
-        ).all()
+    subset = results_df.loc[trainable]
+    assert (
+        subset["n_forecasts"]
+        == (subset["test_target_hours"] - 12) // 6 + 1
+    ).all()
+    assert (subset["n_expected_forecasts"] == subset["n_forecasts"]).all()
+    assert (
+        subset["n_test_predictions"] == subset["n_forecasts"] * 12
+    ).all()
+    assert (subset["n_unique_targets"] == subset["test_target_hours"]).all()
 
     for artifact in ("results.csv", "summary.csv", "detection.csv", "selection.csv"):
         assert (tmp_path / artifact).exists()
@@ -1105,13 +1102,15 @@ def test_foundation_only_common_test_skips_training_arms(tmp_path, monkeypatch):
     assert [arm.name for arm in artifacts["arms"]] == ["raw", "raw+frozen"]
     assert set(artifacts["results_df"]["arm"]) == {"raw", "raw+frozen"}
     assert set(artifacts["results_df"]["model_mode"]) == {"foundation"}
-    assert len(artifacts["results_df"]) == 4
-    assert len(submitted) == 4
-    for raw_task, frozen_task in ((submitted[0], submitted[1]), (submitted[2], submitted[3])):
-        assert raw_task.train_series.index.equals(frozen_task.train_series.index)
-        assert raw_task.test_series.index.equals(frozen_task.test_series.index)
-        assert not raw_task.train_series.equals(frozen_task.train_series)
-        assert not raw_task.test_series.equals(frozen_task.test_series)
+    assert len(artifacts["results_df"]) == 2
+    assert len(submitted) == 2
+    raw_task, frozen_task = submitted
+    assert raw_task.train_series.index.equals(frozen_task.train_series.index)
+    assert raw_task.test_series.index.equals(frozen_task.test_series.index)
+    assert not raw_task.train_series.equals(frozen_task.train_series)
+    assert not raw_task.test_series.equals(frozen_task.test_series)
+    assert raw_task.size_k == frozen_task.size_k == 12
+    assert raw_task.forecast_stride == frozen_task.forecast_stride == 6
     assert (artifacts["results_df"]["train_seconds"] == 1.25).all()
     assert (artifacts["results_df"]["inference_seconds"] == 0.5).all()
     assert artifacts["detection_df"].empty

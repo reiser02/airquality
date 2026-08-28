@@ -165,7 +165,7 @@ def split_train_val_subseries(
     # Scan from the newest block back to the first one long enough to host the
     # fixed validation tail plus a training prefix.
     for i in range(len(subseries) - 1, -1, -1):
-        val_block = max(validation_target_length, validation_len)
+        val_block = validation_target_length + validation_len - size_k
         if len(subseries[i]) < min_len + val_block:
             continue
         val_host = subseries[i]
@@ -236,7 +236,7 @@ def get_strict_forecast_requirements(
             context_len=context_len,
         )
         reserve = (
-            max(validation_len, native.validation_target_length)
+            native.validation_target_length + validation_len - size_k
             if native.validation_target_offset is not None
             else 0
         )
