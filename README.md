@@ -95,7 +95,7 @@ Controls shared split sizes and direct imputation benchmark behavior.
 - `gap_sizes`: synthetic missing-gap sizes
 - `num_gaps`: number of gaps injected per series
 - `gap_strategy`: gap placement strategy
-- `metrics`: evaluation metrics such as `mae`, `rmse`, `mase`
+- `metrics`: evaluation metrics such as `mae`, `rmse`, `mase`, and `rmsse`
 - `random_seed`: benchmark seed
 - `seasonality_m`: seasonality used by MASE
 - `val_size`, `val_context_len`, `min_train_len_base`: shared split settings
@@ -104,9 +104,14 @@ Controls shared split sizes and direct imputation benchmark behavior.
 
 Controls the direct imputation benchmark independently from training.
 
-- `model_names`: explicit methods to evaluate; the default is eight Darts models plus `TSPulse`
+- `model_names`: explicit methods to evaluate; the current config selects eight Darts models, `Prophet`, both TSPulse variants, and two interpolation baselines
 - `strict_artifacts`: abort when a selected Darts `.pt` or Torch checkpoint is absent; set to `false` to omit incomplete artifacts
-- `max_workers`: process limit for model-level parallelism; the default is `1`
+- `max_workers`: process limit for model-level parallelism; the current shared config uses `8`
+
+The complete evaluation protocol, including the retrospective holdout, synthetic
+gap generation, model information access, metrics, Monte Carlo aggregation, and
+limitations, is documented in
+[`docs/IMPUTATION_BENCHMARK.md`](docs/IMPUTATION_BENCHMARK.md).
 
 #### `[tspulse]`
 
@@ -263,6 +268,9 @@ Outputs:
 
 This uses `src/airquality/benchmark.py`.
 
+The full methodology is documented in
+[`docs/IMPUTATION_BENCHMARK.md`](docs/IMPUTATION_BENCHMARK.md).
+
 ```bash
 uv run python -m airquality.benchmark
 ```
@@ -273,6 +281,11 @@ What it does:
 - validates every selected Darts artifact before parallel execution
 - runs Monte Carlo imputation evaluation
 - saves benchmark CSVs and rendered plots
+
+The benchmark reports standardized MAE/RMSE, MASE/RMSSE, and R². R² is
+computed from all finite masked points for each model, station, gap size, and
+seed; station-level aggregation gives every station equal weight. Higher R² is
+better, while lower values are better for the four error metrics.
 
 Outputs are written to a timestamped directory like:
 
@@ -285,13 +298,13 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
-- `model_performance_by_gap_{mae,rmse,mase,rmsse}.png`: error, mean rank, and top-three frequency for every gap size
-- `overall_model_performance_{mae,rmse,mase,rmsse}.png`: compact global scorecards
-- `global_station_error_{mae,rmse,mase,rmsse}.png`: distributions of gap-averaged error across stations
-- `pairwise_win_rate_{mae,rmse,mase,rmsse}.png`: matched head-to-head win rates for every model pair
+- `model_performance_by_gap_{mae,rmse,mase,rmsse,r2}.png`: metric value, mean rank, and top-three frequency for every gap size
+- `overall_model_performance_{mae,rmse,mase,rmsse,r2}.png`: compact global scorecards
+- `global_station_error_{mae,rmse,mase,rmsse,r2}.png`: distributions of gap-averaged metric values across stations
+- `pairwise_win_rate_{mae,rmse,mase,rmsse,r2}.png`: matched head-to-head win rates for every model pair
 - `gap_degradation_{mae,rmse,mase,rmsse}.png`: relative degradation from each model's shortest gap
 - `tail_risk_{mae,rmse,mase,rmsse}.png`: mean error versus the hardest 10% of stations
-- `error_correlation_{mae,rmse,mase,rmsse}.png`: similarity of station-level error patterns between models
+- `error_correlation_{mae,rmse,mase,rmsse,r2}.png`: similarity of station-level metric patterns between models
 - `model_performance_by_gap.csv`, `overall_model_performance.csv`, and the corresponding diagnostic CSVs: data behind the summaries
 - `plot_store.csv.gz`: compressed actual values and per-model predictions used by the plots
 - `plot_images.csv`: manifest of saved plot images

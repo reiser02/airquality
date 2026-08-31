@@ -132,6 +132,19 @@ def test_summarize_results_by_model_averages_impute_seconds() -> None:
     assert out.set_index("Modelo").loc["A", "Impute_Seconds"] == pytest.approx(3.0)
 
 
+def test_summarize_results_by_model_maximizes_r2() -> None:
+    df = pd.DataFrame(
+        {
+            "Modelo": ["Low", "High"],
+            "R2": [0.2, 0.8],
+        }
+    )
+
+    out = summarize_results_by_model(df)
+
+    assert list(out["Modelo"]) == ["High", "Low"]
+
+
 def test_resolve_requested_models_deduplicates_darts_and_detects_tspulse() -> None:
     darts, prophet, tspulse_model_names, interp, linear = _resolve_requested_models(
         ["TiDE", "TiDE", " TCN ", TSPULSE_ORIGINAL_MODEL_NAME]
@@ -485,6 +498,22 @@ def test_summarize_montecarlo_rankings_aggregates_and_sorts() -> None:
     assert list(out["Runs"]) == [2, 2]
     assert out.loc[out["Modelo"] == "A", "MASE_Mean"].item() == 3.0
     assert out.loc[out["Modelo"] == "A", "RMSSE_Mean"].item() == 4.0
+
+
+def test_summarize_montecarlo_rankings_maximizes_r2() -> None:
+    df = pd.DataFrame(
+        {
+            "Modelo": ["Low", "Low", "High", "High"],
+            "Seed": [1, 2, 1, 2],
+            "R2": [0.1, 0.3, 0.8, float("nan")],
+        }
+    )
+
+    out = summarize_montecarlo_rankings(df)
+
+    assert list(out["Modelo"]) == ["High", "Low"]
+    assert out.set_index("Modelo").loc["High", "R2_Mean"] == pytest.approx(0.8)
+    assert out.set_index("Modelo").loc["High", "R2_N"] == 1
 
 
 def test_load_darts_models_from_artifacts_loads_cpu_model_and_skips_missing(

@@ -45,6 +45,7 @@ from airquality.imputation.registry import (
     resolve_imputer_family,
 )
 from airquality.modeling.training import build_benchmark_dataset_bundle
+from airquality.metrics import metric_higher_is_better
 from airquality.modeling.training_config import (
     BenchmarkDatasetBundle,
     build_lightning_trainer_kwargs,
@@ -89,7 +90,7 @@ def _default_gap_counts() -> tuple[int, ...] | None:
 def _default_metrics() -> tuple[str, ...]:
     """Return the default metric names computed by the benchmark."""
     return cfg_get_csv_list(
-        "benchmark", "metrics", ("mae", "rmse", "mase", "rmsse")
+        "benchmark", "metrics", ("mae", "rmse", "mase", "rmsse", "r2")
     )
 
 
@@ -579,21 +580,23 @@ def summarize_results_by_model(results_df: pd.DataFrame) -> pd.DataFrame:
     but never used for ordering.
     """
     metric_cols = [
-        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_df.columns
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE", "R2") if m in results_df.columns
     ]
     if not metric_cols:
         return pd.DataFrame(columns=["Modelo"])
 
     timing_cols = [c for c in ("Train_Seconds", "Impute_Seconds") if c in results_df.columns]
     avg_cols = metric_cols + timing_cols
-    ranking_df = (
-        results_df.groupby("Modelo", as_index=False)[avg_cols]
-        .mean(numeric_only=True)
-        .sort_values(
-            [c for c in ("MASE", "RMSSE", "RMSE", "MAE") if c in metric_cols]
-        )
-        .reset_index(drop=True)
+    sort_cols = [
+        c for c in ("MASE", "RMSSE", "R2", "RMSE", "MAE") if c in metric_cols
+    ]
+    ranking_df = results_df.groupby("Modelo", as_index=False)[avg_cols].mean(
+        numeric_only=True
     )
+    ranking_df = ranking_df.sort_values(
+        sort_cols,
+        ascending=[not metric_higher_is_better(metric) for metric in sort_cols],
+    ).reset_index(drop=True)
     return ranking_df
 
 
@@ -1087,7 +1090,9 @@ def _build_montecarlo_seed_list(
 def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFrame:
     """Summarize per-seed rankings with mean, spread, and quantiles by model."""
     metric_cols = [
-        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in ranking_by_seed_df.columns
+        m
+        for m in ("MAE", "RMSE", "MASE", "RMSSE", "R2")
+        if m in ranking_by_seed_df.columns
     ]
     if ranking_by_seed_df.empty or not metric_cols:
         return pd.DataFrame(columns=["Modelo", "Runs"])
@@ -1101,6 +1106,7 @@ def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFr
 
         for metric in metric_cols:
             values = pd.to_numeric(group_df[metric], errors="coerce").dropna()
+            row[f"{metric}_N"] = int(len(values))
             row[f"{metric}_Mean"] = float(values.mean()) if len(values) > 0 else float("nan")
             row[f"{metric}_Std"] = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
             row[f"{metric}_P05"] = float(values.quantile(0.05)) if len(values) > 0 else float("nan")
@@ -1111,11 +1117,17 @@ def summarize_montecarlo_rankings(ranking_by_seed_df: pd.DataFrame) -> pd.DataFr
     summary_df = pd.DataFrame(rows)
     sort_cols = [
         c
-        for c in ("MASE_Mean", "RMSSE_Mean", "RMSE_Mean", "MAE_Mean")
+        for c in ("MASE_Mean", "RMSSE_Mean", "R2_Mean", "RMSE_Mean", "MAE_Mean")
         if c in summary_df.columns
     ]
     if sort_cols:
-        summary_df = summary_df.sort_values(sort_cols).reset_index(drop=True)
+        summary_df = summary_df.sort_values(
+            sort_cols,
+            ascending=[
+                not metric_higher_is_better(column.removesuffix("_Mean"))
+                for column in sort_cols
+            ],
+        ).reset_index(drop=True)
     return summary_df
 
 
@@ -1334,7 +1346,9 @@ def run_imputation_benchmark_parallel_montecarlo(
 
     results_mc_df = pd.concat(results_runs, ignore_index=True)
     metric_cols = [
-        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_mc_df.columns
+        m
+        for m in ("MAE", "RMSE", "MASE", "RMSSE", "R2")
+        if m in results_mc_df.columns
     ]
     if metric_cols:
         ranking_by_seed_df = (

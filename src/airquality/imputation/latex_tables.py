@@ -15,8 +15,9 @@ from typing import Final
 
 import pandas as pd
 
+from airquality.metrics import metric_higher_is_better
 
-METRIC_ORDER: Final[tuple[str, ...]] = ("MAE", "RMSE", "MASE", "RMSSE")
+METRIC_ORDER: Final[tuple[str, ...]] = ("MAE", "RMSE", "MASE", "RMSSE", "R2")
 PROFILE_TOLERANCES: Final[tuple[float, ...]] = (0.0, 5.0, 10.0, 25.0, 50.0)
 
 
@@ -49,7 +50,14 @@ def build_overall_summary(overall: pd.DataFrame, *, top_k: int = 5) -> pd.DataFr
     for metric in _metric_order(overall):
         group = overall[overall["Metric"] == metric].copy()
         group = group.sort_values(
-            ["Mean", "Median", "Station_SD", "Modelo"], kind="stable"
+            ["Mean", "Median", "Station_SD", "Modelo"],
+            ascending=[
+                not metric_higher_is_better(metric),
+                not metric_higher_is_better(metric),
+                True,
+                True,
+            ],
+            kind="stable",
         ).head(top_k)
         group.insert(1, "Rank_Mean", range(1, len(group) + 1))
         rows.append(group)
@@ -87,7 +95,14 @@ def build_gap_summary(by_gap: pd.DataFrame, *, top_k: int = 3) -> pd.DataFrame:
         ["Metric", "Gap_Size"], sort=False
     ):
         selected = group.sort_values(
-            ["Mean", "Median", "Station_SD", "Modelo"], kind="stable"
+            ["Mean", "Median", "Station_SD", "Modelo"],
+            ascending=[
+                not metric_higher_is_better(metric),
+                not metric_higher_is_better(metric),
+                True,
+                True,
+            ],
+            kind="stable",
         ).head(top_k).copy()
         selected.insert(2, "Rank_Mean", range(1, len(selected) + 1))
         groups.append(selected)
@@ -274,8 +289,9 @@ def export_latex_tables(
     csv_frames = {
         "overall_model_summary": overall_summary,
         "best_models_by_gap": gap_summary,
-        "global_profile_summary": profile_summary,
     }
+    if not profile_summary.empty:
+        csv_frames["global_profile_summary"] = profile_summary
     for name, frame in csv_frames.items():
         path = output_dir / f"{name}.csv"
         frame.to_csv(path, index=False)
@@ -284,7 +300,7 @@ def export_latex_tables(
     latex_tables = {
         "overall_model_summary.tex": _latex_frame(
             overall_summary,
-            caption="Best imputation models by absolute global error.",
+            caption="Best imputation models by global metric value.",
             label="tab:imputation-overall-models",
         ),
         "best_models_by_gap.tex": _latex_frame(
@@ -292,12 +308,13 @@ def export_latex_tables(
             caption="Best imputation models by gap size.",
             label="tab:imputation-models-by-gap",
         ),
-        "global_profile_summary.tex": _latex_frame(
+    }
+    if not profile_summary.empty:
+        latex_tables["global_profile_summary.tex"] = _latex_frame(
             profile_summary,
             caption="Global performance profile relative to the winner in each context.",
             label="tab:imputation-global-profile",
-        ),
-    }
+        )
     for filename, content in latex_tables.items():
         path = output_dir / filename
         path.write_text(content, encoding="utf-8")

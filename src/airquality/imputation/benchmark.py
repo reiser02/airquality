@@ -9,6 +9,9 @@ import numpy as np  # Numeric operations for masks, metrics, and random sampling
 import pandas as pd  # Time-indexed series/dataframe processing.
 
 from darts import TimeSeries  # Darts time series container used across the module.
+from darts.metrics import mae as darts_mae
+from darts.metrics import r2_score as darts_r2_score
+from darts.metrics import rmse as darts_rmse
 from airquality.data.series import ensure_datetime_series, to_pd_series
 from airquality.modeling.training_config import BenchmarkDatasetBundle
 from airquality.metrics import compute_mase, compute_rmsse
@@ -461,32 +464,44 @@ def _compute_metrics_on_mask(
     metrics: Sequence[str],
     scale_std: float | None = None,
 ) -> dict[str, float]:
-    """Compute selected MAE/RMSE on mask timestamps, optionally standardized."""
+    """Compute selected pooled metrics on mask timestamps."""
     idx = y_true.index.intersection(y_pred.index)
     true_vals = y_true.reindex(idx).to_numpy(dtype=float)
     pred_vals = y_pred.reindex(idx).to_numpy(dtype=float)
 
     valid = np.isfinite(true_vals) & np.isfinite(pred_vals)
     if not np.any(valid):
-        return {m.upper(): float("nan") for m in metrics if m.lower() in ("mae", "rmse")}
+        return {
+            m.upper(): float("nan")
+            for m in metrics
+            if m.lower() in ("mae", "rmse", "r2")
+        }
 
-    err = true_vals[valid] - pred_vals[valid]
-    if scale_std is not None:
-        if not np.isfinite(scale_std) or scale_std <= 0.0:
-            return {
-                m.upper(): float("nan")
-                for m in metrics
-                if m.lower() in ("mae", "rmse")
-            }
-        err = err / float(scale_std)
+    true_vals = true_vals[valid]
+    pred_vals = pred_vals[valid]
+    actual_ts = TimeSeries.from_values(true_vals)
+    predicted_ts = TimeSeries.from_values(pred_vals)
     out: dict[str, float] = {}
 
     for metric_name in metrics:
         m = metric_name.lower()
-        if m == "mae":
-            out["MAE"] = float(np.mean(np.abs(err)))
-        elif m == "rmse":
-            out["RMSE"] = float(np.sqrt(np.mean(np.square(err))))
+        if m in ("mae", "rmse"):
+            if scale_std is not None and (
+                not np.isfinite(scale_std) or scale_std <= 0.0
+            ):
+                out[m.upper()] = float("nan")
+                continue
+            metric = darts_mae if m == "mae" else darts_rmse
+            value = float(metric(actual_ts, predicted_ts))
+            out[m.upper()] = (
+                value / float(scale_std) if scale_std is not None else value
+            )
+        elif m == "r2":
+            out["R2"] = (
+                float(darts_r2_score(actual_ts, predicted_ts))
+                if len(true_vals) >= 2 and np.ptp(true_vals) > 0.0
+                else float("nan")
+            )
     return out
 
 
@@ -638,11 +653,15 @@ def _build_metric_row(
 
     n_target_points = int(len(mask_index))
     n_scored_points = int(valid_pairs.sum())
-    scale_std = _scaler_standard_deviation(metric_scaler)
+    scale_std = (
+        _scaler_standard_deviation(metric_scaler)
+        if any(metric in ("mae", "rmse") for metric in metric_list)
+        else float("nan")
+    )
 
-    # MAE and RMSE use the station's train-only standard scale. MASE and RMSSE
-    # retain their seasonal-naive scales and remain directly comparable to prior runs.
-    mae_rmse_metrics = [m for m in metric_list if m in ("mae", "rmse")]
+    # MAE and RMSE use the station's train-only standard scale. R2 is already
+    # scale invariant. MASE and RMSSE retain their seasonal-naive scales.
+    pooled_metrics = [m for m in metric_list if m in ("mae", "rmse", "r2")]
     row: dict[str, Any] = {
         "Modelo": str(model_name),
         "Serie": str(series_name),
@@ -661,14 +680,14 @@ def _build_metric_row(
         ),
     }
 
-    if mae_rmse_metrics:
-        mae_rmse_values = _compute_metrics_on_mask(
+    if pooled_metrics:
+        pooled_values = _compute_metrics_on_mask(
             y_true=y_true,
             y_pred=y_pred,
-            metrics=mae_rmse_metrics,
+            metrics=pooled_metrics,
             scale_std=scale_std,
         )
-        row.update(mae_rmse_values)
+        row.update(pooled_values)
 
     scaled_metric_functions = {
         "mase": compute_mase,
@@ -810,7 +829,7 @@ def execute_complete_pipeline(
     gap_strategy: str = "block",
     hybrid_random_fraction: float = 0.75,
     gap_spec_by_series: Mapping[str, Sequence[tuple[pd.Timestamp, int]]] | None = None,
-    metrics: Sequence[str] = ("mae", "rmse", "mase", "rmsse"),
+    metrics: Sequence[str] = ("mae", "rmse", "mase", "rmsse", "r2"),
     seasonality_m: int = 24,
     freq: str = "h",
     random_seed: int = 42,
@@ -824,8 +843,8 @@ def execute_complete_pipeline(
     - Receive one dataset bundle and already-loaded models.
     - Generate (or receive) artificial gaps compatible with TSPulse notebook ideas.
     - Impute with TSPulse and Darts.
-    - Evaluate train-standardized MAE/RMSE and seasonal-scaled MASE/RMSSE strictly
-      on missing points.
+    - Evaluate train-standardized MAE/RMSE, seasonal-scaled MASE/RMSSE, and
+      scale-invariant pooled R2 strictly on missing points.
     - Scale-sensitive models (those without `requires_unscaled_input`) predict on
       scaled values and their output is inverse-transformed before applying the
       common train-only station scale; models that require unscaled input consume
@@ -846,7 +865,7 @@ def execute_complete_pipeline(
 
     metric_list = [str(m).strip().lower() for m in metrics]
     for m in metric_list:
-        if m not in {"mae", "rmse", "mase", "rmsse"}:
+        if m not in {"mae", "rmse", "mase", "rmsse", "r2"}:
             raise ValueError(f"Metrica no soportada: {m}")
 
     if config_workers is None:

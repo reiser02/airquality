@@ -28,8 +28,12 @@ def _overall_frame() -> pd.DataFrame:
                 "N_Gaps": 2,
                 "N_Contexts": 4,
             }
-            for metric in ("MAE", "RMSE", "MASE", "RMSSE")
-            for model, mean, rank in (("A_Model", 1.0, 1.0), ("B_Model", 2.0, 2.0))
+            for metric in ("MAE", "RMSE", "MASE", "RMSSE", "R2")
+            for model, mean, rank in (
+                (("A_Model", 0.8, 1.0), ("B_Model", 0.2, 2.0))
+                if metric == "R2"
+                else (("A_Model", 1.0, 1.0), ("B_Model", 2.0, 2.0))
+            )
         ]
     )
 
@@ -38,14 +42,14 @@ def test_summary_tables_select_and_sort_models() -> None:
     overall = _overall_frame()
     summary = build_overall_summary(overall, top_k=1)
 
-    assert summary["Metric"].tolist() == ["MAE", "RMSE", "MASE", "RMSSE"]
-    assert summary["Modelo"].tolist() == ["A_Model"] * 4
-    assert summary["Rank_Mean"].tolist() == [1] * 4
+    assert summary["Metric"].tolist() == ["MAE", "RMSE", "MASE", "RMSSE", "R2"]
+    assert summary["Modelo"].tolist() == ["A_Model"] * 5
+    assert summary["Rank_Mean"].tolist() == [1] * 5
 
     by_gap = overall.assign(Gap_Size=1).rename(columns={"Mean_Rank": "Mean_Rank"})
     gap_summary = build_gap_summary(by_gap, top_k=1)
-    assert len(gap_summary) == 4
-    assert gap_summary["Modelo"].tolist() == ["A_Model"] * 4
+    assert len(gap_summary) == 5
+    assert gap_summary["Modelo"].tolist() == ["A_Model"] * 5
 
 
 def test_profile_summary_keeps_relative_tolerances() -> None:
@@ -105,3 +109,35 @@ def test_export_latex_tables_reads_run_csvs(tmp_path: Path) -> None:
     assert "RMSSE" in (
         tmp_path / "latex_tables/overall_model_summary.tex"
     ).read_text(encoding="utf-8")
+    assert "R2" in (
+        tmp_path / "latex_tables/overall_model_summary.tex"
+    ).read_text(encoding="utf-8")
+
+
+def test_export_latex_tables_omits_profiles_for_r2_only(tmp_path: Path) -> None:
+    overall = _overall_frame().query("Metric == 'R2'")
+    overall.assign(Gap_Size=1).to_csv(
+        tmp_path / "model_performance_by_gap.csv", index=False
+    )
+    overall.to_csv(tmp_path / "overall_model_performance.csv", index=False)
+    overall[["Metric", "Modelo", "Mean_Rank"]].to_csv(
+        tmp_path / "global_rank_summary.csv", index=False
+    )
+    pd.DataFrame(
+        columns=[
+            "Metric",
+            "Modelo",
+            "Threshold_Ratio",
+            "Tolerance_Percent",
+            "Context_Percent",
+        ]
+    ).to_csv(tmp_path / "global_performance_profiles.csv", index=False)
+
+    outputs = export_latex_tables(tmp_path, top_k=1)
+
+    assert set(outputs) == {
+        "overall_model_summary.csv",
+        "best_models_by_gap.csv",
+        "overall_model_summary.tex",
+        "best_models_by_gap.tex",
+    }

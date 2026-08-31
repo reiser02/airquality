@@ -170,6 +170,37 @@ def test_global_summaries_derive_support_from_all_26_stations() -> None:
     )
 
 
+def test_r2_rankings_and_pairwise_wins_maximize_metric() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "Modelo": model,
+                "Serie": station,
+                "Gap_Size": gap,
+                "R2": value,
+            }
+            for station in ("A", "B")
+            for gap in (1, 2)
+            for model, value in (("High", 0.8), ("Low", 0.2))
+        ]
+    )
+
+    rank_summary, _ = _global_rank_frequency_tables(frame, ["R2"])
+    ranks = rank_summary.set_index("Modelo")
+    _, overall = _model_performance_tables(frame, ["R2"])
+    performance = overall.set_index("Modelo")
+    pairwise = _pairwise_win_rate_table(frame, ["R2"]).set_index(
+        ["Modelo", "Opponent"]
+    )
+
+    assert ranks.loc["High", "Mean_Rank"] == pytest.approx(1.0)
+    assert ranks.loc["High", "Winner_Percent"] == pytest.approx(100.0)
+    assert performance.loc["High", "Mean_Rank"] == pytest.approx(1.0)
+    assert pairwise.loc[("High", "Low"), "Win_Rate_Percent"] == pytest.approx(
+        100.0
+    )
+
+
 def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> None:
     rows: list[dict[str, object]] = []
     for gap in (1, 2, 6, 24):
@@ -188,6 +219,7 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
                             "RMSE": base + 0.4,
                             "MASE": base / 5.0,
                             "RMSSE": base / 6.0,
+                            "R2": 1.0 - base / 100.0,
                             "Test_Block_Points": 100 if station != "C" else 80,
                             "Test_Hours": 200 if station != "C" else 160,
                         }
@@ -219,10 +251,11 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         "overall_model_performance_plot_paths",
         "global_station_error_plot_paths",
         "pairwise_win_rate_plot_paths",
-        "gap_degradation_plot_paths",
-        "tail_risk_plot_paths",
         "error_correlation_plot_paths",
     ):
+        assert set(artifacts[key]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
+        assert all(path.exists() for path in artifacts[key].values())
+    for key in ("gap_degradation_plot_paths", "tail_risk_plot_paths"):
         assert set(artifacts[key]) == {"MAE", "RMSE", "MASE", "RMSSE"}
         assert all(path.exists() for path in artifacts[key].values())
 
@@ -243,6 +276,6 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         tmp_path / filename for filename in expected_tables
     }
     gap_table = pd.read_csv(tmp_path / "model_performance_by_gap.csv")
-    assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE"}
+    assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
     assert gap_table["N_Stations"].eq(3).all()
     assert all(not (tmp_path / filename).exists() for filename in obsolete_plots)
