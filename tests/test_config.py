@@ -75,4 +75,11 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.getint("forecasting", "foundation_test_seed") == 1001
     assert cfg.getint("forecasting", "foundation_test_repeats") == 1
     assert not cfg.has_option("benchmark", "model_names")
+    assert cfg.get("benchmark", "metrics").split(",") == [
+        "mae",
+        "rmse",
+        "mase",
+        "rmsse",
+        "r2",
+    ]
     assert cfg.has_option("tspulse", "finetuned_model_path")

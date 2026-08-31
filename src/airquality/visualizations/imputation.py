@@ -18,8 +18,8 @@ Figures:
 
 - ``imputation_time_by_model.png`` — grouped horizontal bars of the mean
   training time and the mean imputation (inference) time per model.
-- ``imputation_time_vs_{mase,rmsse,rmse,mae}.png`` — cost/accuracy scatter: mean
-  imputation time (x, log) vs error (y) per model, so the bottom-left is best.
+- ``imputation_time_vs_{mase,rmsse,rmse,mae,r2}.png`` — cost/accuracy scatter:
+  mean imputation time (x, log) vs metric value (y) per model.
 
 All timings are means across series; plots regenerate from the CSVs without
 recomputing anything.
@@ -41,6 +41,7 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
+from airquality.metrics import metric_higher_is_better
 from airquality.visualizations.anomaly import (
     EDGE_COLOR,
     FIGURE_FACE,
@@ -73,6 +74,7 @@ METRIC_LABELS = {
     "RMSSE": "RMSSE",
     "RMSE": "RMSE",
     "MAE": "MAE",
+    "R2": "R²",
 }
 
 
@@ -120,7 +122,7 @@ def summarize_timing(
     """Mean timing (and error metrics) per model from a raw benchmark results frame.
 
     Returns a frame with a ``Modelo`` column plus whichever of ``Train_Seconds`` /
-    ``Impute_Seconds`` / ``MAE`` / ``RMSE`` / ``MASE`` / ``RMSSE`` are present,
+    ``Impute_Seconds`` / ``MAE`` / ``RMSE`` / ``MASE`` / ``RMSSE`` / ``R2`` are present,
     one row per
     model (input order preserved). Every value is the mean across series.
 
@@ -131,7 +133,8 @@ def summarize_timing(
     if results_df.empty or "Modelo" not in results_df.columns:
         return pd.DataFrame()
     value_cols = [
-        col for col in (TRAIN_COL, IMPUTE_COL, "MAE", "RMSE", "MASE", "RMSSE")
+        col
+        for col in (TRAIN_COL, IMPUTE_COL, "MAE", "RMSE", "MASE", "RMSSE", "R2")
         if col in results_df.columns
     ]
     if not value_cols:
@@ -249,7 +252,11 @@ def save_time_vs_error_plot(
     add_plot_header(
         figure,
         f"Coste vs precision — {metric_label}",
-        "Media por modelo: X = tiempo de imputacion, Y = error (abajo-izquierda = mejor).",
+        (
+            "Media por modelo: X = tiempo de imputacion, Y = metrica (arriba-izquierda = mejor)."
+            if metric_higher_is_better(metric)
+            else "Media por modelo: X = tiempo de imputacion, Y = error (abajo-izquierda = mejor)."
+        ),
     )
     style_axis(axis)
     axis.grid(True, axis="both", color=GRID_COLOR, linestyle="--", alpha=0.5)
@@ -283,7 +290,7 @@ def render_timing_figures(
     """Render every applicable timing figure for one results frame; return saved paths."""
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics = [
-        m for m in ("MASE", "RMSSE", "RMSE", "MAE") if m in results_df.columns
+        m for m in ("MASE", "RMSSE", "RMSE", "MAE", "R2") if m in results_df.columns
     ]
     jobs: list[tuple[Path, object]] = [
         (output_dir / "imputation_time_by_model.png",

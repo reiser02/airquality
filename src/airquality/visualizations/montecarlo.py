@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from airquality.metrics import metric_higher_is_better
+
 # Base palette mirrored from `airquality.visualizations.anomaly` (same "base color"
 # the anomaly benchmark plots use). Copied verbatim on purpose: importing that
 # module would drag in the heavy STL/anomaly stack just for a handful of colours.
@@ -270,7 +272,11 @@ def _global_rank_frequency_tables(
         panel = _complete_metric_panel(results_mc_df, metric)
         if panel.empty:
             continue
-        ranks = panel.rank(axis=1, method="average", ascending=True)
+        ranks = panel.rank(
+            axis=1,
+            method="average",
+            ascending=not metric_higher_is_better(metric),
+        )
         details = (
             ranks.rename_axis(columns="Modelo")
             .stack()
@@ -442,9 +448,13 @@ def _pairwise_win_rate_table(
             for opponent in panel.columns:
                 differences = panel[model] - panel[opponent]
                 ties = np.isclose(differences, 0.0, rtol=1e-9, atol=1e-12)
+                wins = (
+                    differences > 0.0
+                    if metric_higher_is_better(metric)
+                    else differences < 0.0
+                )
                 scores = pd.Series(
-                    np.where(ties, 0.5, np.where(differences < 0.0, 1.0, 0.0)),
-                    index=panel.index,
+                    np.where(ties, 0.5, wins.astype(float)), index=panel.index
                 )
                 station_scores = scores.groupby(level="Serie", sort=False).mean()
                 station_deltas = differences.groupby(level="Serie", sort=False).mean()
@@ -695,7 +705,11 @@ def _model_performance_tables(
         panel = _complete_metric_panel(results_mc_df, metric)
         if panel.empty:
             continue
-        ranks = panel.rank(axis=1, method="average", ascending=True)
+        ranks = panel.rank(
+            axis=1,
+            method="average",
+            ascending=not metric_higher_is_better(metric),
+        )
         gap_sizes = sorted(
             int(value) for value in panel.index.get_level_values("Gap_Size").unique()
         )
@@ -826,7 +840,15 @@ def _save_global_station_error_plots(
         if metric_frame.empty or overall.empty:
             continue
         model_order = (
-            overall.sort_values(["Mean", "Median", "Modelo"], kind="stable")["Modelo"]
+            overall.sort_values(
+                ["Mean", "Median", "Modelo"],
+                ascending=[
+                    not metric_higher_is_better(metric),
+                    not metric_higher_is_better(metric),
+                    True,
+                ],
+                kind="stable",
+            )["Modelo"]
             .astype(str)
             .tolist()
         )
@@ -903,7 +925,11 @@ def _save_global_station_error_plots(
             0.953,
             _summary_support_text(overall)
             + " Cada punto es una estación; caja P25-P75, línea naranja mediana y diamante media.\n"
-            "Cómo leer: más a la izquierda es mejor; una caja corta indica comportamiento homogéneo entre estaciones.",
+            + (
+                "Cómo leer: más a la derecha es mejor; una caja corta indica comportamiento homogéneo entre estaciones."
+                if metric_higher_is_better(metric)
+                else "Cómo leer: más a la izquierda es mejor; una caja corta indica comportamiento homogéneo entre estaciones."
+            ),
             ha="center",
             va="top",
             fontsize=8.5,
@@ -935,7 +961,15 @@ def _save_pairwise_win_rate_plots(
         if metric_frame.empty or overall.empty:
             continue
         model_order = (
-            overall.sort_values(["Mean", "Median", "Modelo"], kind="stable")["Modelo"]
+            overall.sort_values(
+                ["Mean", "Median", "Modelo"],
+                ascending=[
+                    not metric_higher_is_better(metric),
+                    not metric_higher_is_better(metric),
+                    True,
+                ],
+                kind="stable",
+            )["Modelo"]
             .astype(str)
             .tolist()
         )
@@ -1031,7 +1065,15 @@ def _save_gap_degradation_plots(
         if metric_frame.empty or overall.empty:
             continue
         model_order = (
-            overall.sort_values(["Mean", "Median", "Modelo"], kind="stable")["Modelo"]
+            overall.sort_values(
+                ["Mean", "Median", "Modelo"],
+                ascending=[
+                    not metric_higher_is_better(metric),
+                    not metric_higher_is_better(metric),
+                    True,
+                ],
+                kind="stable",
+            )["Modelo"]
             .astype(str)
             .tolist()
         )
@@ -1198,7 +1240,15 @@ def _save_error_correlation_plots(
         if metric_frame.empty or overall.empty:
             continue
         model_order = (
-            overall.sort_values(["Mean", "Median", "Modelo"], kind="stable")["Modelo"]
+            overall.sort_values(
+                ["Mean", "Median", "Modelo"],
+                ascending=[
+                    not metric_higher_is_better(metric),
+                    not metric_higher_is_better(metric),
+                    True,
+                ],
+                kind="stable",
+            )["Modelo"]
             .astype(str)
             .tolist()
         )
@@ -1250,7 +1300,7 @@ def _save_error_correlation_plots(
         colorbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8)
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
         fig.suptitle(
-            f"Similitud de los patrones de error: {display_metric}",
+            f"Similitud de los patrones entre estaciones: {display_metric}",
             y=0.992,
             fontsize=14,
             fontweight="bold",
@@ -1261,7 +1311,7 @@ def _save_error_correlation_plots(
             0.953,
             _summary_support_text(overall)
             + " Se correlacionan estaciones dentro de cada hueco y después se promedian los huecos.\n"
-            "Cómo leer: +1 indica que ambos fallan en las mismas estaciones; 0 o valores negativos sugieren complementariedad, no mayor precisión.",
+            "Cómo leer: +1 indica perfiles similares entre estaciones; 0 o valores negativos sugieren complementariedad, no mayor precisión.",
             ha="center",
             va="top",
             fontsize=8.5,
@@ -1322,9 +1372,11 @@ def _save_model_performance_by_gap_plots(
         if metric_frame.empty or overall.empty:
             continue
         model_order = (
-            overall.sort_values(["Mean_Rank", "Mean", "Modelo"], kind="stable")[
-                "Modelo"
-            ]
+            overall.sort_values(
+                ["Mean_Rank", "Mean", "Modelo"],
+                ascending=[True, not metric_higher_is_better(metric), True],
+                kind="stable",
+            )["Modelo"]
             .astype(str)
             .tolist()
         )
@@ -1337,16 +1389,17 @@ def _save_model_performance_by_gap_plots(
             facecolor=FIGURE_FACE,
             sharey=True,
         )
+        higher_is_better = metric_higher_is_better(metric)
         specifications = (
             (
                 "Mean",
                 f"{_metric_display_name(metric, scaled_errors=scaled_errors)} medio",
-                "YlOrRd",
+                "YlGnBu" if higher_is_better else "YlOrRd",
                 None,
                 None,
                 _format_metric_value,
                 False,
-                "Error medio",
+                "Valor medio",
             ),
             (
                 "Mean_Rank",
@@ -1435,8 +1488,12 @@ def _save_model_performance_by_gap_plots(
             0.5,
             0.953,
             _summary_support_text(overall)
-            + " El error conserva su escala; rango y top 3 comparan dentro de cada estación-hueco.\n"
-            "Cómo leer: error y rango bajos son mejores; un porcentaje top 3 alto indica consistencia para ese tamaño de hueco.",
+            + " La métrica conserva su escala; rango y top 3 comparan dentro de cada estación-hueco.\n"
+            + (
+                "Cómo leer: R² alto, rango bajo y top 3 alto indican mejor rendimiento y consistencia."
+                if higher_is_better
+                else "Cómo leer: error y rango bajos son mejores; un porcentaje top 3 alto indica consistencia."
+            ),
             ha="center",
             va="top",
             fontsize=8.5,
@@ -1466,7 +1523,9 @@ def _save_overall_model_performance_plots(
         if metric_frame.empty:
             continue
         metric_frame = metric_frame.sort_values(
-            ["Mean_Rank", "Mean", "Modelo"], kind="stable"
+            ["Mean_Rank", "Mean", "Modelo"],
+            ascending=[True, not metric_higher_is_better(metric), True],
+            kind="stable",
         ).reset_index(drop=True)
         model_order = metric_frame["Modelo"].astype(str).tolist()
         positions = np.arange(len(model_order))
@@ -1501,7 +1560,9 @@ def _save_overall_model_performance_plots(
             fontweight="bold",
         )
         axes[0].set_xlabel(
-            "Error medio (menor es mejor)"
+            "Valor medio (mayor es mejor)"
+            if metric_higher_is_better(metric)
+            else "Error medio (menor es mejor)"
         )
         axes[0].set_ylabel("Modelo")
         if metric in {"MASE", "RMSSE"}:
@@ -1582,8 +1643,12 @@ def _save_overall_model_performance_plots(
             0.5,
             0.953,
             _summary_support_text(metric_frame)
-            + " Las barras resumen error medio, rango medio y frecuencia ganador / top 3.\n"
-            "Cómo leer: barras cortas son mejores en los dos primeros paneles; barras largas son mejores en consistencia.",
+            + " Las barras resumen la métrica media, el rango y la frecuencia ganador / top 3.\n"
+            + (
+                "Cómo leer: R² alto, rango bajo y consistencia alta son mejores."
+                if metric_higher_is_better(metric)
+                else "Cómo leer: error y rango bajos, y consistencia alta, son mejores."
+            ),
             ha="center",
             va="top",
             fontsize=8.5,
@@ -1616,7 +1681,7 @@ def _save_metric_gap_plot(
         return None
 
     metrics = [
-        m for m in ("MAE", "RMSE", "MASE", "RMSSE") if m in results_mc_df.columns
+        m for m in ("MAE", "RMSE", "MASE", "RMSSE", "R2") if m in results_mc_df.columns
     ]
     if not metrics:
         return None
@@ -1633,7 +1698,7 @@ def _save_metric_gap_plot(
     model_order = (
         agg_df.groupby("Modelo")[f"{order_metric}_Mean"]
         .mean()
-        .sort_values()
+        .sort_values(ascending=not metric_higher_is_better(order_metric))
         .index.astype(str)
         .tolist()
     )
@@ -1658,7 +1723,9 @@ def _save_metric_gap_plot(
         if len(finite) == 0:
             ax.set_visible(False)
             continue
-        cmap = plt.get_cmap("YlOrRd").copy()
+        cmap = plt.get_cmap(
+            "YlGnBu" if metric_higher_is_better(metric) else "YlOrRd"
+        ).copy()
         cmap.set_bad("#ded8cf")
         image = ax.imshow(
             np.ma.masked_invalid(values),
@@ -1719,7 +1786,7 @@ def _save_metric_gap_plot(
         0.948,
         "Cada celda promedia primero las semillas dentro de cada estación y después las estaciones por igual. "
         "* indica soporte incompleto.\n"
-        "Cómo leer: menor valor y color más claro indican menos error; compare modelos dentro de una misma métrica y hueco.",
+        "Cómo leer: MAE/RMSE/MASE/RMSSE menores son mejores; R² mayor es mejor. Compare dentro de una misma métrica y hueco.",
         ha="center",
         va="top",
         fontsize=8.5,
@@ -1754,7 +1821,7 @@ def _save_montecarlo_diagnostic_plots(
     }
     metrics = [
         metric
-        for metric in ("MAE", "RMSE", "MASE", "RMSSE")
+        for metric in ("MAE", "RMSE", "MASE", "RMSSE", "R2")
         if metric in results_mc_df.columns
     ]
     if not metrics or results_mc_df.empty:
@@ -1777,13 +1844,16 @@ def _save_montecarlo_diagnostic_plots(
     global_rank_summary, global_rank_frequencies = _global_rank_frequency_tables(
         results_mc_df, metrics
     )
+    error_metrics = [
+        metric for metric in metrics if not metric_higher_is_better(metric)
+    ]
     performance_profiles = _global_performance_profile_table(
-        results_mc_df, metrics
+        results_mc_df, error_metrics
     )
     station_errors = _global_station_error_table(results_mc_df, metrics)
     pairwise_rates = _pairwise_win_rate_table(results_mc_df, metrics)
-    gap_degradation = _gap_degradation_table(results_mc_df, metrics)
-    tail_risk = _tail_risk_table(results_mc_df, metrics)
+    gap_degradation = _gap_degradation_table(results_mc_df, error_metrics)
+    tail_risk = _tail_risk_table(results_mc_df, error_metrics)
     error_correlations = _error_correlation_table(results_mc_df, metrics)
     global_rank_summary.to_csv(
         output_dir / "global_rank_summary.csv", index=False
@@ -1840,13 +1910,13 @@ def _save_montecarlo_diagnostic_plots(
         "gap_degradation_plot_paths": _save_gap_degradation_plots(
             gap_degradation,
             overall_performance,
-            metrics,
+            error_metrics,
             output_dir=output_dir,
             scaled_errors=scaled_errors,
         ),
         "tail_risk_plot_paths": _save_tail_risk_plots(
             tail_risk,
-            metrics,
+            error_metrics,
             output_dir=output_dir,
             scaled_errors=scaled_errors,
         ),

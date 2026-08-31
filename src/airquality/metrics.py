@@ -11,6 +11,11 @@ from darts.metrics import mase as darts_mase
 from darts.metrics import rmsse as darts_rmsse
 
 
+def metric_higher_is_better(metric: str) -> bool:
+    """Return whether larger values indicate better benchmark performance."""
+    return str(metric).upper() == "R2"
+
+
 def compute_mase(
     actual: pd.Series | TimeSeries,
     pred: pd.Series | TimeSeries,
@@ -120,4 +125,4 @@ def compute_rmsse(
         return float("nan")
 
 
-__all__ = ["compute_mase", "compute_rmsse"]
+__all__ = ["compute_mase", "compute_rmsse", "metric_higher_is_better"]

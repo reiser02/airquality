@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 from darts import TimeSeries
 
 from airquality.imputation.benchmark import (
+    _build_metric_row,
     _compute_metrics_on_mask,
     _gap_windows_to_mask_index,
     _generate_block_gaps,
@@ -298,20 +300,66 @@ def test_compute_metrics_on_mask_computes_selected_metrics() -> None:
     out = _compute_metrics_on_mask(
         y_true=y_true,
         y_pred=y_pred,
-        metrics=("mae", "rmse"),
+        metrics=("mae", "rmse", "r2"),
     )
 
     assert out["MAE"] == pytest.approx(2 / 3)
     assert out["RMSE"] == pytest.approx(((1.0**2 + 0.0 + 1.0**2) / 3) ** 0.5)
+    assert out["R2"] == pytest.approx(0.75)
 
     scaled = _compute_metrics_on_mask(
         y_true=y_true,
         y_pred=y_pred,
-        metrics=("mae", "rmse"),
+        metrics=("mae", "rmse", "r2"),
         scale_std=2.0,
     )
     assert scaled["MAE"] == pytest.approx(out["MAE"] / 2.0)
     assert scaled["RMSE"] == pytest.approx(out["RMSE"] / 2.0)
+    assert scaled["R2"] == pytest.approx(out["R2"])
+
+
+def test_compute_r2_on_mask_requires_variable_target() -> None:
+    idx = pd.date_range("2024-01-01", periods=2, freq="h")
+
+    constant = _compute_metrics_on_mask(
+        y_true=pd.Series([3.0, 3.0], index=idx),
+        y_pred=pd.Series([3.0, 2.0], index=idx),
+        metrics=("r2",),
+    )
+    single = _compute_metrics_on_mask(
+        y_true=pd.Series([3.0], index=idx[:1]),
+        y_pred=pd.Series([3.0], index=idx[:1]),
+        metrics=("r2",),
+    )
+
+    assert np.isnan(constant["R2"])
+    assert np.isnan(single["R2"])
+
+
+def test_r2_only_does_not_use_metric_scaler() -> None:
+    class BrokenScaler:
+        def transform(self, _):
+            raise AssertionError("R2 must not use the scaler")
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="h")
+    actual = pd.Series([1.0, 2.0, 3.0], index=idx, name="S")
+
+    row = _build_metric_row(
+        model_name="M",
+        series_name="S",
+        gap_size=3,
+        pred_mask=actual.copy(),
+        ts_test_unscaled=actual,
+        all_series_map={"S": actual},
+        gap_windows=[idx],
+        metric_list=("r2",),
+        seasonality_m=1,
+        freq="h",
+        metric_scaler=BrokenScaler(),
+    )
+
+    assert row["R2"] == pytest.approx(1.0)
+    assert np.isnan(row["Scale_Std"])
 
 
 def test_compute_metrics_on_mask_rejects_unknown_metric() -> None:
@@ -356,7 +404,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         gap_sizes=(2,),
         num_gaps=1,
         gap_spec_by_series={"S": [(gap_start, 2)]},
-        metrics=("mae", "rmse", "mase", "rmsse"),
+        metrics=("mae", "rmse", "mase", "rmsse", "r2"),
         seasonality_m=1,
         freq="h",
         random_seed=123,
@@ -383,6 +431,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         "RMSE",
         "MASE",
         "RMSSE",
+        "R2",
     ]
     assert results_df.loc[0, "Modelo"] == "Stub"
     assert results_df.loc[0, "Serie"] == "S"
@@ -392,6 +441,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     assert results_df.loc[0, "RMSE"] == pytest.approx(((20.0**2 + 10.0**2) / 2) ** 0.5)
     assert results_df.loc[0, "MASE"] == pytest.approx(1.5)
     assert results_df.loc[0, "RMSSE"] == pytest.approx(10**0.5 / 2)
+    assert results_df.loc[0, "R2"] == pytest.approx(-9.0)
     assert results_df.loc[0, "N_Gaps_Target"] == 1
     assert results_df.loc[0, "N_Gaps_Scored"] == 1
     assert results_df.loc[0, "N_Target_Points"] == 2
@@ -461,7 +511,7 @@ def test_scaled_metrics_per_gap_advancing_context_and_weighted_average() -> None
         gap_sizes=(5,),
         num_gaps=2,
         gap_spec_by_series={"S": gap_spec},
-        metrics=("mae", "rmse", "mase", "rmsse"),
+        metrics=("mae", "rmse", "mase", "rmsse", "r2"),
         seasonality_m=5,
         freq="h",
         random_seed=123,
@@ -472,3 +522,4 @@ def test_scaled_metrics_per_gap_advancing_context_and_weighted_average() -> None
     assert results_df.loc[0, "RMSE"] == pytest.approx(16.73320053068151)
     assert results_df.loc[0, "MASE"] == pytest.approx(0.4)
     assert results_df.loc[0, "RMSSE"] == pytest.approx(0.4)
+    assert results_df.loc[0, "R2"] == pytest.approx(1.0 - 1400.0 / 2680.0)
