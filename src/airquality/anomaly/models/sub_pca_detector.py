@@ -98,6 +98,9 @@ def _zscore_columns(windows: np.ndarray) -> np.ndarray:
 class SubPCADetector(BaseTimeSeriesAnomalyDetector):
     """Sub_PCA matching TSB-AD's PyOD-derived implementation.
 
+    The default window is 8 points. Pass ``window_size=None`` explicitly to
+    select a window from the series' autocorrelation instead.
+
     Sliding windows are normalized as a matrix, constant columns are pruned,
     PCA is fitted on the resulting subsequences, and scores are the weighted
     distances to the selected low-variance component vectors.
@@ -106,7 +109,7 @@ class SubPCADetector(BaseTimeSeriesAnomalyDetector):
     def __init__(
         self,
         *args: Any,
-        window_size: int | None = None,
+        window_size: int | None = 8,
         periodicity: int = 1,
         fallback_window: int = 125,
         n_components: int | float | str | None = None,
