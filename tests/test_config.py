@@ -50,6 +50,7 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.get("synthetic", "injection_variant") == "combined"
     assert not cfg.has_option("data", "base_path_glob")
     assert cfg.getint("anomaly", "min_series_points") == 8
+    assert cfg.get("anomaly", "sub_pca_components") == "all"
     assert not cfg.has_option("anomaly", "raw_base_dir")
     assert cfg.get("forecasting", "imputation_model") == "TSPulse"
     assert cfg.getint("forecasting", "max_imputation_gap") == 5

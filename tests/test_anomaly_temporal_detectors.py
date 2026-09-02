@@ -22,9 +22,12 @@ def test_sub_pca_resolves_the_dominant_period() -> None:
     model = SubPCADetector(device="cpu")
     model.fit(values)
 
-    assert model.window_size == 24
+    assert model.window_size == 8
     assert model.training_summary_["periodicity"] == 1
     assert model.score(values).shape == values.shape
+
+    adaptive_model = SubPCADetector(device="cpu", window_size=None).fit(values)
+    assert adaptive_model.window_size == 24
 
 
 def test_sub_pca_uses_tsb_ad_padding_and_prunes_constant_columns() -> None:
