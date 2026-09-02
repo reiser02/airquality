@@ -492,6 +492,7 @@ def backtest_forecast(
     result = {
         "model": model_name,
         "model_mode": model_config.mode,
+        "failure_reason": "not_completed",
         "_rmse": float("nan"),
         "_mae": float("nan"),
         "mase": float("nan"),
@@ -529,6 +530,7 @@ def backtest_forecast(
     )
     if split is None:
         logging.warning("[%s] sin bloque entrenable (min_len=%d)", model_name, min_len)
+        result["failure_reason"] = "no_trainable_block"
         return result
     train_subs, val_subs = split
     if model_config.mode != "trained":
@@ -570,14 +572,20 @@ def backtest_forecast(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         fit_start = time.perf_counter()
-        model = _fit_forecast_model(
-            model_config,
-            train_scaled,
-            val_scaled,
-            size_k=size_k,
-            cleanup_checkpoints=cleanup_checkpoints,
-        )
-        result["train_seconds"] = time.perf_counter() - fit_start
+        try:
+            model = _fit_forecast_model(
+                model_config,
+                train_scaled,
+                val_scaled,
+                size_k=size_k,
+                cleanup_checkpoints=cleanup_checkpoints,
+            )
+            result["train_seconds"] = time.perf_counter() - fit_start
+        except Exception as exc:  # pragma: no cover - model/series specific
+            result["train_seconds"] = time.perf_counter() - fit_start
+            result["failure_reason"] = f"fit_error:{type(exc).__name__}"
+            logging.warning("[%s] fit fallo: %s", model_name, exc)
+            return result
         try:
             inference_start = time.perf_counter()
             forecasts = model.historical_forecasts(
@@ -591,10 +599,12 @@ def backtest_forecast(
             )
             result["inference_seconds"] = time.perf_counter() - inference_start
         except Exception as exc:  # pragma: no cover - model/series specific
+            result["failure_reason"] = f"forecast_error:{type(exc).__name__}"
             logging.warning("[%s] historical_forecasts fallo: %s", model_name, exc)
             return result
 
     if not forecasts:
+        result["failure_reason"] = "no_forecasts"
         return result
     forecast_list = forecasts if isinstance(forecasts, list) else [forecasts]
     actual_starts = pd.DatetimeIndex(forecast.start_time() for forecast in forecast_list)
@@ -609,12 +619,20 @@ def backtest_forecast(
             for forecast, position in zip(forecast_list, expected_positions, strict=True)
         )
     if not exact_windows:
+        result["failure_reason"] = "unexpected_forecast_windows"
         logging.warning(
             "[%s] Darts devolvio ventanas distintas al plan explicito de test",
             model_name,
         )
         return result
     predictions = [scaler.inverse_transform(forecast) for forecast in forecast_list]
+    if any(
+        not np.isfinite(prediction.to_series().to_numpy(dtype=float)).all()
+        for prediction in predictions
+    ):
+        result["failure_reason"] = "nonfinite_prediction"
+        logging.warning("[%s] devolvio predicciones no finitas", model_name)
+        return result
 
     actual_values: list[np.ndarray] = []
     predicted_values: list[np.ndarray] = []
@@ -629,6 +647,9 @@ def backtest_forecast(
             continue
         actual_array = actual.to_series().to_numpy(dtype=float)
         predicted_array = pred.to_series().to_numpy(dtype=float)
+        if not np.isfinite(actual_array).all():
+            result["failure_reason"] = "nonfinite_actual"
+            return result
         insample = reference_s.loc[reference_s.index < actual.start_time()]
         actual_values.append(actual_array)
         predicted_values.append(predicted_array)
@@ -652,6 +673,7 @@ def backtest_forecast(
         target_times.update(pd.DatetimeIndex(actual.time_index))
 
     if not actual_values:
+        result["failure_reason"] = "no_actual_values"
         return result
 
     actual_array = np.concatenate(actual_values)
@@ -661,24 +683,32 @@ def backtest_forecast(
         predicted_array,
     )
     finite_mase = np.isfinite(origin_mase)
-    if np.any(finite_mase):
+    if np.all(finite_mase):
         result["mase"] = float(
             np.average(
-                np.asarray(origin_mase)[finite_mase],
-                weights=np.asarray(origin_lengths)[finite_mase],
+                np.asarray(origin_mase),
+                weights=np.asarray(origin_lengths),
             )
         )
     finite_rmsse = np.isfinite(origin_rmsse)
-    if np.any(finite_rmsse):
+    if np.all(finite_rmsse):
         result["rmsse"] = float(
             np.average(
-                np.asarray(origin_rmsse)[finite_rmsse],
-                weights=np.asarray(origin_lengths)[finite_rmsse],
+                np.asarray(origin_rmsse),
+                weights=np.asarray(origin_lengths),
             )
         )
     result["n_test_predictions"] = int(len(actual_array))
     result["n_forecasts"] = len(actual_values)
     result["n_unique_targets"] = len(target_times)
+    result["failure_reason"] = (
+        ""
+        if all(
+            np.isfinite(result[metric])
+            for metric in ("_mae", "_rmse", "mase", "rmsse")
+        )
+        else "nonfinite_metrics"
+    )
     return result
 
 

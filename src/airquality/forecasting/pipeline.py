@@ -52,10 +52,11 @@ import gc
 import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import json
 import math
 from pathlib import Path
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import pandas as pd
 
@@ -138,6 +139,7 @@ RAW_FROZEN_ARM = "raw+frozen"
 RAW_SOURCE_ARMS = (RAW_ARM, RAW_FROZEN_ARM)
 DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote")
 IMPUTATION_CHOICES = ("both", "impute", "none")
+BACKTEST_MAX_ATTEMPTS = 2
 #: Public forecasting metrics. ``mase`` and ``rmsse`` use the primary raw
 #: history available before each origin; the relative metrics compare each arm
 #: with its matching ``raw`` result for the same series and model.
@@ -156,7 +158,7 @@ RESULT_COLUMNS = (
     "test_target_hours", "model",
     "model_mode", "rmsse", "mase", "relmae", "relrmse", "train_seconds",
     "inference_seconds", "n_test_predictions", "n_forecasts",
-    "n_expected_forecasts", "n_unique_targets",
+    "n_expected_forecasts", "n_unique_targets", "status", "failure_reason",
 )
 
 SELECTION_COLUMNS = (
@@ -313,21 +315,25 @@ def _run_gpu_backtest(task: _BacktestTask) -> dict[str, Any]:
         _FORECAST_WORKER_GPU,
     )
     try:
-        result = backtest_forecast(
-            task.train_series,
-            task.test_series,
-            task.model_name,
-            size_k=task.size_k,
-            test_target_start=task.test_target_start,
-            seasonality_m=task.seasonality_m,
-            freq=task.freq,
-            reference_insample=task.reference_insample,
-            validation_len=task.validation_len,
-            validation_stride=task.validation_stride,
-            forecast_stride=task.forecast_stride,
-            context_len=task.context_len,
-            cleanup_checkpoints=True,
-            model_config=model_config,
+        result = _run_backtest_with_retries(
+            lambda: backtest_forecast(
+                task.train_series,
+                task.test_series,
+                task.model_name,
+                size_k=task.size_k,
+                test_target_start=task.test_target_start,
+                seasonality_m=task.seasonality_m,
+                freq=task.freq,
+                reference_insample=task.reference_insample,
+                validation_len=task.validation_len,
+                validation_stride=task.validation_stride,
+                forecast_stride=task.forecast_stride,
+                context_len=task.context_len,
+                cleanup_checkpoints=True,
+                model_config=model_config,
+            ),
+            label=f"{task.series_name}/{task.arm_name}/{task.model_name}",
+            before_retry=_release_cuda_memory,
         )
     except Exception:
         PROGRESS_LOGGER.exception(
@@ -566,6 +572,50 @@ def _cacheable_backtest(result: dict[str, Any]) -> bool:
             for metric in ("_mae", "_rmse", "mase", "rmsse")
         )
     )
+
+
+def _run_backtest_with_retries(
+    run: Callable[[], dict[str, Any]],
+    *,
+    label: str,
+    before_retry: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Retry one incomplete backtest immediately before reporting failure."""
+    for attempt in range(1, BACKTEST_MAX_ATTEMPTS + 1):
+        try:
+            result = run()
+        except Exception as exc:  # model/runtime failure; retry under the same contract
+            PROGRESS_LOGGER.exception(
+                "[backtest][%s] attempt=%d/%d failed",
+                label,
+                attempt,
+                BACKTEST_MAX_ATTEMPTS,
+            )
+            result = {
+                "_mae": float("nan"),
+                "_rmse": float("nan"),
+                "mase": float("nan"),
+                "rmsse": float("nan"),
+                "train_seconds": float("nan"),
+                "inference_seconds": float("nan"),
+                "n_test_predictions": 0,
+                "n_forecasts": 0,
+                "n_expected_forecasts": 0,
+                "n_unique_targets": 0,
+                "failure_reason": f"backtest_error:{type(exc).__name__}",
+            }
+        if _cacheable_backtest(result) or attempt == BACKTEST_MAX_ATTEMPTS:
+            return result
+        PROGRESS_LOGGER.warning(
+            "[backtest][%s] incomplete reason=%s retry=%d/%d",
+            label,
+            result.get("failure_reason", "unknown"),
+            attempt + 1,
+            BACKTEST_MAX_ATTEMPTS,
+        )
+        if before_retry is not None:
+            before_retry()
+    raise AssertionError("unreachable")
 
 
 def _cacheable_foundation_test(result: dict[str, Any], horizon: int) -> bool:
@@ -1166,6 +1216,7 @@ def _run_benchmark_from_config(
             wall_seconds: float,
         ) -> None:
             nonlocal backtest_completed
+            complete = _cacheable_backtest(result)
             series_backtest_rows[ordinal] = {
                 **common,
                 "model": model_name,
@@ -1181,9 +1232,13 @@ def _run_benchmark_from_config(
                 "n_forecasts": result.get("n_forecasts", 0),
                 "n_expected_forecasts": result.get("n_expected_forecasts", 0),
                 "n_unique_targets": result.get("n_unique_targets", 0),
+                "status": "ok" if complete else "failed",
+                "failure_reason": (
+                    "" if complete else result.get("failure_reason", "incomplete_backtest")
+                ),
             }
             backtest_completed += 1
-            status = "ok" if _cacheable_backtest(result) else "incomplete"
+            status = "ok" if complete else "incomplete"
             PROGRESS_LOGGER.info(
                 "[backtest task=%d/%d completed=%d/%d][%s][%s][%s] "
                 "done cache=%s status=%s train=%.1fs inference=%.1fs wall=%.1fs",
@@ -1355,23 +1410,26 @@ def _run_benchmark_from_config(
                         model_name,
                         cache_state,
                     )
-                    res = backtest_forecast(
-                        arm_train,
-                        arm_test_series,
-                        model_name,
-                        size_k=horizon,
-                        test_target_start=test_target_start,
-                        seasonality_m=seasonality_m,
-                        freq=freq,
-                        validation_len=validation_len,
-                        validation_stride=stride,
-                        forecast_stride=stride,
-                        context_len=context_len,
-                        cleanup_checkpoints=True,
-                        model_config=forecast_model_config,
-                        # Every arm uses the primary raw history available
-                        # before each origin for its seasonal-naive scales.
-                        reference_insample=raw_reference,
+                    res = _run_backtest_with_retries(
+                        lambda: backtest_forecast(
+                            arm_train,
+                            arm_test_series,
+                            model_name,
+                            size_k=horizon,
+                            test_target_start=test_target_start,
+                            seasonality_m=seasonality_m,
+                            freq=freq,
+                            validation_len=validation_len,
+                            validation_stride=stride,
+                            forecast_stride=stride,
+                            context_len=context_len,
+                            cleanup_checkpoints=True,
+                            model_config=forecast_model_config,
+                            # Every arm uses the primary raw history available
+                            # before each origin for its seasonal-naive scales.
+                            reference_insample=raw_reference,
+                        ),
+                        label=f"{name}/{arm.name}/{model_name}",
                     )
                     if _cacheable_backtest(res):
                         cache.put("backtest", backtest_key, res)
@@ -1807,6 +1865,55 @@ def _run_benchmark_from_config(
     foundation_preprocessing_summary_df = summarize_foundation_preprocessing(
         foundation_preprocessing_df
     )
+    selected_stations = selection_df.loc[
+        selection_df["selected"].eq(True), "series"
+    ].astype(str).tolist()
+    expected_result_rows = len(selected_stations) * backtests_per_station
+    failures = results_df.loc[
+        results_df["status"].ne("ok"),
+        ["series", "arm", "model", "failure_reason"],
+    ].to_dict("records")
+    manifest = {
+        "schema_version": 1,
+        "status": (
+            "complete"
+            if not failures and len(results_df) == expected_result_rows
+            else "incomplete"
+        ),
+        "protocol": {
+            "frequency": freq,
+            "horizon": horizon,
+            "forecast_stride": stride,
+            "validation_len": validation_len,
+            "validation_stride": stride,
+            "holdout": holdout,
+            "context_len": context_len,
+            "seasonality_m": seasonality_m,
+        },
+        "config": {
+            **cache_config,
+            "imputation": imputation,
+            "imputation_model": imputation_model,
+            "max_imputation_gap": max_imputation_gap,
+            "mask_transforms": transform_names,
+        },
+        "models": [
+            {
+                "name": name,
+                "mode": config.mode,
+                "uses_training_arms": config.uses_training_arms,
+                "identity": effective_config(forecast_model_cache_identity(config)),
+            }
+            for name, config in forecast_model_configs.items()
+        ],
+        "arms": [asdict(arm) for arm in arms],
+        "loaded_stations": list(primary_series_by_name),
+        "selected_stations": selected_stations,
+        "expected_result_rows": expected_result_rows,
+        "result_rows": len(results_df),
+        "backtest_max_attempts": BACKTEST_MAX_ATTEMPTS,
+        "failures": failures,
+    }
 
     results_df.to_csv(output_dir / "results.csv", index=False)
     summary_df.to_csv(output_dir / "summary.csv", index=False)
@@ -1818,6 +1925,11 @@ def _run_benchmark_from_config(
     )
     foundation_preprocessing_summary_df.to_csv(
         output_dir / "foundation_preprocessing_summary.csv", index=False
+    )
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, default=str, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
     )
 
     PROGRESS_LOGGER.info(
@@ -1841,6 +1953,7 @@ def _run_benchmark_from_config(
         "excluded_df": excluded_df,
         "foundation_preprocessing_df": foundation_preprocessing_df,
         "foundation_preprocessing_summary_df": foundation_preprocessing_summary_df,
+        "manifest": manifest,
     }
 
 
