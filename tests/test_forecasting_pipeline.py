@@ -341,6 +341,49 @@ def test_backtest_forecast_returns_finite_metrics():
     assert res["n_test_predictions"] > res["n_unique_targets"]
 
 
+def test_backtest_forecast_rejects_nonfinite_predictions(monkeypatch):
+    series = _seasonal_series(n=600, seed=21)
+    window = select_holdout_window(
+        series,
+        holdout=40,
+        context_len=72,
+        train_min_len=77,
+        validation_len=48,
+    )
+
+    class NonfiniteModel:
+        def historical_forecasts(
+            self, *, series, start, forecast_horizon, stride, **_kwargs
+        ):
+            start_pos = int(series.time_index.get_loc(start))
+            return [
+                TimeSeries.from_times_and_values(
+                    series.time_index[position : position + forecast_horizon],
+                    np.full(forecast_horizon, np.nan),
+                )
+                for position in range(
+                    start_pos, len(series) - forecast_horizon + 1, stride
+                )
+            ]
+
+    monkeypatch.setattr(
+        backtest_module,
+        "_fit_forecast_model",
+        lambda *_args, **_kwargs: NonfiniteModel(),
+    )
+    result = backtest_forecast(
+        series.loc[window["train_index"]],
+        series.loc[window["test_index"]],
+        "LinearRegression",
+        size_k=5,
+        test_target_start=window["test_target_start"],
+        forecast_stride=2,
+    )
+
+    assert result["failure_reason"] == "nonfinite_prediction"
+    assert result["n_test_predictions"] == 0
+
+
 def test_train_val_split_keeps_train_before_validation():
     # A long early block followed by a shorter (still trainable) recent block:
     # the split must host validation in the RECENT block, never the long early
@@ -469,6 +512,46 @@ def test_backtest_scaled_metrics_use_raw_history_before_each_origin(monkeypatch)
     )
 
 
+def test_backtest_scaled_metrics_require_every_origin(monkeypatch):
+    series = _seasonal_series(n=600, seed=13)
+    window = select_holdout_window(
+        series,
+        holdout=40,
+        context_len=72,
+        train_min_len=77,
+        validation_len=48,
+    )
+    train = series.loc[window["train_index"]]
+    test_series = series.loc[window["test_index"]]
+
+    def partial_metric():
+        calls = 0
+
+        def metric(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return float("nan") if calls == 1 else 1.0
+
+        return metric
+
+    monkeypatch.setattr(backtest_module, "compute_mase", partial_metric())
+    monkeypatch.setattr(backtest_module, "compute_rmsse", partial_metric())
+
+    result = backtest_forecast(
+        train,
+        test_series,
+        "LinearRegression",
+        size_k=5,
+        test_target_start=window["test_target_start"],
+        seasonality_m=24,
+        forecast_stride=2,
+    )
+
+    assert result["n_forecasts"] > 1
+    assert np.isnan(result["mase"])
+    assert np.isnan(result["rmsse"])
+
+
 def test_darts_error_metrics_pool_overlapping_forecasts():
     from darts.metrics import mae, rmse
     from airquality.forecasting.backtest import _darts_error_metrics
@@ -534,6 +617,41 @@ def test_only_complete_backtests_are_cacheable():
     assert cp._cacheable_backtest(complete)
     assert not cp._cacheable_backtest({**complete, "n_forecasts": 1})
     assert not cp._cacheable_backtest({**complete, "_rmse": float("nan")})
+
+
+def test_incomplete_backtest_is_retried_immediately():
+    complete = {
+        "_mae": 1.0,
+        "_rmse": 1.0,
+        "mase": 1.0,
+        "rmsse": 1.0,
+        "n_test_predictions": 12,
+        "n_forecasts": 1,
+        "n_expected_forecasts": 1,
+    }
+    calls = 0
+    cleanup_calls = 0
+
+    def run():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient")
+        return complete
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    result = cp._run_backtest_with_retries(
+        run,
+        label="station/arm/model",
+        before_retry=cleanup,
+    )
+
+    assert result == complete
+    assert calls == 2
+    assert cleanup_calls == 1
 
 
 def test_relative_metrics_pair_each_arm_with_matching_raw_result():
@@ -635,7 +753,17 @@ def test_gpu_worker_preserves_train_and_inference_timings(monkeypatch):
         seen.update(kwargs)
         return {names[0]: object()}
 
-    expected = {"train_seconds": 1.25, "inference_seconds": 0.5}
+    expected = {
+        "_mae": 1.0,
+        "_rmse": 1.0,
+        "mase": 1.0,
+        "rmsse": 1.0,
+        "train_seconds": 1.25,
+        "inference_seconds": 0.5,
+        "n_test_predictions": 8,
+        "n_forecasts": 1,
+        "n_expected_forecasts": 1,
+    }
     monkeypatch.setattr(cp, "resolve_forecasting_model_configs", fake_configs)
     def fake_backtest(*args, **kwargs):
         seen["reference_insample"] = kwargs["reference_insample"].copy()
@@ -743,6 +871,7 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
             "rmsse": 1.0,
             "n_test_predictions": n_forecasts * horizon,
             "n_forecasts": n_forecasts,
+            "n_expected_forecasts": n_forecasts,
             "n_unique_targets": 96,
         }
 
@@ -914,6 +1043,8 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     assert set(imputed_rows["imputation_model"]) == {"interp"}
     # The public forecasting metric contract contains only scaled and relative metrics.
     assert set(results_df.columns) >= {"rmsse", "mase", "relmae", "relrmse"}
+    assert (results_df["status"] == "ok").all()
+    assert (results_df["failure_reason"] == "").all()
     assert not {
         "mae",
         "rmse",
@@ -948,8 +1079,19 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     ).all()
     assert (subset["n_unique_targets"] == subset["test_target_hours"]).all()
 
-    for artifact in ("results.csv", "summary.csv", "detection.csv", "selection.csv"):
+    for artifact in (
+        "results.csv",
+        "summary.csv",
+        "detection.csv",
+        "selection.csv",
+        "manifest.json",
+    ):
         assert (tmp_path / artifact).exists()
+    assert artifacts["manifest"]["status"] == "complete"
+    assert artifacts["manifest"]["result_rows"] == len(results_df)
+    from airquality.forecasting.statistics import _validate_manifest
+
+    _validate_manifest(results_df, artifacts["manifest"])
     progress_log = artifacts["log_path"].read_text(encoding="utf-8")
     assert "[log-guide] elapsed=wall-clock time" in progress_log
     assert "branch=forecast arm" in progress_log
@@ -1162,7 +1304,7 @@ def test_run_benchmark_closes_gpu_resources_on_failure(monkeypatch):
     assert cp._ACTIVE_DEVICE_QUEUE is None
 
 
-def test_backtest_scaled_metrics_match_darts_denominators():
+def test_backtest_scaled_metrics_let_darts_handle_missing_insample_values():
     from darts import TimeSeries
     from darts.metrics import mae, mase, rmsse
     from airquality.metrics import compute_mase, compute_rmsse
@@ -1184,10 +1326,9 @@ def test_backtest_scaled_metrics_match_darts_denominators():
         pd.Series(actual_vals + rng.normal(0, 0.7, 48), index=hold_idx), freq="h"
     )
 
-    # The wrappers use the interpolated training history and the native Darts
-    # scaled metrics on a contiguous synthetic index.
-    filled = insample.interpolate(method="time", limit_direction="both").ffill().bfill()
-    values = filled.to_numpy(dtype=float)
+    # The wrappers preserve missing history and let Darts ignore undefined
+    # seasonal differences when it computes the native error scale.
+    values = insample.to_numpy(dtype=float)
     insample_ts = TimeSeries.from_times_and_values(pd.RangeIndex(n), values)
     eval_index = pd.RangeIndex(n, n + len(actual_vals))
     actual_ts = TimeSeries.from_times_and_values(eval_index, actual_vals)

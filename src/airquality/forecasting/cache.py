@@ -54,8 +54,9 @@ import pandas as pd
 #: forecasting metrics use MASE/RMSSE plus raw-relative MAE/RMSE. v19: scaled
 #: metrics use the primary raw history available before each forecast origin. v20:
 #: the forecasting benchmark uses one scalar temporal protocol. v21: validation
-#: reserves every native model's target length across all protocol origins.
-CACHE_VERSION = 21
+#: reserves every native model's target length across all protocol origins. v22:
+#: Darts handles missing values in the seasonal-naive scale without interpolation.
+CACHE_VERSION = 22
 
 
 def series_fingerprint(series: pd.Series) -> str:

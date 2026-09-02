@@ -23,7 +23,7 @@ def compute_mase(
     *,
     seasonality_m: int,
 ) -> float:
-    """Compute MASE with Darts after finite-value alignment and gap filling."""
+    """Compute MASE with Darts after finite-value forecast alignment."""
     actual_s = actual.to_series() if isinstance(actual, TimeSeries) else actual
     pred_s = pred.to_series() if isinstance(pred, TimeSeries) else pred
     insample_s = insample.to_series() if isinstance(insample, TimeSeries) else insample
@@ -38,13 +38,8 @@ def compute_mase(
         return float("nan")
 
     insample_s = insample_s.astype(float)
-    if insample_s.isna().any():
-        method = "time" if isinstance(insample_s.index, pd.DatetimeIndex) else "linear"
-        insample_s = (
-            insample_s.interpolate(method=method, limit_direction="both").ffill().bfill()
-        )
     insample_values = insample_s.to_numpy()
-    if len(insample_values) <= seasonality_m or not np.isfinite(insample_values).all():
+    if len(insample_values) <= seasonality_m or np.isinf(insample_values).any():
         return float("nan")
 
     # Darts requires insample to end one step before prediction. Synthetic
@@ -93,13 +88,8 @@ def compute_rmsse(
         return float("nan")
 
     insample_s = insample_s.astype(float)
-    if insample_s.isna().any():
-        method = "time" if isinstance(insample_s.index, pd.DatetimeIndex) else "linear"
-        insample_s = (
-            insample_s.interpolate(method=method, limit_direction="both").ffill().bfill()
-        )
     insample_values = insample_s.to_numpy()
-    if len(insample_values) <= seasonality_m or not np.isfinite(insample_values).all():
+    if len(insample_values) <= seasonality_m or np.isinf(insample_values).any():
         return float("nan")
 
     # Darts requires insample to end immediately before the prediction.
