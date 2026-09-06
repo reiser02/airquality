@@ -24,6 +24,10 @@ from airquality.data.preprocessing import preprocess
 from airquality.data.segments import observed_blocks
 
 
+DEFAULT_POLLUTANTS = ("NO2", "O3")
+POLLUTANT_COLORS = {"CO": SERIES_COLOR, "NO2": "#f28c38", "O3": "#5b8c8a"}
+
+
 def _coverage_summary(series: pd.Series) -> tuple[pd.DataFrame, float]:
     """Return observed blocks and the missing percentage over the station span."""
     blocks = observed_blocks(series)
@@ -163,13 +167,18 @@ def save_combined_station_coverage(
     output_path: str | Path,
     stations_by_pollutant: dict[str, list[tuple[str, pd.DataFrame]]],
 ) -> Path:
-    """Plot CO and NO2 availability as paired bands for each station."""
-    colors = {"CO": SERIES_COLOR, "NO2": "#f28c38"}
+    """Plot pollutant availability as bands for each station."""
+    pollutants = tuple(stations_by_pollutant)
+    if not pollutants:
+        raise ValueError("No hay contaminantes que representar")
+    colors = {pollutant: POLLUTANT_COLORS[pollutant] for pollutant in pollutants}
     station_maps = {
         pollutant: {station: frame for station, frame in stations}
         for pollutant, stations in stations_by_pollutant.items()
     }
-    station_names = sorted(set().union(*(mapping for mapping in station_maps.values())))
+    station_names = sorted(
+        {station for stations in stations_by_pollutant.values() for station, _ in stations}
+    )
     if not station_names:
         raise ValueError("No hay estaciones que representar")
 
@@ -183,9 +192,13 @@ def save_combined_station_coverage(
 
     limits = []
     summaries: dict[tuple[str, str], float] = {}
-    offsets = {"CO": -0.19, "NO2": 0.19}
+    band_height = min(0.3, 0.7 / len(pollutants))
+    offsets = {
+        pollutant: (index - (len(pollutants) - 1) / 2) * 0.7 / len(pollutants)
+        for index, pollutant in enumerate(pollutants)
+    }
     for position, station in enumerate(station_names):
-        for pollutant in ("CO", "NO2"):
+        for pollutant in pollutants:
             frame = station_maps.get(pollutant, {}).get(station)
             if frame is None or frame.empty:
                 continue
@@ -195,7 +208,7 @@ def save_combined_station_coverage(
             limits.extend((series.index.min(), series.index.max()))
             start = mdates.date2num(series.index.min())
             active_hours = (series.index.max() - series.index.min()) / pd.Timedelta(hours=1) + 1
-            band = (position + offsets[pollutant] - 0.15, 0.3)
+            band = (position + offsets[pollutant] - band_height / 2, band_height)
             axis.broken_barh(
                 [(start, active_hours / 24.0)],
                 band,
@@ -226,7 +239,7 @@ def save_combined_station_coverage(
     axis.text(
         1.015,
         1.015,
-        "CO NaN    NO2 NaN",
+        "    ".join(f"{pollutant} NaN" for pollutant in pollutants),
         transform=axis.transAxes,
         ha="left",
         va="bottom",
@@ -236,14 +249,16 @@ def save_combined_station_coverage(
     )
     summary_transform = axis.get_yaxis_transform()
     for position, station in enumerate(station_names):
-        co = summaries.get((station, "CO"))
-        no2 = summaries.get((station, "NO2"))
+        values = [
+            f"{summaries[(station, pollutant)]:6.2f}%"
+            if (station, pollutant) in summaries
+            else "    n/d"
+            for pollutant in pollutants
+        ]
         axis.text(
             1.015,
             position,
-            f"{co:6.2f}%    {no2:6.2f}%"
-            if co is not None and no2 is not None
-            else "    n/d        n/d",
+            "    ".join(values),
             transform=summary_transform,
             ha="left",
             va="center",
@@ -254,19 +269,25 @@ def save_combined_station_coverage(
 
     axis.legend(
         handles=[
-            Patch(facecolor=colors["CO"], edgecolor=EDGE_COLOR, label="CO observado"),
-            Patch(facecolor=colors["NO2"], edgecolor=EDGE_COLOR, label="NO2 observado"),
+            *[
+                Patch(
+                    facecolor=colors[pollutant],
+                    edgecolor=EDGE_COLOR,
+                    label=f"{pollutant} observado",
+                )
+                for pollutant in pollutants
+            ],
             Patch(facecolor=SERIES_GHOST_COLOR, edgecolor=EDGE_COLOR, label="Hora ausente"),
         ],
         loc="lower center",
         bbox_to_anchor=(0.5, -0.09),
-        ncols=3,
+        ncols=min(3, len(pollutants) + 1),
     )
     height = float(figure.get_size_inches()[1])
     figure.text(
         0.06,
         1.0 - 0.08 / height,
-        "Disponibilidad horaria de CO y NO2 por estación",
+        f"Disponibilidad horaria de {', '.join(pollutants)} por estación",
         ha="left",
         va="top",
         fontsize=14,
@@ -300,14 +321,17 @@ def save_comparison_station_coverage(
 ) -> Path:
     """Compare 5-minute coverage with and without frozen-value suppression.
 
-    Each station gets four narrow bands: CO and NO2 after the normal
-    preprocessing suppression, followed by the corresponding 5-minute series
-    with both frozen-value filters disabled. Filled bars show observed hours;
-    the gray backing shows the span covered by each variant, including its
-    internal gaps.
+    Each station gets two narrow bands per pollutant: one after the normal
+    preprocessing suppression and one with both frozen-value filters disabled.
+    Filled bars show observed hours; the gray backing shows the span covered by
+    each variant, including its internal gaps.
     """
-    pollutants = ("CO", "NO2")
-    colors = {"CO": SERIES_COLOR, "NO2": "#f28c38"}
+    pollutants = tuple(
+        dict.fromkeys((*suppressed_by_pollutant, *unsuppressed_by_pollutant))
+    )
+    if not pollutants:
+        raise ValueError("No hay contaminantes que comparar")
+    colors = {pollutant: POLLUTANT_COLORS[pollutant] for pollutant in pollutants}
     sources = {
         "suppressed": suppressed_by_pollutant,
         "unsuppressed": unsuppressed_by_pollutant,
@@ -338,13 +362,19 @@ def save_comparison_station_coverage(
     axis.grid(False, axis="y")
     axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.6)
 
-    band_specs = (
-        ("CO", "suppressed", -0.30, None),
-        ("CO", "unsuppressed", -0.10, "//"),
-        ("NO2", "suppressed", 0.10, None),
-        ("NO2", "unsuppressed", 0.30, "//"),
-    )
-    band_height = 0.16
+    band_height = min(0.16, 0.72 / (2 * len(pollutants)))
+    offset_step = 0.8 / (2 * len(pollutants))
+    band_specs = [
+        (
+            pollutant,
+            source,
+            (2 * index + source_index - (2 * len(pollutants) - 1) / 2)
+            * offset_step,
+            "//" if source == "unsuppressed" else None,
+        )
+        for index, pollutant in enumerate(pollutants)
+        for source_index, source in enumerate(("suppressed", "unsuppressed"))
+    ]
     limits: list[pd.Timestamp] = []
     summaries: dict[tuple[str, str, str], float] = {}
 
@@ -397,7 +427,7 @@ def save_comparison_station_coverage(
     axis.text(
         1.015,
         1.015,
-        "CO sup./sin     NO2 sup./sin",
+        "    ".join(f"{pollutant} sup./sin" for pollutant in pollutants),
         transform=axis.transAxes,
         ha="left",
         va="bottom",
@@ -415,7 +445,10 @@ def save_comparison_station_coverage(
         axis.text(
             1.015,
             position,
-            f"{values[0]} / {values[1]}    {values[2]} / {values[3]}",
+            "    ".join(
+                f"{values[index]} / {values[index + 1]}"
+                for index in range(0, len(values), 2)
+            ),
             transform=summary_transform,
             ha="left",
             va="center",
@@ -426,20 +459,23 @@ def save_comparison_station_coverage(
 
     axis.legend(
         handles=[
-            Patch(facecolor=colors["CO"], edgecolor=EDGE_COLOR, label="CO: con supresión"),
-            Patch(
-                facecolor=colors["CO"],
-                edgecolor=EDGE_COLOR,
-                hatch="//",
-                label="CO: sin supresión",
-            ),
-            Patch(facecolor=colors["NO2"], edgecolor=EDGE_COLOR, label="NO2: con supresión"),
-            Patch(
-                facecolor=colors["NO2"],
-                edgecolor=EDGE_COLOR,
-                hatch="//",
-                label="NO2: sin supresión",
-            ),
+            *[
+                Patch(
+                    facecolor=colors[pollutant],
+                    edgecolor=EDGE_COLOR,
+                    label=f"{pollutant}: con supresión",
+                )
+                for pollutant in pollutants
+            ],
+            *[
+                Patch(
+                    facecolor=colors[pollutant],
+                    edgecolor=EDGE_COLOR,
+                    hatch="//",
+                    label=f"{pollutant}: sin supresión",
+                )
+                for pollutant in pollutants
+            ],
             Patch(
                 facecolor=SERIES_GHOST_COLOR,
                 edgecolor=EDGE_COLOR,
@@ -448,7 +484,7 @@ def save_comparison_station_coverage(
         ],
         loc="lower center",
         bbox_to_anchor=(0.5, -0.09),
-        ncols=3,
+        ncols=min(3, 2 * len(pollutants) + 1),
     )
     height = float(figure.get_size_inches()[1])
     figure.text(
@@ -482,7 +518,7 @@ def save_comparison_station_coverage(
 
 
 def main() -> None:
-    """Preprocess raw NO2 and CO stations and write their coverage figures."""
+    """Preprocess raw pollutant stations and write their coverage figures."""
     root = Path(__file__).resolve().parents[3]
     raw_base_dir = Path(
         cfg_get_str("data", "raw_base_dir", "data/raw/datos_estaciones_5m")
@@ -491,7 +527,7 @@ def main() -> None:
         raw_base_dir = root / raw_base_dir
     stations_by_pollutant = {}
     stations_without_freeze_filters = {}
-    for pollutant in ("NO2", "CO"):
+    for pollutant in DEFAULT_POLLUTANTS:
         raw_stations = [
             item
             for item in load_raw_5m(pollutant, str(raw_base_dir))

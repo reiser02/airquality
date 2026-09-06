@@ -4,7 +4,7 @@ Run with::
 
     uv run python -m airquality.data.block_analysis
 
-The command preprocesses the raw 5-minute NO2/CO files, reserves one complete
+The command preprocesses the raw 5-minute NO2/O3 files, reserves one complete
 observed block for an exact 96-hour test, and audits the configured rolling
 validation requirement. It writes CSV tables plus figures under
 ``reports/data_blocks/<timestamp>/`` without running detectors or models, so its
@@ -31,6 +31,9 @@ from airquality.forecasting.backtest import (
 )
 from airquality.forecasting.registry import resolve_forecasting_model_configs
 from airquality.paths import create_run_dir
+
+
+DEFAULT_POLLUTANTS = ("NO2", "O3")
 
 
 def _requirement_note(table: pd.DataFrame) -> str:
@@ -312,7 +315,7 @@ def run_analysis(
     *,
     base_dir: str | Path,
     output_dir: str | Path,
-    pollutants: tuple[str, ...] = ("NO2", "CO"),
+    pollutants: tuple[str, ...] = DEFAULT_POLLUTANTS,
     context: int = 72,
     horizon: int = 12,
     stride: int = 6,
@@ -402,7 +405,7 @@ def main() -> None:
     )
     parser.add_argument("--base-dir", default="data/raw/datos_estaciones_5m")
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--pollutants", nargs="+", default=["NO2", "CO"])
+    parser.add_argument("--pollutants", nargs="+", default=DEFAULT_POLLUTANTS)
     parser.add_argument(
         "--context", type=int, default=cfg_get_int("forecasting", "context_len", 72)
     )
