@@ -30,6 +30,7 @@ from airquality.data.series import ensure_datetime_series
 DETECTION_LIMITS = {
     "CO": 0.0,
     "NO2": 0.0,
+    "O3": 0.0,
 }
 
 RAW_FREQ = "5min"

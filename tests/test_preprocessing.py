@@ -120,7 +120,7 @@ def test_preprocess_can_keep_frozen_and_repeated_hourly_values() -> None:
 
 
 def test_detection_limits_present() -> None:
-    assert set(DETECTION_LIMITS) == {"CO", "NO2"}
+    assert set(DETECTION_LIMITS) == {"CO", "NO2", "O3"}
 
 
 # --- frozen_mask (ramas extra) ------------------------------------------
@@ -149,9 +149,10 @@ def test_hourly_mean_uses_co_threshold() -> None:
     assert out.iloc[0] == 8.0  # media de 6,8,10
 
 
-def test_hourly_mean_unknown_pollutant_raises_keyerror() -> None:
-    with pytest.raises(KeyError):
-        hourly_mean(_series_5m([10.0] * 12), "O3")
+def test_hourly_mean_supports_o3() -> None:
+    out = hourly_mean(_series_5m([10.0, 20.0, 30.0] + [1.0] * 9), "O3")["NO2"]
+
+    assert out.iloc[0] == 20.0
 
 
 def test_hourly_mean_preserves_regular_hourly_grid() -> None:
