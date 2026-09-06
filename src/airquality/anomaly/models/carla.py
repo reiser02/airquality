@@ -3,7 +3,7 @@
 Self-supervised windowed detector: a ResNet encoder is pretrained contrastively
 against synthetically corrupted windows (native CARLA rules or GenIAS-generated
 anomalies), then a classification head separates normal from anomalous windows;
-the per-window anomaly probability is folded back onto the timeline.
+each per-window anomaly probability is aligned to the window's final timestamp.
 
 This module is adapted from the official CARLA implementation:
 https://github.com/zamanzadeh/CARLA
@@ -28,7 +28,6 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from ..windowing import aggregate_window_scores
 from .common import (
     BaseTimeSeriesAnomalyDetector,
     GenIASWindowGenerator,
@@ -896,30 +895,15 @@ class CARLABase(BaseTimeSeriesAnomalyDetector):
                 probabilities.append(F.softmax(logits, dim=1).cpu().numpy())
         return np.concatenate(probabilities, axis=0)
 
-    def _score_with_head_and_label(self, values: np.ndarray, head_index: int, majority_label: int) -> np.ndarray:
-        """Score with one classification head: ``1 − P(majority class)`` per window."""
-        if self.classification_model is None:
-            raise RuntimeError("Model must be fitted before scoring")
-        windows = rolling_windows_nd(values, self.window_size, stride=1)
-        dataset = torch.from_numpy(windows)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
-        probabilities = []
-        self.classification_model.eval()
-        with torch.inference_mode():
-            for batch in loader:
-                batch = batch.float().to(self.device).transpose(1, 2)
-                logits = self.classification_model(batch)[head_index]
-                probabilities.append(F.softmax(logits, dim=1).cpu().numpy())
-        window_probabilities = np.concatenate(probabilities, axis=0)
-        window_scores = 1.0 - window_probabilities[:, majority_label]
-        return aggregate_window_scores(window_scores, values.shape[0], self.window_size)
-
     def _score_normalized(self, values: np.ndarray) -> np.ndarray:
-        """Score sliding windows with the selected head and fold onto the timeline."""
+        """Align each native window score to the window's final timestamp."""
         windows = rolling_windows_nd(values, self.window_size, stride=1)
         probabilities = self._window_probabilities(windows)
         window_scores = 1.0 - probabilities[:, self.majority_label_]
-        return aggregate_window_scores(window_scores, values.shape[0], self.window_size)
+        prefix = np.full(
+            values.shape[0] - window_scores.shape[0], np.nan, dtype=np.float32
+        )
+        return np.concatenate([prefix, window_scores.astype(np.float32)], axis=0)
 
 
 class CARLAGenIAS(CARLABase):

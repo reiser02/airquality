@@ -34,6 +34,16 @@ class FakeTSPulse(torch.nn.Module):
         }
 
 
+def test_defaults_average_time_and_frequency_scores():
+    detector = TSPulse(device="cpu")
+
+    assert detector.prediction_modes == ("time", "fft")
+    assert detector.aggr_function == "mean"
+    assert detector._aggregate_modes(
+        [np.array([0.0, 1.0]), np.array([1.0, 0.0])]
+    ) == pytest.approx([0.5, 0.5])
+
+
 @pytest.fixture
 def fake_checkpoint(monkeypatch):
     clear_tspulse_model_cache()
@@ -138,3 +148,15 @@ def test_long_series_keeps_original_alignment(fake_checkpoint):
     assert np.isfinite(scores).all()
     assert model.calls
     assert all(past_values.shape[1] == 512 for past_values, _ in model.calls)
+
+
+def test_context_switches_from_padding_to_native_at_512_points(fake_checkpoint):
+    detector = TSPulse(device="cpu").fit(np.arange(512, dtype=np.float32))
+
+    padded = detector._contexts(detector._normalize(np.arange(511, dtype=np.float32)))
+    native = detector._contexts(detector._normalize(np.arange(512, dtype=np.float32)))
+
+    assert np.count_nonzero(padded[1]) == 511
+    assert np.count_nonzero(padded[2] == -1) == 1
+    assert native[1].all()
+    assert np.array_equal(native[2][0], np.arange(512))
