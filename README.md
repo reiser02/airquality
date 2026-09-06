@@ -169,7 +169,7 @@ gaps instead of concatenating observations across missing timestamps.
 uv run python -m airquality.data.block_analysis
 ```
 
-This is the fast pre-study for NO2 and CO. It reserves the fixed test, measures
+This is the fast pre-study for NO2 and O3. It reserves the fixed test, measures
 contiguous observed blocks before it, and reports whether
 each block can support the configured forecasting protocol and validation
 geometry. It does not run anomaly detectors or forecasting models, so the
@@ -195,7 +195,7 @@ uv run python -m airquality.data.block_support_analysis
 
 This is the canonical support report for the configured forecasting protocol.
 It uses `[forecasting] pollutant` by default. Override it with the
-case-insensitive `--pollutant` option, currently `CO` or `NO2`:
+case-insensitive `--pollutant` option, currently `CO`, `NO2`, or `O3`:
 
 ```bash
 uv run python -m airquality.data.block_support_analysis --pollutant CO

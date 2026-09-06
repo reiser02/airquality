@@ -18,7 +18,11 @@ def test_station_coverage_counts_blocks_and_renders(tmp_path) -> None:
     output = save_station_coverage(tmp_path / "coverage.png", [("ST1", frame)])
     combined = save_combined_station_coverage(
         tmp_path / "combined.png",
-        {"NO2": [("ST1", frame)], "CO": [("ST1", frame.rename(columns={"NO2": "CO"}))]},
+        {
+            "NO2": [("ST1", frame)],
+            "CO": [("ST1", frame.rename(columns={"NO2": "CO"}))],
+            "O3": [("ST1", frame.rename(columns={"NO2": "O3"}))],
+        },
     )
 
     assert blocks["hours"].tolist() == [2, 1]
@@ -43,10 +47,12 @@ def test_comparison_station_coverage_renders_suppressed_and_unsuppressed_sources
         {
             "NO2": [("ST1", suppressed)],
             "CO": [("ST1", suppressed.rename(columns={"NO2": "CO"}))],
+            "O3": [("ST1", suppressed.rename(columns={"NO2": "O3"}))],
         },
         {
             "NO2": [("ST1", unsuppressed)],
             "CO": [("ST1", unsuppressed.rename(columns={"NO2": "CO"}))],
+            "O3": [("ST1", unsuppressed.rename(columns={"NO2": "O3"}))],
         },
     )
 
