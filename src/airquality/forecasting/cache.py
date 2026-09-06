@@ -56,7 +56,12 @@ import pandas as pd
 #: the forecasting benchmark uses one scalar temporal protocol. v21: validation
 #: reserves every native model's target length across all protocol origins. v22:
 #: Darts handles missing values in the seasonal-naive scale without interpolation.
-CACHE_VERSION = 22
+#: v23: injected-ranking fallbacks are separated by TSPulse context regime while
+#: selection retains one station-wide injection and detector fit. v24: CARLA
+#: window scores are aligned to window ends instead of averaged over timestamps.
+#: v25: injected-ranking VUS excludes non-finite detector support.
+#: v26: detectors failing every injected selection segment are excluded.
+CACHE_VERSION = 26
 
 
 def series_fingerprint(series: pd.Series) -> str:

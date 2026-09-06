@@ -53,10 +53,8 @@ class TSPulse(BaseTimeSeriesAnomalyDetector):
         window_size: int = 512,
         batch_size: int = 256,
         aggregation_length: int = 64,
-        aggr_function: str = "max",
+        aggr_function: str = "mean",
         smoothing_length: int = 8,
-        least_significant_scale: float = 0.01,
-        least_significant_score: float = 0.1,
         prediction_modes: tuple[str, ...] = (
             AnomalyScoreMethods.TIME_RECONSTRUCTION.value,
             AnomalyScoreMethods.FREQUENCY_RECONSTRUCTION.value,
@@ -93,10 +91,6 @@ class TSPulse(BaseTimeSeriesAnomalyDetector):
         self.aggregation_length = int(aggregation_length)
         self.aggr_function = aggr_function.lower()
         self.smoothing_length = int(smoothing_length)
-        # Retained for constructor compatibility; direct pointwise scoring does
-        # not use the upstream pipeline's threshold-dependent rescaling.
-        self.least_significant_scale = least_significant_scale
-        self.least_significant_score = least_significant_score
         self.prediction_modes = tuple(prediction_modes)
         self.model_: TSPulseForReconstruction | None = None
 

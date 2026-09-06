@@ -16,8 +16,9 @@ anomaly mask, so strategies share detector fits instead of refitting per arm:
   the injection labels, and keep the single best detector's MAD-thresholded
   mask on the real series.
 - ``inject-vote`` (``top_k=3, min_votes=2`` by default): rank long blocks
-  locally (short blocks inherit the station mean), backfill non-finite scores
-  point by point, and flag points where the configured quorum agrees.
+  locally (short blocks inherit the finite mean from their TSPulse context
+  regime), backfill non-finite scores point by point, and flag points where the
+  configured quorum agrees.
 
 The injected copies are used ONLY to select detectors; the final mask always
 comes from scores on the real (uninjected) series.
@@ -37,19 +38,23 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 import numpy as np
 import pandas as pd
 
-from airquality.anomaly._vendor.vus_volume import vus_roc_pr
 from airquality.anomaly.anomalies import (
     DEFAULT_INJECTION_VARIANT,
     INJECTION_POLICY_VERSION,
     inject_synthetic_anomaly_segments,
     normalize_injection_variant,
 )
-from airquality.anomaly.ensemble import rank_top_k, ranked_pointwise_vote
+from airquality.anomaly.ensemble import (
+    rank_top_k,
+    ranked_pointwise_vote,
+    ranking_source_indices,
+    uses_native_context,
+)
 from airquality.anomaly.metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
+    compute_segmented_metrics,
     detect_mask,
-    normalize_scores,
     vus_sliding_window,
 )
 from airquality.anomaly.registry import (
@@ -76,7 +81,7 @@ MIN_SEGMENT_POINTS = 8
 #: ``synthetic`` mode; the seed is independent of the detector seed so the
 #: injected shapes do not covary with the models' own randomness. Only
 #: segments with at least ``DEFAULT_MIN_SELECTION_POINTS`` points establish the
-#: local ranking; short segments inherit the station-level result.
+#: local ranking; short segments inherit their TSPulse context-regime mean.
 DEFAULT_INJECTION_SEED = 101
 DEFAULT_MIN_SELECTION_POINTS = 300
 
@@ -192,18 +197,19 @@ def _detector_rate(segment_scores: list[np.ndarray | None], threshold_k: float) 
 
 
 def _selection_vus_pr(labels: np.ndarray, scores: np.ndarray) -> float:
-    """VUS-PR of ``scores`` against injection ``labels`` (0.0 with no positives).
+    """VUS-PR against injection labels over contiguous finite-score support.
 
     Same convention as :func:`airquality.anomaly.metrics.compute_metrics`:
-    min-max normalized scores and the label-derived sliding window, so the
-    values are comparable across detectors.
+    non-finite scores are abstentions, finite components remain temporally
+    separate, and normalization uses only finite scores.
     """
     flat = np.asarray(labels, dtype=np.int64).ravel()
-    if flat.size == 0 or int(flat.sum()) == 0:
-        return 0.0
-    normalized = normalize_scores(np.asarray(scores, dtype=np.float64))
-    _, vus_pr = vus_roc_pr(flat, normalized, vus_sliding_window(flat))
-    return float(vus_pr)
+    result = compute_segmented_metrics(
+        [flat],
+        [np.asarray(scores, dtype=np.float64)],
+        vus_sliding_window(flat),
+    )
+    return float(result["metrics"]["vus_pr"])
 
 
 class SeriesDetectionContext:
@@ -217,8 +223,8 @@ class SeriesDetectionContext:
     - :meth:`selection_ranking`: every detector's mean VUS-PR against synthetic
       anomalies injected into the (sufficiently long) segments — the label-based
       selection signal the injection strategies use, with no real labels needed.
-      A detector that cannot score an injected segment is evaluated as detecting
-      no anomalies there, rather than having that segment omitted from its rank.
+      Undefined local ranks inherit a finite same-regime fallback when available;
+      detectors that cannot score any selection segment are omitted.
     """
 
     def __init__(
@@ -337,23 +343,16 @@ class SeriesDetectionContext:
 
     def selection_segment_indices(self) -> list[int]:
         """Long segments ranked locally, or the longest segment as fallback."""
-        eligible = [
-            index
-            for index, segment in enumerate(self.segments)
-            if len(segment) >= self.min_selection_points
-        ]
-        if eligible:
-            return eligible
-        if not self.segments:
-            return []
-        return [max(range(len(self.segments)), key=lambda index: len(self.segments[index]))]
+        return ranking_source_indices(
+            [len(segment) for segment in self.segments], self.min_selection_points
+        )
 
     def selection_segments(self) -> list[pd.Series]:
-        """Segments used to establish local and station fallback rankings."""
+        """Segments used to establish local and context-regime fallback rankings."""
         return [self.segments[index] for index in self.selection_segment_indices()]
 
     def selection_rankings(self) -> list[dict[str, float]]:
-        """Ranking per real segment, with short segments inheriting the station mean."""
+        """Ranking per segment, with short ones inheriting their context-regime mean."""
         if self._segment_rankings is not None:
             return self._segment_rankings
 
@@ -364,18 +363,18 @@ class SeriesDetectionContext:
             return self._segment_rankings
 
         selected_segments = [self.segments[index] for index in selected_indices]
-        injected_pairs = []
         injected = inject_synthetic_anomaly_segments(
             [segment.to_numpy(dtype=np.float32) for segment in selected_segments],
             self.injection_variant,
             self.injection_seed,
         )
-        for segment, (injected_values, labels) in zip(
-            selected_segments, injected, strict=True
-        ):
-            injected_pairs.append(
-                (injected_values, labels, pd.DatetimeIndex(segment.index))
+        injected_pairs = [
+            (
+                *pair,
+                pd.DatetimeIndex(segment.index),
             )
+            for segment, pair in zip(selected_segments, injected, strict=True)
+        ]
 
         local = {index: {} for index in selected_indices}
         for name in self.model_names:
@@ -384,7 +383,7 @@ class SeriesDetectionContext:
                 cache_key = {
                     "detector": name,
                     "segment_index": segment_index,
-                    "ranking_policy": "local-long-fallback-v1",
+                    "ranking_policy": "context-regime-fallback-v3",
                     "injection_policy": INJECTION_POLICY_VERSION,
                     "injection_variant": self.injection_variant,
                     "injection_seed": self.injection_seed,
@@ -441,6 +440,10 @@ class SeriesDetectionContext:
                 selected_scores = score_model_segments(
                     model, [injected for injected, _, _ in injected_pairs]
                 )
+                if len(selected_scores) != len(injected_pairs):
+                    raise ValueError(
+                        "detector returned an unexpected number of selection segments"
+                    )
             except Exception as exc:  # pragma: no cover - detector-specific failures
                 logging.warning(
                     "Detector %s fallo al entrenar segmentos inyectados: %s", name, exc
@@ -450,16 +453,22 @@ class SeriesDetectionContext:
             for segment_index, (_, labels, _), scores in zip(
                 selected_indices, injected_pairs, selected_scores, strict=True
             ):
-                if scores is None or np.asarray(scores).shape != labels.shape:
-                    scores = np.zeros(labels.shape, dtype=np.float64)
-                value = _selection_vus_pr(labels, scores)
+                array = None if scores is None else np.asarray(scores)
+                if (
+                    array is None
+                    or array.shape != labels.shape
+                    or not np.isfinite(array).any()
+                ):
+                    value = float("nan")
+                else:
+                    value = _selection_vus_pr(labels, array)
                 local[segment_index][name] = value
                 self._store(
                     "selection_scores",
                     {
                         "detector": name,
                         "segment_index": segment_index,
-                        "ranking_policy": "local-long-fallback-v1",
+                        "ranking_policy": "context-regime-fallback-v3",
                         "injection_policy": INJECTION_POLICY_VERSION,
                         "injection_variant": self.injection_variant,
                         "injection_seed": self.injection_seed,
@@ -475,19 +484,47 @@ class SeriesDetectionContext:
                 time.perf_counter() - started,
             )
 
-        self._ranking = {
-            name: float(np.mean([local[index][name] for index in selected_indices]))
-            for name in self.model_names
-            if all(name in local[index] for index in selected_indices)
-        }
-        self._segment_rankings = [
-            dict(local[index]) if index in local else dict(self._ranking)
-            for index in range(len(self.segments))
-        ]
+        self._ranking = {}
+        for name in self.model_names:
+            values = np.asarray(
+                [local[index][name] for index in selected_indices], dtype=float
+            )
+            if np.isfinite(values).any():
+                self._ranking[name] = float(np.nanmean(values))
+        fallbacks = {}
+        for native in (False, True):
+            regime_indices = [
+                index
+                for index in selected_indices
+                if uses_native_context(len(self.segments[index])) == native
+            ]
+            if not regime_indices:
+                continue
+            fallback = {}
+            for name in self.model_names:
+                values = np.asarray(
+                    [local[index][name] for index in regime_indices], dtype=float
+                )
+                if np.isfinite(values).any():
+                    fallback[name] = float(np.nanmean(values))
+            fallbacks[native] = fallback
+        self._segment_rankings = []
+        for index, segment in enumerate(self.segments):
+            fallback = fallbacks[uses_native_context(len(segment))]
+            if index not in local:
+                self._segment_rankings.append(dict(fallback))
+                continue
+            self._segment_rankings.append(
+                {
+                    name: value if np.isfinite(value) else fallback[name]
+                    for name, value in local[index].items()
+                    if np.isfinite(value) or name in fallback
+                }
+            )
         return self._segment_rankings
 
     def selection_ranking(self) -> dict[str, float]:
-        """Station fallback ranking: mean of the locally ranked long segments."""
+        """Station-level summary of the selection rankings."""
         self.selection_rankings()
         return self._ranking or {}
 

@@ -906,6 +906,38 @@ def test_build_cases_synthetic_uses_longest_selection_fallback(monkeypatch):
     assert case.selection_segment_indices == (0,)
 
 
+def test_build_cases_synthetic_selects_a_fallback_for_each_context_regime(monkeypatch):
+    frame = _hourly_5m_frame(1072)
+    first_gap = frame.index[700 * 12 : 701 * 12]
+    second_gap = frame.index[951 * 12 : 952 * 12]
+    frame = frame.drop(first_gap.union(second_gap))
+    monkeypatch.setattr(
+        benchmark_module, "load_raw_5m", lambda pollutant, base_dir: [("Station", frame)]
+    )
+    injection_calls = []
+    real_inject = benchmark_module.inject_synthetic_anomaly_segments
+
+    def recording_inject(segments, variant, seed):
+        injection_calls.append((list(map(len, segments)), seed))
+        return real_inject(segments, variant, seed)
+
+    monkeypatch.setattr(
+        benchmark_module, "inject_synthetic_anomaly_segments", recording_inject
+    )
+
+    (case,) = benchmark_module.build_cases(
+        AnomalyBenchmarkConfig(
+            mode="synthetic", injection_variant="drift", min_series_points=8
+        )
+    )
+
+    assert case.segment_lengths == (700, 250, 120)
+    assert case.selection_segment_lengths == (700, 250)
+    assert case.selection_segment_indices == (0, 1)
+    assert injection_calls == [([700, 250], 13), ([700, 250, 120], 101)]
+    assert case.labels_select.any()
+
+
 def test_score_case_synthetic_inherits_station_selection_ranking(monkeypatch):
     lengths = (320, 10, 350)
     selection_lengths = (320, 350)
@@ -947,13 +979,131 @@ def test_score_case_synthetic_inherits_station_selection_ranking(monkeypatch):
 
     rankings = result["vus_pr_select_by_segment"]
     assert rankings[0] != rankings[2]
-    assert rankings[1] == pytest.approx(result["vus_pr_select"])
-    assert result["vus_pr_select"] == pytest.approx(rankings[1])
+    assert rankings[1] == pytest.approx((rankings[0] + rankings[2]) / 2)
     assert result["timing"]["selection_fit_seconds"] == 1.0
     assert result["timing"]["fit_seconds"] == 3.0
     assert result["timing"]["total_fit_seconds"] == 4.0
     assert result["scored_segments"] == [True, False, True]
     assert result["scored_points"] == 665
+
+
+def test_score_case_synthetic_separates_native_and_padded_fallbacks(monkeypatch):
+    lengths = (700, 420, 150)
+    selected_lengths = (700, 420)
+    labels = [np.zeros(length, dtype=np.int64) for length in lengths]
+    selected_labels = [np.zeros(length, dtype=np.int64) for length in selected_lengths]
+    selected_labels[0][10] = 1
+    selected_labels[1][10] = 1
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(sum(lengths), dtype=np.float32),
+        labels=np.concatenate(labels),
+        values_select=np.zeros(sum(selected_lengths), dtype=np.float32),
+        labels_select=np.concatenate(selected_labels),
+        segment_lengths=lengths,
+        segment_indices=_segment_indices(lengths),
+        selection_segment_lengths=selected_lengths,
+        selection_segment_indices=(0, 1),
+    )
+    call_count = 0
+
+    def fake_fit_score(_cls, _kwargs, segments, _seed, _device, **_extra):
+        nonlocal call_count
+        call_count += 1
+        model = type("Model", (), {"training_summary_": {}})()
+        if call_count == 1:
+            return model, [np.full(700, 0.9), np.full(420, 0.2)], 0.0, 0.0
+        return model, [np.zeros(len(segment)) for segment in segments], 0.0, 0.0
+
+    monkeypatch.setattr(benchmark_module, "_fit_score_timed", fake_fit_score)
+    monkeypatch.setattr(
+        benchmark_module,
+        "_selection_vus_pr",
+        lambda _labels, scores: float(scores[0]),
+    )
+    monkeypatch.setattr(
+        benchmark_module, "_selection_vus_pr_segments", lambda *_args: 0.7
+    )
+    result = benchmark_module._score_case_synthetic(
+        object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+    )
+
+    assert result["vus_pr_select"] == pytest.approx(0.7)
+    assert result["vus_pr_select_by_segment"] == pytest.approx([0.9, 0.2, 0.2])
+
+
+def test_score_case_synthetic_fits_selection_sources_together(monkeypatch):
+    lengths = (700, 250, 120)
+    selected_lengths = (700, 250)
+    labels = [np.zeros(length, dtype=np.int64) for length in lengths]
+    selected_labels = [np.zeros(length, dtype=np.int64) for length in selected_lengths]
+    selected_labels[0][10] = 1
+    selected_labels[1][10] = 1
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(sum(lengths), dtype=np.float32),
+        labels=np.concatenate(labels),
+        values_select=np.zeros(sum(selected_lengths), dtype=np.float32),
+        labels_select=np.concatenate(selected_labels),
+        segment_lengths=lengths,
+        segment_indices=_segment_indices(lengths),
+        selection_segment_lengths=selected_lengths,
+        selection_segment_indices=(0, 1),
+    )
+    calls = []
+
+    def fake_fit_score(_cls, _kwargs, segments, _seed, _device, **_extra):
+        calls.append(list(map(len, segments)))
+        model = type("Model", (), {"training_summary_": {}})()
+        return model, [np.zeros(len(segment)) for segment in segments], 0.0, 0.0
+
+    monkeypatch.setattr(benchmark_module, "_fit_score_timed", fake_fit_score)
+
+    benchmark_module._score_case_synthetic(
+        object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+    )
+
+    assert calls == [[700, 250], [700, 250, 120]]
+
+
+def test_score_case_synthetic_rejects_missing_context_regime_selection():
+    lengths = (700, 250)
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(sum(lengths), dtype=np.float32),
+        labels=np.zeros(sum(lengths), dtype=np.int64),
+        values_select=np.zeros(700, dtype=np.float32),
+        labels_select=np.zeros(700, dtype=np.int64),
+        segment_lengths=lengths,
+        segment_indices=_segment_indices(lengths),
+        selection_segment_lengths=(700,),
+        selection_segment_indices=(0,),
+    )
+
+    with pytest.raises(ValueError, match="context regime"):
+        benchmark_module._score_case_synthetic(
+            object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+        )
+
+
+def test_score_case_synthetic_rejects_misaligned_selection_lengths():
+    lengths = (700, 420)
+    case = AnomalyCase(
+        name="Station",
+        values=np.zeros(sum(lengths), dtype=np.float32),
+        labels=np.zeros(sum(lengths), dtype=np.int64),
+        values_select=np.zeros(sum(lengths), dtype=np.float32),
+        labels_select=np.zeros(sum(lengths), dtype=np.int64),
+        segment_lengths=lengths,
+        segment_indices=_segment_indices(lengths),
+        selection_segment_lengths=(420, 700),
+        selection_segment_indices=(0, 1),
+    )
+
+    with pytest.raises(ValueError, match="lengths do not match"):
+        benchmark_module._score_case_synthetic(
+            object, {}, case, AnomalyBenchmarkConfig(mode="synthetic"), "cpu"
+        )
 
 
 def test_synthetic_ensemble_uses_local_and_inherited_rankings():

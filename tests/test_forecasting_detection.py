@@ -8,6 +8,7 @@ import pytest
 
 from _forecasting_helpers import BASELINE_DETECTORS, _seasonal_series
 import airquality.forecasting.detection as detection_module
+from airquality.anomaly.ensemble import ranking_source_indices, uses_native_context
 from airquality.forecasting.cache import BenchmarkCache
 from airquality.forecasting.detection import (
     ConsensusDetection,
@@ -232,11 +233,11 @@ def test_injection_strategies_flag_spike_on_real_series():
     best = InjectionTopKDetection(name="inject-best", top_k=1, min_votes=1).detect(context)
     vote = InjectionTopKDetection(name="inject-vote", top_k=3, min_votes=2).detect(context)
 
-    assert len(best.detectors) == 1
+    assert all(len(selected) == 1 for selected in best.selected_by_segment)
     assert set(best.ranking) <= set(BASELINE_DETECTORS) and best.ranking
     assert bool(best.mask.iloc[300])
 
-    assert 1 <= len(vote.detectors) <= 3
+    assert all(1 <= len(selected) <= 3 for selected in vote.selected_by_segment)
     assert bool(vote.mask.iloc[300])
     # Gaps are never flagged (they are not observed points).
     assert not best.mask.iloc[100:105].any()
@@ -458,6 +459,33 @@ def test_selection_ranking_resumes_per_detector(tmp_path, monkeypatch):
     assert fit_calls == 3
 
 
+def test_selection_cache_preserves_failed_detector_exclusion(tmp_path, monkeypatch):
+    series = _seasonal_series(n=500, seed=7)
+    cache = BenchmarkCache(tmp_path)
+    fit_calls = 0
+
+    def fake_fit_segments(*args, **kwargs):
+        nonlocal fit_calls
+        fit_calls += 1
+        return object()
+
+    monkeypatch.setattr(detection_module, "fit_model_segments", fake_fit_segments)
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [None] * len(segments),
+    )
+    kwargs = {
+        "detectors": ["IQR"],
+        "cache": cache,
+        "cache_key": {"series": "ST"},
+    }
+
+    assert SeriesDetectionContext(series, **kwargs).selection_ranking() == {}
+    assert SeriesDetectionContext(series, **kwargs).selection_ranking() == {}
+    assert fit_calls == 1
+
+
 def test_strategies_return_empty_result_without_segments():
     idx = pd.date_range("2024-01-01", periods=20, freq="h")
     series = pd.Series(np.nan, index=idx, name="S")
@@ -506,10 +534,24 @@ def test_context_normalizes_injection_variant():
     assert context.injection_variant == "drift"
 
 
-def test_selection_ranking_scores_failed_segment_as_no_detections(monkeypatch):
+@pytest.mark.parametrize(
+    "failed_scores",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(
+            np.resize([np.nan, np.inf, -np.inf], 309),
+            id="wholly-nonfinite",
+        ),
+    ],
+)
+def test_selection_ranking_uses_same_regime_fallback_for_failed_segment(
+    monkeypatch, failed_scores
+):
     series = _seasonal_series(n=610, seed=5)
     series.iloc[300] = np.nan  # two eligible segments: 300 and 309 points
-    context = SeriesDetectionContext(series, detectors=["IQR"], min_selection_points=300)
+    context = SeriesDetectionContext(
+        series, detectors=["IQR"], min_selection_points=300
+    )
     fit_calls = 0
     metric_scores = []
 
@@ -528,17 +570,57 @@ def test_selection_ranking_scores_failed_segment_as_no_detections(monkeypatch):
         "score_model_segments",
         lambda _model, segments: [
             np.linspace(0.0, 1.0, len(segments[0])),
-            None,
+            failed_scores,
         ],
     )
     monkeypatch.setattr(detection_module, "_selection_vus_pr", fake_vus_pr)
 
-    ranking = context.selection_ranking()
+    rankings = context.selection_rankings()
 
-    assert ranking["IQR"] == pytest.approx(0.5)
+    assert rankings == [{"IQR": 0.8}, {"IQR": 0.8}]
+    assert context.selection_ranking() == pytest.approx({"IQR": 0.8})
     assert fit_calls == 1
-    assert len(metric_scores) == 2
-    assert np.all(metric_scores[1] == metric_scores[1][0])
+    assert len(metric_scores) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["none", "nonfinite", "wrong-shape", "wrong-count", "exception"],
+)
+def test_selection_excludes_detector_that_fails_all_segments(monkeypatch, failure):
+    series = _seasonal_series(n=610, seed=5)
+    series.iloc[300] = np.nan
+    context = SeriesDetectionContext(series, detectors=["IQR"], min_selection_points=300)
+
+    def failed_scores(_model, segments):
+        if failure == "exception":
+            raise RuntimeError("selection scoring failed")
+        if failure == "none":
+            return [None] * len(segments)
+        if failure == "nonfinite":
+            return [
+                np.resize([np.nan, np.inf, -np.inf], len(segment))
+                for segment in segments
+            ]
+        if failure == "wrong-shape":
+            return [np.zeros(len(segment) - 1) for segment in segments]
+        return [None]
+
+    monkeypatch.setattr(
+        detection_module, "fit_model_segments", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(detection_module, "score_model_segments", failed_scores)
+
+    assert context.selection_rankings() == [{}, {}]
+    assert context.selection_ranking() == {}
+    for strategy in (
+        InjectionTopKDetection(name="inject-best", top_k=1, min_votes=1),
+        InjectionTopKDetection(name="inject-vote", top_k=3, min_votes=2),
+    ):
+        result = strategy.detect(context)
+        assert result.detectors == []
+        assert not result.mask.any()
+        assert not result.scored_mask.any()
 
 
 def test_selection_rankings_are_local_with_station_fallback(monkeypatch):
@@ -580,6 +662,191 @@ def test_selection_rankings_are_local_with_station_fallback(monkeypatch):
     assert context.selection_ranking() == pytest.approx(
         {"IQR": 0.55, "Hampel_w24": 0.45}
     )
+
+
+def test_selection_rankings_do_not_mix_native_and_padded_fallbacks(monkeypatch):
+    series = _seasonal_series(n=1272, seed=9)
+    series.iloc[[700, 1121]] = np.nan  # blocks of 700, 420, and 150 points
+    context = SeriesDetectionContext(
+        series,
+        detectors=["IQR", "Hampel_w24"],
+        min_selection_points=300,
+    )
+    values = {
+        "IQRDetector": {700: 0.9, 420: 0.2},
+        "HampelDetector": {700: 0.1, 420: 0.8},
+    }
+
+    monkeypatch.setattr(
+        detection_module,
+        "fit_model_segments",
+        lambda model_cls, *_args, **_kwargs: model_cls.__name__,
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda model, segments: [
+            np.full(len(segment), values[model][len(segment)]) for segment in segments
+        ],
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "_selection_vus_pr",
+        lambda _labels, scores: float(scores[0]),
+    )
+
+    rankings = context.selection_rankings()
+
+    assert rankings[0] == {"IQR": 0.9, "Hampel_w24": 0.1}
+    assert rankings[1] == {"IQR": 0.2, "Hampel_w24": 0.8}
+    assert rankings[2] == rankings[1]
+
+
+def test_undefined_local_ranking_uses_same_regime_fallback(monkeypatch):
+    series = _seasonal_series(n=611, seed=12)
+    series.iloc[300] = np.nan  # padded blocks of 300 and 310 points
+    context = SeriesDetectionContext(
+        series,
+        detectors=["IQR"],
+        min_selection_points=300,
+    )
+
+    monkeypatch.setattr(
+        detection_module, "fit_model_segments", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(segment)) for segment in segments],
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "_selection_vus_pr",
+        lambda labels, _scores: float("nan") if len(labels) == 300 else 0.8,
+    )
+
+    rankings = context.selection_rankings()
+
+    assert rankings == [{"IQR": 0.8}, {"IQR": 0.8}]
+
+
+def test_selection_rankings_use_longest_padded_block_as_regime_fallback(monkeypatch):
+    series = _seasonal_series(n=1072, seed=10)
+    series.iloc[[700, 951]] = np.nan  # blocks of 700, 250, and 120 points
+    context = SeriesDetectionContext(
+        series,
+        detectors=["IQR"],
+        min_selection_points=300,
+    )
+    fitted_lengths = []
+
+    def fake_fit_segments(_model_cls, segments, **_kwargs):
+        fitted_lengths.append(list(map(len, segments)))
+        return object()
+
+    monkeypatch.setattr(detection_module, "fit_model_segments", fake_fit_segments)
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.full(len(segment), len(segment)) for segment in segments],
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "_selection_vus_pr",
+        lambda _labels, scores: float(scores[0]),
+    )
+
+    rankings = context.selection_rankings()
+
+    assert fitted_lengths == [[700, 250]]
+    assert rankings[1] == rankings[2] == {"IQR": 250.0}
+
+
+@pytest.mark.parametrize(
+    ("lengths", "expected"),
+    [
+        ((79, 80, 299, 300, 511, 512), [3, 4, 5]),
+        ((79, 80, 299, 511, 512), [3, 4]),
+        ((512, 700), [0, 1]),
+    ],
+)
+def test_ranking_source_indices_respect_selection_and_context_boundaries(
+    lengths, expected
+):
+    assert ranking_source_indices(lengths, 300) == expected
+
+
+def test_native_context_boundary_is_exactly_512():
+    assert not uses_native_context(511)
+    assert uses_native_context(512)
+
+
+def test_selection_vus_is_undefined_without_injected_anomalies():
+    assert np.isnan(
+        detection_module._selection_vus_pr(np.zeros(50), np.zeros(50))
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [slice(0, 15), slice(45, 65), slice(95, None)],
+    ids=["prefix", "internal", "suffix"],
+)
+@pytest.mark.parametrize("nonfinite", [np.nan, np.inf, -np.inf])
+def test_selection_vus_excludes_nonfinite_support(unsupported, nonfinite):
+    labels = np.zeros(120, dtype=np.int64)
+    labels[5:11] = 1
+    labels[50:57] = 1
+    labels[100:109] = 1
+    scores = np.linspace(0.0, 0.2, len(labels))
+    scores[labels == 1] = 1.0
+    scores[unsupported] = nonfinite
+
+    assert detection_module._selection_vus_pr(labels, scores) == pytest.approx(1.0)
+
+
+def test_selection_vus_is_undefined_when_finite_support_has_one_class():
+    labels = np.array([0, 0, 1, 1], dtype=np.int64)
+    scores = np.array([0.0, 1.0, np.nan, np.nan])
+
+    assert np.isnan(detection_module._selection_vus_pr(labels, scores))
+
+
+def test_selection_injects_native_and_padded_sources_together(monkeypatch):
+    series = _seasonal_series(n=951, seed=11)
+    series.iloc[700] = np.nan  # blocks of 700 and 250 points
+    context = SeriesDetectionContext(
+        series,
+        detectors=["IQR"],
+        injection_variant="drift",
+        min_selection_points=300,
+    )
+    injection_calls = []
+    real_inject = detection_module.inject_synthetic_anomaly_segments
+
+    def recording_inject(segments, variant, seed):
+        generated = real_inject(segments, variant, seed)
+        injection_calls.append(
+            ([len(segment) for segment in segments], [int(labels.sum()) for _, labels in generated])
+        )
+        return generated
+
+    monkeypatch.setattr(
+        detection_module, "inject_synthetic_anomaly_segments", recording_inject
+    )
+    monkeypatch.setattr(
+        detection_module, "fit_model_segments", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        detection_module,
+        "score_model_segments",
+        lambda _model, segments: [np.zeros(len(segment)) for segment in segments],
+    )
+
+    context.selection_rankings()
+
+    assert [lengths for lengths, _ in injection_calls] == [[700, 250]]
+    assert sum(injection_calls[0][1]) > 0
 
 
 # --------------------------------------------------------------------------- #

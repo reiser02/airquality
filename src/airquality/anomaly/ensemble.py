@@ -3,8 +3,8 @@
 In ``unlabeled`` mode there is no label-based metric to rank detectors with,
 so :class:`airquality.forecasting.detection.ConsensusDetection` combines every
 detector that survives the detection-rate filter. In ``synthetic`` mode detectors
-are ranked by selection-injection VUS-PR: long
-segments use local rankings and short segments inherit the station ranking. At
+are ranked by selection-injection VUS-PR: long segments use local rankings and
+short segments inherit the mean for their TSPulse context regime. At
 each point, the first ``top_k`` ranked detectors with a finite score vote; later
 detectors backfill missing scores and at least ``min_votes`` votes are required.
 """
@@ -16,6 +16,33 @@ import numpy as np
 from .metrics import DEFAULT_THRESHOLD_K, detect_mask
 
 DEFAULT_TOP_K = 3
+NATIVE_CONTEXT_LENGTH = 512
+
+
+def uses_native_context(length: int) -> bool:
+    """Whether TSPulse can score the block without padding."""
+    return length >= NATIVE_CONTEXT_LENGTH
+
+
+def ranking_source_indices(
+    segment_lengths: list[int] | tuple[int, ...], minimum_points: int
+) -> list[int]:
+    """Select local-ranking blocks independently for padded and native contexts."""
+    selected: list[int] = []
+    for native in (False, True):
+        regime = [
+            index
+            for index, length in enumerate(segment_lengths)
+            if uses_native_context(length) == native
+        ]
+        if not regime:
+            continue
+        eligible = [index for index in regime if segment_lengths[index] >= minimum_points]
+        selected.extend(
+            eligible
+            or [max(regime, key=lambda index: segment_lengths[index])]
+        )
+    return sorted(selected)
 
 
 def rank_top_k(metric_by_model: dict[str, float | None], k: int = DEFAULT_TOP_K) -> list[str]:

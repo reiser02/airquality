@@ -17,11 +17,12 @@ configured injection variant (default ``combined``: a per-segment mix of
 anomaly shapes) is injected **directly into the real series** — the old STL base was
 removed after ``docs/estudio_inyeccion_stl_2026-07-03.md`` showed it distorts
 per-model metrics. Each station is injected TWICE with independent seeds — a
-*selection* injection (on segments of at least 300 points, with a longest-
-segment fallback) and a held-out *evaluation* injection (on every segment of
-at least 8 points). The ensemble ranks long segments locally, gives short
-segments the station-level selection ranking, and backfills its top three point by point
-before a 2-of-3/2-of-2 vote. Final metrics are multiplied by finite-score
+*selection* injection (on segments of at least 300 points per TSPulse context
+regime, with that regime's longest-segment fallback) and a held-out *evaluation*
+injection (on every segment of at least 8 points). The ensemble ranks long
+segments locally, gives short segments the finite selection mean from their own
+context regime, and backfills its top three point by point before a 2-of-3/2-of-2
+vote. Final metrics are multiplied by finite-score
 coverage; raw auroc/aupr/vus_pr/vus_roc/affiliation_f1 remain diagnostic.
 
 Both modes share the loading (raw 5-minute data → hourly means → all eligible
@@ -63,7 +64,13 @@ from .anomalies import (
     inject_synthetic_anomaly_segments,
     normalize_injection_variant,
 )
-from .ensemble import DEFAULT_TOP_K, rank_top_k, ranked_pointwise_vote
+from .ensemble import (
+    DEFAULT_TOP_K,
+    rank_top_k,
+    ranked_pointwise_vote,
+    ranking_source_indices,
+    uses_native_context,
+)
 from .metrics import (
     DEFAULT_MAX_DETECTION_RATE,
     DEFAULT_THRESHOLD_K,
@@ -350,18 +357,9 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
         segment_indices = tuple(pd.DatetimeIndex(segment.index) for segment in segments)
         values = np.concatenate(segment_values)
         if mode == "synthetic":
-            selection_indices = [
-                position
-                for position, segment in enumerate(segment_values)
-                if len(segment) >= MIN_SYNTHETIC_SEGMENT_POINTS
-            ]
-            if not selection_indices:
-                selection_indices = [
-                    max(
-                        range(len(segment_values)),
-                        key=lambda position: len(segment_values[position]),
-                    )
-                ]
+            selection_indices = ranking_source_indices(
+                segment_lengths, MIN_SYNTHETIC_SEGMENT_POINTS
+            )
             selection_segments = [segment_values[position] for position in selection_indices]
             selected = inject_synthetic_anomaly_segments(
                 selection_segments, config.injection_variant, config.seed
@@ -701,12 +699,27 @@ def _score_case_synthetic(
     selection_indices = _case_selection_segment_indices(
         case, len(evaluated), len(selected)
     )
+    if any(
+        selection_length != lengths[index]
+        for selection_length, index in zip(
+            selection_lengths, selection_indices, strict=True
+        )
+    ):
+        raise ValueError(f"Selection segment lengths do not match {case.name}")
+    evaluation_regimes = {
+        uses_native_context(length) for length in lengths
+    }
+    selection_regimes = {
+        uses_native_context(lengths[index]) for index in selection_indices
+    }
+    if not evaluation_regimes <= selection_regimes:
+        raise ValueError(f"Selection segments are missing a context regime for {case.name}")
     selection_segment_indices = [
         segment_indices[index] for index in selection_indices
     ]
     score_parts: list[np.ndarray] = []
-    selection_vus_by_index: dict[int, float] = {}
     selection_score_parts: list[np.ndarray] = []
+    selection_vus_by_index: dict[int, float] = {}
     failures: list[dict[str, object]] = []
     summaries: list[dict[str, object]] = []
     fit_seconds = 0.0
@@ -768,12 +781,26 @@ def _score_case_synthetic(
     station_selection_vus = _selection_vus_pr_segments(
         selected_labels, selection_score_parts
     )
+    regime_selection_vus = {
+        native: _finite_mean(
+            [
+                selection_vus_by_index[index]
+                for index in selection_indices
+                if uses_native_context(lengths[index]) == native
+            ]
+        )
+        for native in (False, True)
+        if any(
+            uses_native_context(lengths[index]) == native
+            for index in selection_indices
+        )
+    }
     selection_vus_by_segment = [
         float(
             selection_vus_by_index[index]
             if index in selection_vus_by_index
             and np.isfinite(selection_vus_by_index[index])
-            else station_selection_vus
+            else regime_selection_vus[uses_native_context(lengths[index])]
         )
         for index in range(len(evaluated))
     ]
@@ -1120,7 +1147,7 @@ def _build_synthetic_ensemble(
         for segment_index, labels in enumerate(labels_by_segment):
             # Ranking + weights come only from the selection injection. Long
             # segments have local scores; short segments inherit each model's
-            # station-level selection score, matching inject-vote's policy.
+            # context-regime selection score, matching inject-vote's policy.
             ranking = {
                 name: float(
                     result["per_case"][index]["vus_pr_select_by_segment"][segment_index]
@@ -1443,7 +1470,7 @@ def recompute_ensemble(
     ensemble according to the run's mode:
 
     - ``synthetic``: use each long segment's saved local selection VUS-PR,
-      give short segments the station-level ranking, backfill unavailable
+      give short segments the ranking from their context regime, backfill unavailable
       detectors point by point, apply the coverage adjustment,
       and return macro VUS-PR per detector plus ensemble.
     - ``unlabeled``: re-apply the detection-rate filter (``max_detection_rate``

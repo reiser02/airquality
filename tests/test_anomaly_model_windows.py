@@ -284,4 +284,25 @@ def test_carla_base_fits_one_80_point_window():
     scores = model.fit(values).score(values)
 
     assert scores.shape == values.shape
-    assert np.isfinite(scores).all()
+    assert np.isnan(scores[:-1]).all()
+    assert np.isfinite(scores[-1])
+
+
+def test_carla_aligns_native_window_scores_to_window_ends(monkeypatch):
+    model = CARLABase(device="cpu", window_size=3)
+    model.majority_label_ = 0
+    probabilities = np.array(
+        [[0.9, 0.1], [0.6, 0.4], [0.2, 0.8], [0.7, 0.3]],
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(model, "_window_probabilities", lambda _windows: probabilities)
+
+    scores = model._score_normalized(np.zeros((6, 1), dtype=np.float32))
+
+    np.testing.assert_allclose(
+        scores,
+        np.array([np.nan, np.nan, 0.1, 0.4, 0.8, 0.3], dtype=np.float32),
+        rtol=0.0,
+        atol=1e-6,
+        equal_nan=True,
+    )
