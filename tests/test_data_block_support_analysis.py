@@ -33,7 +33,7 @@ def test_gap_diagnostics_keeps_adjacent_gap_over_limit_unfilled() -> None:
     assert mixed["filled_hours"] == 0
 
 
-@pytest.mark.parametrize("value, expected", [("co", "CO"), (" NO2 ", "NO2")])
+@pytest.mark.parametrize("value, expected", [("co", "CO"), (" NO2 ", "NO2"), ("o3", "O3")])
 def test_normalize_pollutant_accepts_supported_case_insensitive_values(
     value: str, expected: str
 ) -> None:
