@@ -278,4 +278,10 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
     gap_table = pd.read_csv(tmp_path / "model_performance_by_gap.csv")
     assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
     assert gap_table["N_Stations"].eq(3).all()
+    for gap in (1, 2, 6, 24):
+        assert (tmp_path / "plots" / f"gap_{gap}" / "media_estaciones.png").exists()
+    aggregate_rows = artifacts["plot_manifest_df"].query(
+        "series_name == 'Media de estaciones'"
+    )
+    assert set(aggregate_rows["gap_size"]) == {1, 2, 6, 24}
     assert all(not (tmp_path / filename).exists() for filename in obsolete_plots)
