@@ -50,6 +50,23 @@ MODEL_CATEGORY_COLORS = {
     "Deep Learning": "#f28c38",
     "Ensemble": "#9b59b6",
 }
+COVERAGE_MODEL_LABELS = {
+    "ModifiedZScore": "ModZ",
+    "IQR": "IQR",
+    "IsolationForest": "iForest",
+    "LOF": "LOF",
+    "Sub_PCA": "SubPCA",
+    "COUTABase": "COUTA-B",
+    "COUTAGenIAS": "COUTA-G",
+    "CARLABase": "CARLA-B",
+    "CARLAGenIAS": "CARLA-G",
+    "LSTMAD": "LSTMAD",
+    "Hampel_w24": "Hampel24",
+    "Hampel_w6": "Hampel6",
+    "Prophet": "Prophet",
+    "TSPulse": "TSPulse",
+    "Ensemble": "Ensemble",
+}
 STATISTICAL_MODELS = {
     "ModifiedZScore",
     "IQR",
@@ -273,8 +290,13 @@ def save_detection_rate_distribution_plot(
     axis.set_xlabel("Detection rate")
     axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
     axis.grid(False, axis="y")
-    axis.legend(handles=category_legend_handles(alpha=0.78), loc="lower right", ncols=3)
-    figure.tight_layout(rect=(0, 0, 1, 0.925))
+    figure.legend(
+        handles=category_legend_handles(alpha=0.78),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        ncols=4,
+    )
+    figure.tight_layout(rect=(0, 0.08, 1, 0.925))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
@@ -319,8 +341,13 @@ def save_training_time_plot(
             fontsize=9,
             color=TEXT_COLOR,
         )
-    axis.legend(handles=category_legend_handles(alpha=0.92), loc="lower right", ncols=3)
-    figure.tight_layout(rect=(0, 0, 1, 0.925))
+    figure.legend(
+        handles=category_legend_handles(alpha=0.92),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        ncols=4,
+    )
+    figure.tight_layout(rect=(0, 0.08, 1, 0.925))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
@@ -365,8 +392,13 @@ def save_detection_rate_vs_inference_plot(
         plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markeredgecolor="#444444", markersize=8, label=category)
         for category, color in MODEL_CATEGORY_COLORS.items()
     ]
-    axis.legend(handles=legend_handles, loc="upper right", ncols=3)
-    figure.tight_layout()
+    figure.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        ncols=4,
+    )
+    figure.tight_layout(rect=(0, 0.08, 1, 1))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
@@ -445,8 +477,13 @@ def save_vus_pr_distribution_plot(
     axis.set_xlabel("Coverage-adjusted VUS-PR")
     axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
     axis.grid(False, axis="y")
-    axis.legend(handles=category_legend_handles(alpha=0.78), loc="lower right", ncols=3)
-    figure.tight_layout(rect=(0, 0, 1, 0.925))
+    figure.legend(
+        handles=category_legend_handles(alpha=0.78),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        ncols=4,
+    )
+    figure.tight_layout(rect=(0, 0.08, 1, 0.925))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
@@ -492,8 +529,13 @@ def save_vus_pr_vs_inference_plot(
         plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markeredgecolor="#444444", markersize=8, label=category)
         for category, color in MODEL_CATEGORY_COLORS.items()
     ]
-    axis.legend(handles=legend_handles, loc="lower right", ncols=3)
-    figure.tight_layout()
+    figure.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        ncols=4,
+    )
+    figure.tight_layout(rect=(0, 0.08, 1, 1))
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
 
@@ -501,12 +543,12 @@ def save_vus_pr_vs_inference_plot(
 def save_vus_pr_raw_vs_coverage_plot(
     output_path: Path, model_summaries: dict[str, dict[str, object]]
 ) -> None:
-    """Render raw macro VUS-PR against score coverage, annotated by adjusted VUS."""
+    """Render raw macro VUS-PR against score coverage with compact model labels."""
     figure, axis = plt.subplots(figsize=(12.5, 6.5), facecolor=FIGURE_FACE)
     style_axis(axis)
+    points: list[tuple[str, float, float]] = []
     for model_name, summary in model_summaries.items():
         raw_metrics = summary.get("macro_raw_metrics", {})
-        macro_metrics = summary.get("macro_metrics", {})
         raw = _safe_float(
             raw_metrics.get("vus_pr") if isinstance(raw_metrics, dict) else None,
             default=float("nan"),
@@ -514,29 +556,62 @@ def save_vus_pr_raw_vs_coverage_plot(
         coverage = _safe_float(
             summary.get("macro_coverage_rate"), default=float("nan")
         )
-        adjusted = _safe_float(
-            macro_metrics.get("vus_pr") if isinstance(macro_metrics, dict) else None,
-            default=float("nan"),
-        )
         if not np.isfinite(raw) or not np.isfinite(coverage):
             continue
+        points.append((model_name, coverage, raw))
+
+    points.sort(key=lambda point: point[2], reverse=True)
+    right_cluster_indices = [
+        point_number for point_number, (_, coverage, _) in enumerate(points) if coverage >= 0.9
+    ]
+    right_offsets = (
+        np.linspace(18, -18, len(right_cluster_indices)) if right_cluster_indices else []
+    )
+    right_offsets_by_index = dict(zip(right_cluster_indices, right_offsets))
+
+    for point_number, (model_name, coverage, raw) in enumerate(points):
         axis.scatter(
             coverage,
             raw,
             s=90,
             color=model_color(model_name),
+            marker="o",
             edgecolor=EDGE_COLOR,
             linewidth=0.8,
             zorder=3,
         )
-        label = f"{model_name}  adjusted={adjusted:.3f}"
+        if point_number in right_offsets_by_index:
+            label_offset = (-6, right_offsets_by_index[point_number])
+        else:
+            nearby = [
+                other_number
+                for other_number, (_, other_coverage, other_raw) in enumerate(points)
+                if other_number != point_number
+                and abs(coverage - other_coverage) <= 0.025
+                and abs(raw - other_raw) <= 0.035
+            ]
+            close_points = sorted([point_number, *nearby])
+            if len(close_points) > 1:
+                close_index = close_points.index(point_number)
+                label_offset = ((6, 8), (6, -8), (-6, 8), (-6, -8))[close_index % 4]
+            else:
+                label_offset = (6, 4)
         axis.annotate(
-            label,
+            COVERAGE_MODEL_LABELS.get(model_name, model_name),
             (coverage, raw),
             textcoords="offset points",
-            xytext=(6, 4),
-            fontsize=8.5,
+            xytext=label_offset,
+            ha="right" if label_offset[0] < 0 else "left",
+            va="center",
+            fontsize=8,
             color=TEXT_COLOR,
+            bbox={
+                "boxstyle": "round,pad=0.16",
+                "facecolor": FIGURE_FACE,
+                "edgecolor": "none",
+                "alpha": 0.82,
+            },
+            zorder=4,
         )
     axis.set_xlim(-0.02, 1.02)
     axis.set_ylim(-0.02, 1.02)
@@ -544,9 +619,8 @@ def save_vus_pr_raw_vs_coverage_plot(
     axis.set_xlabel("Scored-point coverage")
     axis.set_ylabel("Raw VUS-PR on scored support")
     axis.set_title("Raw VUS-PR vs. Coverage", fontsize=13)
-    axis.legend(handles=category_legend_handles(alpha=0.92), loc="lower left", ncols=2)
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=150)
+    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.13, top=0.92)
+    figure.savefig(output_path, dpi=150, facecolor=FIGURE_FACE)
     plt.close(figure)
 
 
