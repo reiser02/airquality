@@ -113,6 +113,28 @@ gap generation, model information access, metrics, Monte Carlo aggregation, and
 limitations, is documented in
 [`docs/IMPUTATION_BENCHMARK.md`](docs/IMPUTATION_BENCHMARK.md).
 
+#### `[forecasting]`
+
+Forecasting keeps one `<strategy>+impute` arm, but can select a different
+imputation model for each contiguous gap size through inclusive rules:
+
+```ini
+imputation_gap_rules = 1=LinearInterp;2-5=TSPulse;6-10=TSPulse_FineTuned
+```
+
+Rules use `size` or `min-max` on the left and an imputer registry name on the
+right. They cannot overlap. Gap size is the number of consecutive missing
+points on the hourly grid; gaps without a matching rule remain `NaN`. If a
+selected model returns missing predictions, only those selected points use the
+existing seasonal interpolation safety net.
+
+`imputation_gap_rules` is required. The separate foundation-context experiment
+applies the same rules when its first prediction fails because the context
+contains missing values. Gap diagnostics report `fallback_used` and
+`effective_imputer`; the latter is built dynamically from whichever configured
+model actually supplied values, including mixed results such as
+`TSPulse+interp`.
+
 #### `[tspulse]`
 
 Controls the TSPulse base checkpoint, optional fine-tuned checkpoint, and fine-tuning.
@@ -175,13 +197,17 @@ each block can support the configured forecasting protocol and validation
 geometry. It does not run anomaly detectors or forecasting models, so the
 reported support is an upper bound for detector-aware runs.
 
-The default output is `reports/data_blocks/YYYYMMDD_HHMMSS/` and contains:
+The default output is `reports/data_blocks/<POLLUTANTS>_YYYYMMDD_HHMMSS/`, where
+`<POLLUTANTS>` is the underscore-separated list selected with `--pollutants`
+(`O3` for a single-contaminant run or `NO2_O3` by default), and contains:
 
 - `summary.csv`: aggregate block counts, usable hours, and retention by pollutant
 - `series_summary.csv`: holdout, validation, and retained-support details per station and pollutant
 - `blocks.csv`: start, end, length, eligibility, and usage of every contiguous block
 - `excluded_series.csv`: series that could not provide the required holdout or training history
-- `retention_overview.png`, `block_length_distribution.png`, `retained_hours_by_series.png`, and `usable_blocks_by_series.png`
+- `retention_overview.png`: retención por contaminante y `TOTAL` solo en informes conjuntos
+- `block_length_distribution.png`: distribuciones superpuestas y transparentes, con un color por contaminante
+- `retained_hours_by_series.png` y `usable_blocks_by_series.png`: un panel por contaminante
 
 Useful options include `--pollutants`, `--context`, `--horizon`, `--stride`,
 `--validation-len`, `--holdout`, and `--forecast-models`. Defaults are read from
@@ -201,11 +227,19 @@ case-insensitive `--pollutant` option, currently `CO`, `NO2`, or `O3`:
 uv run python -m airquality.data.block_support_analysis --pollutant CO
 ```
 
+The report can use a strategy override without changing the forecasting
+configuration. For example, to generate only the `inject-vote` arms:
+
+```bash
+uv run python -m airquality.data.block_support_analysis \
+  --strategies inject-vote
+```
+
 It compares the same training prefix in the real benchmark states:
 
 - `raw`
 - `<strategy>+noimpute`, after anomaly removal
-- `<strategy>+impute`, after the configured imputer processes complete short gaps
+- `<strategy>+impute`, after the configured gap-size policy processes matching gaps
 
 There is no `raw+impute` arm. Detection runs on the full series, all states use
 the same common test, and support is measured only before the first test target.
@@ -228,7 +262,7 @@ The persisted report contains:
 - `summary.csv`: aggregate support and deltas against raw by arm
 - `series_summary.csv`: support per station and arm
 - `blocks.csv`: every resulting block, its provenance and protocol eligibility
-- `gaps.csv`: actual gap origin, length, eligibility and filled hours
+- `gaps.csv`: actual gap origin, length, assigned imputer, eligibility and filled hours
 - `detection.csv`: coverage and anomaly rate per strategy
 - `excluded_series.csv`: stations without a viable common test and training host
 - `manifest.json` and `README.md`: effective protocol and artifact guide
@@ -240,9 +274,11 @@ uv run python -m airquality.visualizations.block_support \
   reports/data_blocks/forecast_support_NO2_YYYYMMDD_HHMMSS
 ```
 
-Omit the directory to render the newest run. The figures cover aggregate
-observed/imputed support, per-series retention, valid block counts, block-length
-survival, recovered-gap composition, strategy-level detection and imputation age.
+Omit the directory to render the newest run. The figures use `raw` as the
+reference and exclusively `inject-vote` for detection and imputation. They cover
+aggregate observed/imputed support, stage-specific retention, retained hours and
+usable blocks by series, block-length distributions and survival, recovered-gap
+composition, detection coverage and imputation age.
 
 ### Train the configured forecasting models
 
@@ -298,6 +334,7 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
+- `excluded_series.csv`: stations omitted because they cannot satisfy the fixed holdout protocol, with the reason and observed support
 - `model_performance_by_gap_{mae,rmse,mase,rmsse,r2}.png`: metric value, mean rank, and top-three frequency for every gap size
 - `overall_model_performance_{mae,rmse,mase,rmsse,r2}.png`: compact global scorecards
 - `global_station_error_{mae,rmse,mase,rmsse,r2}.png`: distributions of gap-averaged metric values across stations
