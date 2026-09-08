@@ -21,8 +21,9 @@ per-model metrics. Each station is injected TWICE with independent seeds — a
 regime, with that regime's longest-segment fallback) and a held-out *evaluation*
 injection (on every segment of at least 8 points). The ensemble ranks long
 segments locally, gives short segments the finite selection mean from their own
-context regime, and backfills its top three point by point before a 2-of-3/2-of-2
-vote. Final metrics are multiplied by finite-score
+context regime, min-max normalizes each detector over the station, and averages
+its first three finite scores pointwise with ranked backfill. Final metrics are
+multiplied by finite-score
 coverage; raw auroc/aupr/vus_pr/vus_roc/affiliation_f1 remain diagnostic.
 
 Both modes share the loading (raw 5-minute data → hourly means → all eligible
@@ -50,12 +51,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
-
 from airquality.data.loaders import load_raw_5m
 from airquality.data.preprocessing import preprocess
 from airquality.data.segments import contiguous_observed_segments
 from airquality.paths import create_run_dir
+from airquality.run_logging import RunLogging
 
 from .anomalies import (
     DEFAULT_INJECTION_VARIANT,
@@ -67,7 +67,7 @@ from .anomalies import (
 from .ensemble import (
     DEFAULT_TOP_K,
     rank_top_k,
-    ranked_pointwise_vote,
+    ranked_pointwise_minmax_mean,
     ranking_source_indices,
     uses_native_context,
 )
@@ -88,6 +88,7 @@ from .registry import (
 )
 
 ENSEMBLE_NAME = "Ensemble"
+LOGGER = logging.getLogger(__name__)
 MODES = ("unlabeled", "synthetic")
 UNLABELED_METRIC_KEYS = ["detection_rate"]
 SYNTHETIC_METRIC_KEYS = ["auroc", "aupr", "vus_pr", "vus_roc", "affiliation_f1"]
@@ -335,7 +336,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
     if config.series_limit is not None:
         stations = stations[: config.series_limit]
 
-    logging.info("Building cases for %d station(s)  [mode=%s]…", len(stations), mode)
+    LOGGER.info("Building cases for %d station(s)  [mode=%s]", len(stations), mode)
     cases: list[AnomalyCase] = []
     for station, frame in stations:
         processed, _ = preprocess([frame], config.pollutant)
@@ -346,7 +347,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
         minimum = max(MIN_SEGMENT_POINTS, int(config.min_series_points))
         segments = contiguous_observed_segments(hourly.iloc[:, 0], min_len=minimum)
         if not segments:
-            logging.info(
+            LOGGER.info(
                 "  skip %s  (no contiguous run with at least %d points)",
                 station,
                 minimum,
@@ -389,7 +390,7 @@ def build_cases(config: AnomalyBenchmarkConfig) -> list[AnomalyCase]:
                     segment_indices=segment_indices,
                 )
             )
-    logging.info("Built %d evaluation cases.", len(cases))
+    LOGGER.info("Built %d evaluation cases.", len(cases))
     return cases
 
 
@@ -900,12 +901,12 @@ def _run_detector(
     per_case = []
     total = len(cases)
     model_started = time.perf_counter()
-    logging.info("    [%s] START  %d cases on %s", model_name, total, device)
+    LOGGER.info("    [%s] START  %d cases on %s", model_name, total, device)
     for case_index, case in enumerate(cases):
         entry = score_case(model_cls, model_kwargs, case, config, device)
         per_case.append(entry)
         timing = entry["timing"]
-        logging.info(
+        LOGGER.info(
             "    [%s] case %d/%d  %s  %s  (%.1fs)",
             model_name,
             case_index + 1,
@@ -918,7 +919,7 @@ def _run_detector(
         )
     headline_key = "vus_pr" if mode == "synthetic" else "detection_rate"
     macro = _finite_mean([entry["metrics"][headline_key] for entry in per_case])
-    logging.info(
+    LOGGER.info(
         "    [%s] DONE   %d cases in %.1fs  macro_%s=%.3f",
         model_name,
         total,
@@ -973,7 +974,7 @@ def _run_detectors(
     if not gpu_models:
         results: dict[str, dict[str, object]] = {}
         for index, name in enumerate(model_names):
-            logging.info("  ▶ [%d/%d] %s (%s)", index + 1, len(model_names), name, device_assignments[name])
+            LOGGER.info("  [%d/%d] %s started (%s)", index + 1, len(model_names), name, device_assignments[name])
             results[name] = _run_detector(name, config, cases, device_assignments[name])
         return results
 
@@ -983,7 +984,7 @@ def _run_detectors(
     futures = {}
     manager = None
     cuda_devices = sorted({device_assignments[name] for name in gpu_models})
-    logging.info(
+    LOGGER.info(
         "  Parallel fan-out: %d GPU model(s) over %s + %d CPU model(s) in a CPU worker",
         len(gpu_models),
         cuda_devices,
@@ -1002,20 +1003,27 @@ def _run_detectors(
         )
         executors.append(gpu_executor)
         for name in gpu_models:
+            LOGGER.info("Detector %s submitted (%s)", name, device_assignments[name])
             futures[gpu_executor.submit(_run_detector_worker_bound, name, str(cases_path), config)] = name
 
         if cpu_models:
             cpu_executor = ProcessPoolExecutor(max_workers=1, mp_context=spawn)
             executors.append(cpu_executor)
             for name in cpu_models:
+                LOGGER.info("Detector %s submitted (cpu)", name)
                 futures[cpu_executor.submit(_run_detector_worker, name, str(cases_path), config, "cpu")] = name
 
         completed = 0
         for future in as_completed(futures):
-            name, summary = future.result()
+            expected_name = futures[future]
+            try:
+                name, summary = future.result()
+            except BaseException:
+                LOGGER.exception("Detector %s failed", expected_name)
+                raise
             results[name] = summary
             completed += 1
-            logging.info("  ✓ [%d/%d] %s finished", completed, len(futures), name)
+            LOGGER.info("  [%d/%d] %s finished", completed, len(futures), name)
     finally:
         for executor in executors:
             executor.shutdown(wait=True)
@@ -1131,7 +1139,7 @@ def _build_synthetic_ensemble(
     cases: list[AnomalyCase],
     detector_results: dict[str, dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Rank on selection data and fuse each point with ranked score backfill."""
+    """Rank on selection data and mean station-normalized scores pointwise."""
     ensemble_results = []
     for index, case in enumerate(cases):
         lengths = _case_segment_lengths(case)
@@ -1140,14 +1148,11 @@ def _build_synthetic_ensemble(
             name: _split_segments(result["per_case"][index]["scores"], lengths)
             for name, result in detector_results.items()
         }
-        fused_by_segment: list[np.ndarray] = []
-        support_by_segment: list[np.ndarray] = []
-        selected_by_segment: list[list[str]] = []
         segment_rankings: list[dict[str, float]] = []
-        for segment_index, labels in enumerate(labels_by_segment):
-            # Ranking + weights come only from the selection injection. Long
+        for segment_index, _labels in enumerate(labels_by_segment):
+            # Ranking comes only from the selection injection. Long
             # segments have local scores; short segments inherit each model's
-            # context-regime selection score, matching inject-vote's policy.
+            # context-regime selection score, matching the inject-* policy.
             ranking = {
                 name: float(
                     result["per_case"][index]["vus_pr_select_by_segment"][segment_index]
@@ -1155,30 +1160,25 @@ def _build_synthetic_ensemble(
                 for name, result in detector_results.items()
             }
             segment_rankings.append(ranking)
-            ordered = rank_top_k(ranking, len(ranking))
-            if ordered:
-                fused, supported, used = ranked_pointwise_vote(
-                    {
-                        name: scores_by_model[name][segment_index]
-                        for name in ordered
-                    },
-                    ordered,
-                    top_k=config.ensemble_top_k,
-                    threshold_k=config.threshold_k,
-                )
-            else:
-                fused = np.zeros(len(labels), dtype=np.float32)
-                supported = np.zeros(len(labels), dtype=bool)
-                used = []
-            fused_by_segment.append(fused)
-            support_by_segment.append(supported)
-            selected_by_segment.append(used)
+
+        fused_by_segment, support_by_segment, selected_by_segment = (
+            ranked_pointwise_minmax_mean(
+                scores_by_model,
+                segment_rankings,
+                lengths,
+                top_k=config.ensemble_top_k,
+                min_scores=2,
+            )
+        )
 
         score_summary = _synthetic_score_summary(
             labels_by_segment,
             fused_by_segment,
             support_by_segment,
-            prediction_masks_by_segment=[scores.astype(bool) for scores in fused_by_segment],
+            prediction_masks_by_segment=[
+                detect_mask(scores, config.threshold_k)
+                for scores in fused_by_segment
+            ],
         )
 
         selected_models = sorted(
@@ -1220,7 +1220,7 @@ def _build_synthetic_ensemble(
                     "selected_models": selected_models,
                     "selected_models_by_segment": selected_by_segment,
                     "rankings_by_segment": segment_rankings,
-                    "method": "VOTE",
+                    "method": "MEAN_TOP_K_MINMAX",
                 },
             }
         )
@@ -1314,14 +1314,16 @@ def _resolve_output_dir(config: AnomalyBenchmarkConfig) -> Path:
     )
 
 
-def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, object]:
+def _run_benchmark(
+    config: AnomalyBenchmarkConfig,
+    output_dir: Path,
+) -> dict[str, object]:
     """Run the full benchmark and persist ``results.json`` + ``scores.npz``.
 
     Plots are intentionally *not* rendered here; use the separate
     ``airquality.visualizations.anomaly_benchmark`` script on the produced
     ``results.json`` to generate them.
     """
-    config = config or AnomalyBenchmarkConfig()
     mode = normalize_mode(config.mode)
     model_names = _expand_model_names(
         resolve_model_names(config.models), config.sub_pca_components
@@ -1333,16 +1335,15 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
             f"'{config.raw_base_dir}' and min_series_points={config.min_series_points}."
         )
 
-    output_dir = _resolve_output_dir(config)
     device_assignments = resolve_benchmark_devices(model_names, config.device)
-    logging.info(
+    LOGGER.info(
         "Running %d detector(s) on %d case(s)  [mode=%s, device request=%s]",
         len(model_names),
         len(cases),
         mode,
         normalize_device_request(config.device),
     )
-    logging.info("  Device plan: %s", {name: device_assignments[name] for name in model_names})
+    LOGGER.info("Device plan: %s", {name: device_assignments[name] for name in model_names})
 
     # Persist cases once so parallel workers load them instead of rebuilding.
     cases_path = output_dir / "_cases.pkl"
@@ -1358,10 +1359,13 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
     if mode == "synthetic":
         for name, result in detector_results.items():
             model_summaries[name] = _summarize(result["per_case"])
-        logging.info("Building ensemble (top-%d by selection VUS-PR)…", config.ensemble_top_k)
+        LOGGER.info(
+            "Building ensemble (mean top-%d min-max by selection VUS-PR)",
+            config.ensemble_top_k,
+        )
         ensemble_results = _build_synthetic_ensemble(config, cases, detector_results)
         model_summaries[ENSEMBLE_NAME] = _summarize(ensemble_results)
-        logging.info("  ✓ Ensemble  VUS-PR=%.3f", model_summaries[ENSEMBLE_NAME]["macro_metrics"]["vus_pr"])
+        LOGGER.info("Ensemble built: VUS-PR=%.3f", model_summaries[ENSEMBLE_NAME]["macro_metrics"]["vus_pr"])
         ordered_names.append(ENSEMBLE_NAME)
         kept_models, discarded_models = list(model_names), []
         selection_by_series = None
@@ -1391,16 +1395,16 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
                 "selection_counts": counts,
             }
         if kept_models:
-            logging.info("Building per-series ensembles from locally surviving detectors…")
+            LOGGER.info("Building per-series ensembles from locally surviving detectors")
             ensemble_results = _build_unlabeled_ensemble(
                 config, cases, detector_results, selection_by_series
             )
             model_summaries[ENSEMBLE_NAME] = {**_summarize(ensemble_results), "discarded": False}
             macro_rate = model_summaries[ENSEMBLE_NAME]["macro_metrics"]["detection_rate"]
-            logging.info("  ✓ Ensemble  detection_rate=%.2f%%", 100.0 * macro_rate)
+            LOGGER.info("Ensemble built: detection_rate=%.2f%%", 100.0 * macro_rate)
             ordered_names.append(ENSEMBLE_NAME)
         else:
-            logging.warning(
+            LOGGER.warning(
                 "No series has a detector under max_detection_rate=%.2f%%; no ensemble built.",
                 100.0 * config.max_detection_rate,
             )
@@ -1438,7 +1442,9 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
         "kept_models": kept_models,
         "discarded_models": discarded_models,
         "selection_scope": (
-            "series" if mode == "unlabeled" else "synthetic_ranked_pointwise"
+            "series"
+            if mode == "unlabeled"
+            else "synthetic_ranked_pointwise_mean_minmax"
         ),
         "selection_by_series": selection_by_series,
         "series_names": sorted({case.name for case in cases}),
@@ -1454,8 +1460,27 @@ def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, obj
     with (output_dir / "results.json").open("w", encoding="utf-8") as handle:
         json.dump(_json_safe(summary), handle, indent=2, default=str, allow_nan=False)
 
+    LOGGER.info("Anomaly benchmark artifacts saved under %s", output_dir)
     summary["output_dir"] = str(output_dir)
+    summary["log_path"] = str(output_dir / "benchmark.log")
     return summary
+
+
+def run_benchmark(config: AnomalyBenchmarkConfig | None = None) -> dict[str, object]:
+    """Run the anomaly benchmark with a persistent log in its run directory."""
+    config = config or AnomalyBenchmarkConfig()
+    output_dir = _resolve_output_dir(config)
+    with RunLogging(output_dir, "anomaly_benchmark"):
+        LOGGER.info(
+            "Configuration: mode=%s pollutant=%s models=%s seed=%d eval_seed=%d device=%s",
+            config.mode,
+            config.pollutant,
+            config.models if config.models is not None else "all",
+            config.seed,
+            config.eval_seed,
+            config.device,
+        )
+        return _run_benchmark(config, output_dir)
 
 
 def recompute_ensemble(
@@ -1470,8 +1495,9 @@ def recompute_ensemble(
     ensemble according to the run's mode:
 
     - ``synthetic``: use each long segment's saved local selection VUS-PR,
-      give short segments the ranking from their context regime, backfill unavailable
-      detectors point by point, apply the coverage adjustment,
+      give short segments the ranking from their context regime, min-max
+      normalize each detector over the station, average with pointwise backfill,
+      apply the coverage adjustment,
       and return macro VUS-PR per detector plus ensemble.
     - ``unlabeled``: re-apply the detection-rate filter (``max_detection_rate``
       defaults to the saved value), combine survivors by majority vote; returns
@@ -1506,37 +1532,28 @@ def recompute_ensemble(
                 name: _split_segments(scores_npz[f"{name}__case{i}"], lengths)
                 for name in model_names
             }
-            fused_by_segment = []
-            support_by_segment = []
-            for segment_index, labels in enumerate(labels_by_segment):
+            segment_rankings = []
+            for segment_index, _labels in enumerate(labels_by_segment):
                 ranking = {
                     name: saved["models"][name]["series_results"][i][
                         "vus_pr_select_by_segment"
                     ][segment_index]
                     for name in model_names
                 }
-                ordered = rank_top_k(ranking, len(ranking))
-                if ordered:
-                    fused, supported, _ = ranked_pointwise_vote(
-                        {
-                            name: scores_by_model[name][segment_index]
-                            for name in ordered
-                        },
-                        ordered,
-                        top_k=top_k,
-                        threshold_k=threshold_k,
-                    )
-                else:
-                    fused = np.zeros(len(labels), dtype=np.float32)
-                    supported = np.zeros(len(labels), dtype=bool)
-                fused_by_segment.append(fused)
-                support_by_segment.append(supported)
+                segment_rankings.append(ranking)
+            fused_by_segment, support_by_segment, _ = ranked_pointwise_minmax_mean(
+                scores_by_model,
+                segment_rankings,
+                lengths,
+                top_k=top_k,
+                min_scores=2,
+            )
             score_summary = _synthetic_score_summary(
                 labels_by_segment,
                 fused_by_segment,
                 support_by_segment,
                 prediction_masks_by_segment=[
-                    scores.astype(bool) for scores in fused_by_segment
+                    detect_mask(scores, threshold_k) for scores in fused_by_segment
                 ],
             )
             ensemble_vus_pr_list.append(score_summary["metrics"]["vus_pr"])
@@ -1545,7 +1562,7 @@ def recompute_ensemble(
             name: saved["models"][name]["macro_metrics"]["vus_pr"]
             for name in model_names
         }
-        out[f"Ensemble(method=VOTE,top_k={top_k})"] = _finite_mean(
+        out[f"Ensemble(method=MEAN_MINMAX,top_k={top_k})"] = _finite_mean(
             ensemble_vus_pr_list
         )
         return out

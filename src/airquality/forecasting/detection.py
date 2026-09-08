@@ -19,6 +19,9 @@ anomaly mask, so strategies share detector fits instead of refitting per arm:
   locally (short blocks inherit the finite mean from their TSPulse context
   regime), backfill non-finite scores point by point, and flag points where the
   configured quorum agrees.
+- ``inject-soft``: use the same local ranking and pointwise backfill, min-max
+  normalize each detector over the station, average the first three finite
+  scores, and MAD-threshold that fused score per contiguous segment.
 
 The injected copies are used ONLY to select detectors; the final mask always
 comes from scores on the real (uninjected) series.
@@ -46,6 +49,7 @@ from airquality.anomaly.anomalies import (
 )
 from airquality.anomaly.ensemble import (
     rank_top_k,
+    ranked_pointwise_minmax_mean,
     ranked_pointwise_vote,
     ranking_source_indices,
     uses_native_context,
@@ -91,7 +95,13 @@ DEFAULT_VOTE_MIN_VOTES = 2
 STRATEGY_UNLABELED = "unlabeled"
 STRATEGY_INJECT_BEST = "inject-best"
 STRATEGY_INJECT_VOTE = "inject-vote"
-DETECTION_STRATEGIES = (STRATEGY_UNLABELED, STRATEGY_INJECT_BEST, STRATEGY_INJECT_VOTE)
+STRATEGY_INJECT_SOFT = "inject-soft"
+DETECTION_STRATEGIES = (
+    STRATEGY_UNLABELED,
+    STRATEGY_INJECT_BEST,
+    STRATEGY_INJECT_VOTE,
+    STRATEGY_INJECT_SOFT,
+)
 
 #: Mask post-processing hook: ``(series, mask) -> mask`` over the same index.
 MaskTransform = Callable[[pd.Series, pd.Series], pd.Series]
@@ -101,7 +111,7 @@ MaskTransform = Callable[[pd.Series, pd.Series], pd.Series]
 class DetectionResult:
     """Outcome of one detection strategy on one series."""
 
-    strategy: str  # strategy spec name ("unlabeled", "inject-best", "inject-vote")
+    strategy: str  # strategy spec name from DETECTION_STRATEGIES
     detectors: list[str]  # detectors whose scores built the final mask
     discarded: list[str]  # scored but excluded (over the rate budget / below top-k)
     rates: dict[str, float]  # per-detector detection rate on this series
@@ -739,6 +749,83 @@ class InjectionTopKDetection:
         )
 
 
+@dataclass(frozen=True)
+class InjectionSoftDetection:
+    """Top-three injection-ranked detector scores fused before thresholding."""
+
+    name: str = STRATEGY_INJECT_SOFT
+    top_k: int = DEFAULT_VOTE_TOP_K
+    min_scores: int = DEFAULT_VOTE_MIN_VOTES
+    threshold_k: float = DEFAULT_THRESHOLD_K
+
+    def __post_init__(self) -> None:
+        if self.top_k < 1 or not 1 <= self.min_scores <= self.top_k:
+            raise ValueError("inject-soft: min_scores debe estar entre 1 y top_k")
+
+    def detect(self, context: SeriesDetectionContext) -> DetectionResult:
+        if not context.segments:
+            return _empty_result(self.name, context, self.threshold_k)
+
+        ranking = context.selection_ranking()
+        if not ranking:
+            return _empty_result(self.name, context, self.threshold_k)
+        segment_rankings = (
+            context.selection_rankings()
+            if hasattr(context, "selection_rankings")
+            else [ranking] * len(context.segments)
+        )
+        scores_by_model = context.real_scores(list(ranking))
+        fused_by_segment, support_by_segment, selected_by_segment = (
+            ranked_pointwise_minmax_mean(
+                scores_by_model,
+                segment_rankings,
+                [len(segment) for segment in context.segments],
+                top_k=self.top_k,
+                min_scores=self.min_scores,
+            )
+        )
+
+        mask = context.empty_mask()
+        scored_mask = context.empty_mask()
+        n_flagged = 0
+        for segment, fused, supported in zip(
+            context.segments,
+            fused_by_segment,
+            support_by_segment,
+            strict=True,
+        ):
+            flagged = supported & detect_mask(fused, self.threshold_k)
+            mask.loc[segment.index] = flagged
+            scored_mask.loc[segment.index] = supported
+            n_flagged += int(flagged.sum())
+
+        selected_set = {
+            name for selected in selected_by_segment for name in selected
+        }
+        selected_all = [
+            name for name in rank_top_k(ranking, len(ranking)) if name in selected_set
+        ]
+        rates = {
+            name: _detector_rate(scores_by_model[name], self.threshold_k)
+            for name in selected_all
+        }
+        n_scored = int(scored_mask.sum())
+        return DetectionResult(
+            strategy=self.name,
+            detectors=selected_all,
+            discarded=sorted(set(ranking) - selected_set),
+            rates=rates,
+            threshold_k=self.threshold_k,
+            mask=mask,
+            ranking=dict(ranking),
+            scored_mask=scored_mask,
+            selected_by_segment=selected_by_segment,
+            n_flagged=n_flagged,
+            n_unscored=context.total_observed() - n_scored,
+            detection_rate=n_flagged / n_scored if n_scored else 0.0,
+        )
+
+
 def build_detection_strategy(
     spec: str,
     *,
@@ -765,6 +852,8 @@ def build_detection_strategy(
             min_votes=vote_min_votes,
             threshold_k=threshold_k,
         )
+    if normalized == STRATEGY_INJECT_SOFT:
+        return InjectionSoftDetection(threshold_k=threshold_k)
     raise ValueError(
         f"Estrategia de deteccion desconocida: '{spec}'. Usa una de {DETECTION_STRATEGIES}"
     )
@@ -827,12 +916,14 @@ __all__ = [
     "DETECTION_STRATEGIES",
     "MIN_SEGMENT_POINTS",
     "STRATEGY_INJECT_BEST",
+    "STRATEGY_INJECT_SOFT",
     "STRATEGY_INJECT_VOTE",
     "STRATEGY_UNLABELED",
     "ConsensusDetection",
     "DetectionResult",
     "DetectionStrategy",
     "InjectionTopKDetection",
+    "InjectionSoftDetection",
     "MaskTransform",
     "SeriesDetectionContext",
     "apply_mask_transforms",

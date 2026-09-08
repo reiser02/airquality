@@ -16,9 +16,9 @@ models on each arm over the **same timestamps** using the configured horizon and
 
 Detection strategies (:mod:`airquality.forecasting.detection`): ``unlabeled``
 (rate-filtered consensus, the production method), ``inject-best`` (single best
-detector by VUS-PR on a synthetic-injection copy) and ``inject-vote`` (top-k
-by injection VUS-PR with a configurable quorum, defaulting to 2-of-3). Detector
-fits are shared across
+detector by VUS-PR on a synthetic-injection copy), ``inject-vote`` (top-k hard
+vote, defaulting to 2-of-3), and ``inject-soft`` (mean of station-min-max
+normalized top-three scores, followed by MAD thresholding). Detector fits are shared across
 strategies through a per-series :class:`~airquality.forecasting.detection.SeriesDetectionContext`,
 and every strategy's mask can be post-processed through ``mask_transforms``
 hooks before removal.
@@ -31,8 +31,8 @@ its own source series. Removal and imputation still touch only training.
 Foundation models run on the two raw-source views in that common time window. A
 separate paired experiment injects one synthetic anomaly type into copies of
 clean test contexts and compares ``clean_reference``, ``corrupted`` and
-``inject-vote``; imputation is only a compatibility fallback after a NaN causes
-foundation prediction to fail.
+``inject-vote``; the same gap-size imputation policy is applied only after a NaN
+causes foundation prediction to fail.
 
 Detections and backtests are cached on disk (:mod:`airquality.forecasting.cache`,
 ``[forecasting] use_cache`` / ``cache_dir``): an interrupted run resumes where
@@ -82,7 +82,6 @@ from airquality.forecasting.backtest import (
 from airquality.forecasting.cache import (
     CACHE_VERSION,
     BenchmarkCache,
-    artifact_fingerprint,
     effective_config,
     series_fingerprint,
     transform_fingerprints,
@@ -107,11 +106,12 @@ from airquality.forecasting.detection import (
     normalize_injection_variant,
 )
 from airquality.forecasting.fill import (
-    DEFAULT_MAX_GAP_SIZE,
     _repo_root,
-    _resolve_tspulse_model_path,
     build_imputer,
-    impute_series,
+    imputation_policy_cache_identity,
+    impute_series_by_gap,
+    impute_series_by_gap_result,
+    parse_imputation_gap_rules,
 )
 from airquality.forecasting.foundation_preprocessing import (
     build_preprocessing_contexts,
@@ -127,17 +127,12 @@ from airquality.forecasting.progress import (
     configure_worker_progress_logging,
     get_progress_logger,
 )
-from airquality.imputation.registry import (
-    DARTS_GLOBAL,
-    TSPULSE,
-    resolve_imputer_family,
-)
 from airquality.paths import create_run_dir
 
 RAW_ARM = "raw"
 RAW_FROZEN_ARM = "raw+frozen"
 RAW_SOURCE_ARMS = (RAW_ARM, RAW_FROZEN_ARM)
-DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote")
+DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote", "inject-soft")
 IMPUTATION_CHOICES = ("both", "impute", "none")
 BACKTEST_MAX_ATTEMPTS = 2
 #: Public forecasting metrics. ``mase`` and ``rmsse`` use the primary raw
@@ -152,7 +147,7 @@ _ACTIVE_DEVICE_QUEUE: Any | None = None
 RESULT_COLUMNS = (
     "horizon", "forecast_stride", "validation_len",
     "validation_stride", "series", "arm", "strategy", "imputed",
-    "imputation_model", "detectors", "n_anomalies", "n_anomalies_full",
+    "imputation_policy", "detectors", "n_anomalies", "n_anomalies_full",
     "detection_scope", "split_basis", "split_n_flagged", "split_n_unscored",
     "test_context_start", "test_target_start", "test_target_end",
     "test_target_hours", "model",
@@ -173,7 +168,8 @@ FOUNDATION_PREPROCESSING_COLUMNS = (
     "series", "horizon", "model", "case_id", "anomaly_type",
     "test_seed", "test_target_start", "condition", "detectors", "n_injected",
     "n_context_flagged", "n_injected_detected", "n_context_nan",
-    "imputation_applied", "imputation_model", "n_imputed", "mase", "rmsse",
+    "imputation_applied", "imputation_policy", "fallback_used",
+    "effective_imputer", "n_imputed", "mase", "rmsse",
     "model_load_seconds", "inference_seconds",
     "n_test_predictions", "failure_reason",
 )
@@ -670,12 +666,9 @@ def _run_benchmark_from_config(
     max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
     carla_stride = cfg_get_int("forecasting", "carla_stride", 1)
     detectors = list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
-    imputation_model = cfg_get_str("forecasting", "imputation_model", "TSPulse")
-    max_imputation_gap = cfg_get_int(
-        "forecasting", "max_imputation_gap", DEFAULT_MAX_GAP_SIZE
+    imputation_policy = parse_imputation_gap_rules(
+        cfg_get_str("forecasting", "imputation_gap_rules", "")
     )
-    if max_imputation_gap < 1:
-        raise ValueError("max_imputation_gap debe ser positivo")
     forecast_models = list(
         cfg_get_csv_list("forecasting", "forecast_models", ("NLinear", "TiDE"))
     )
@@ -807,15 +800,14 @@ def _run_benchmark_from_config(
     # Resolve "all" against the registry NOW so cache keys list concrete names
     # (registry availability, e.g. optional TSPulse, then invalidates entries).
     resolved_detectors = resolve_model_names(detectors)
-    use_scaler = imputation_model not in ("interp", "LinearInterp")
-    imputer_ref: list[Any] = []  # built lazily: only when an imputed arm misses the cache
+    imputer_ref: dict[str, Any] = {}  # built lazily by model on an imputation cache miss
 
-    def get_imputer() -> Any:
-        if not imputer_ref:
-            imputer_ref.append(
-                build_imputer(imputation_model, freq=freq, size_k=imputation_size_k)
+    def get_imputer(model_name: str) -> Any:
+        if model_name not in imputer_ref:
+            imputer_ref[model_name] = build_imputer(
+                model_name, freq=freq, size_k=imputation_size_k
             )
-        return imputer_ref[0]
+        return imputer_ref[model_name]
 
     strategy_by_spec = {strategy.name: strategy for strategy in strategies}
     transform_names = transform_fingerprints(mask_transforms)
@@ -865,46 +857,26 @@ def _run_benchmark_from_config(
             "test_seed": foundation_test_seed,
             "repeats": foundation_test_repeats,
             "anomaly_policy": "single-type-per-case-v1",
-            "imputation_policy": "fallback-after-nan-prediction-failure-v1",
+            "imputation_policy": "gap-rules-after-nan-prediction-failure-v2",
         }
     )
 
-    imputer_identity: dict[str, Any] | None = None
-    if any(arm.impute for arm in arms) or foundation_test_enabled:
-        family = resolve_imputer_family(imputation_model)
-        artifacts: dict[str, str | None] = {}
-        imputer_config: dict[str, Any] = {
-            "model": imputation_model,
-            "family": family,
-            "size_k": imputation_size_k,
-            "max_gap_size": max_imputation_gap,
-        }
-        if family == DARTS_GLOBAL:
-            weights = _repo_root() / "models" / f"{imputation_model}_k{imputation_size_k}.pt"
-            artifacts = {
-                "model": artifact_fingerprint(weights),
-                "checkpoint": artifact_fingerprint(Path(f"{weights}.ckpt")),
-            }
-        elif family == TSPULSE:
-            model_path = _resolve_tspulse_model_path(imputation_model)
-            model_id = cfg_get_str(
-                "tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"
-            )
-            imputer_config["tspulse"] = effective_config(
-                {
-                    "model_path": model_path,
-                    "model_id": model_id,
-                    "revision": cfg_get_str(
-                        "tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"
-                    ),
-                    "context_length": cfg_get_int("tspulse", "context_length", 512),
-                    "device": cfg_get_str("tspulse", "device", "cpu"),
-                }
-            )
-            local_source = Path(model_path or model_id).expanduser()
-            if local_source.exists():
-                artifacts["model"] = artifact_fingerprint(local_source)
-        imputer_identity = {"config": imputer_config, "artifacts": artifacts}
+    imputer_identity = (
+        imputation_policy_cache_identity(
+            imputation_policy,
+            size_k=imputation_size_k,
+        )
+        if any(arm.impute for arm in arms)
+        else None
+    )
+    foundation_imputer_identity = (
+        imputation_policy_cache_identity(
+            imputation_policy,
+            size_k=imputation_size_k,
+        )
+        if foundation_test_enabled
+        else None
+    )
 
     global _ACTIVE_DEVICE_QUEUE, _ACTIVE_GPU_EXECUTOR, _ACTIVE_PROGRESS
     output_dir = _build_output_dir()
@@ -1176,12 +1148,11 @@ def _run_benchmark_from_config(
                 else:
                     base = remove_anomalies(train_raw, detections[arm.strategy])
                 train_by_arm[arm.name] = (
-                    impute_series(
+                    impute_series_by_gap(
                         base,
-                        get_imputer(),
+                        imputation_policy,
+                        get_imputer,
                         freq=freq,
-                        use_scaler=use_scaler,
-                        max_gap_size=max_imputation_gap,
                     )
                     if arm.impute
                     else base
@@ -1285,7 +1256,9 @@ def _run_benchmark_from_config(
                 "arm": arm.name,
                 "strategy": arm.strategy or "none",
                 "imputed": arm.impute,
-                "imputation_model": imputation_model if arm.impute else "none",
+                "imputation_policy": (
+                    imputation_policy.spec if arm.impute else "none"
+                ),
                 "detectors": ",".join(detection.detectors) if detection else "",
                 "n_anomalies": n_train_anomalies,
                 "n_anomalies_full": detection.n_flagged if detection else 0,
@@ -1323,7 +1296,9 @@ def _run_benchmark_from_config(
                     "arm": arm.name,
                     "strategy": arm_strategy_key,
                     "impute": arm.impute,
-                    "imputation_model": imputation_model if arm.impute else None,
+                    "imputation_policy": (
+                        imputation_policy.spec if arm.impute else None
+                    ),
                     "model": model_name,
                     "model_config": training_model_config,
                     "forecast_model": effective_config(
@@ -1608,7 +1583,7 @@ def _run_benchmark_from_config(
                                 "train_fp": train_fp,
                                 "context_fp": series_fingerprint(context),
                                 "target_fp": series_fingerprint(case.target),
-                                "compatibility_imputer": imputer_identity,
+                                "imputation_policy": foundation_imputer_identity,
                             }
                             result = cache.get(
                                 "foundation_preprocessing", forecast_key
@@ -1664,6 +1639,8 @@ def _run_benchmark_from_config(
                                     "inference_seconds": float("nan"),
                                     "n_test_predictions": 0,
                                     "imputation_applied": False,
+                                    "fallback_used": False,
+                                    "effective_imputer": "none",
                                     "n_imputed": 0,
                                     "failure_reason": prepare_error or "",
                                 }
@@ -1688,12 +1665,26 @@ def _run_benchmark_from_config(
                                         if context.isna().any():
                                             result["imputation_applied"] = True
                                             try:
-                                                filled = impute_series(
+                                                imputation_result = impute_series_by_gap_result(
                                                     context,
-                                                    get_imputer(),
+                                                    imputation_policy,
+                                                    get_imputer,
                                                     freq=freq,
-                                                    use_scaler=use_scaler,
-                                                    max_gap_size=len(context),
+                                                )
+                                                filled = imputation_result.series
+                                                effective_imputers = tuple(
+                                                    dict.fromkeys(
+                                                        outcome.effective_imputer
+                                                        for outcome in imputation_result.outcomes
+                                                        if outcome.effective_imputer != "none"
+                                                    )
+                                                )
+                                                result["fallback_used"] = any(
+                                                    outcome.fallback_used
+                                                    for outcome in imputation_result.outcomes
+                                                )
+                                                result["effective_imputer"] = (
+                                                    ";".join(effective_imputers) or "none"
                                                 )
                                                 result["n_imputed"] = int(
                                                     (
@@ -1754,10 +1745,16 @@ def _run_benchmark_from_config(
                                     "imputation_applied": bool(
                                         result.get("imputation_applied", False)
                                     ),
-                                    "imputation_model": (
-                                        imputation_model
+                                    "imputation_policy": (
+                                        imputation_policy.spec
                                         if result.get("imputation_applied", False)
                                         else "none"
+                                    ),
+                                    "fallback_used": bool(
+                                        result.get("fallback_used", False)
+                                    ),
+                                    "effective_imputer": result.get(
+                                        "effective_imputer", "none"
                                     ),
                                     "n_imputed": int(result.get("n_imputed", 0)),
                                     "mase": result["mase"],
@@ -1893,8 +1890,7 @@ def _run_benchmark_from_config(
         "config": {
             **cache_config,
             "imputation": imputation,
-            "imputation_model": imputation_model,
-            "max_imputation_gap": max_imputation_gap,
+            "imputation_gap_rules": imputation_policy.spec,
             "mask_transforms": transform_names,
         },
         "models": [

@@ -134,6 +134,7 @@ def test_effective_config_and_key_exclude_runtime_device(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     frozen_delta = {"value": 0.0}
+    gap_rules = {"value": "1-5=interp"}
 
     def fake_loader(**kwargs):
         s = _seasonal_series(n=900, name="ST0", seed=0)
@@ -155,14 +156,21 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     }
     str_map = {
         ("forecasting", "imputation"): "impute",
-        ("forecasting", "imputation_model"): "interp",
         ("forecasting", "cache_dir"): str(tmp_path / "cache"),
     }
 
     monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(cp, "cfg_get_csv_list", lambda s, o, d, *, cfg=None: csv_map.get((s, o), d))
     monkeypatch.setattr(cp, "cfg_get_int", lambda s, o, d, cfg=None: int_map.get((s, o), d))
-    monkeypatch.setattr(cp, "cfg_get_str", lambda s, o, d, cfg=None: str_map.get((s, o), d))
+    monkeypatch.setattr(
+        cp,
+        "cfg_get_str",
+        lambda s, o, d, cfg=None: (
+            gap_rules["value"]
+            if (s, o) == ("forecasting", "imputation_gap_rules")
+            else str_map.get((s, o), d)
+        ),
+    )
     monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path / "run1")
     monkeypatch.setattr(cp, "resolve_forecasting_devices", lambda _request: ("cpu",))
     (tmp_path / "run1").mkdir()
@@ -206,4 +214,14 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     cp.run_benchmark_from_config()
 
     assert calls["backtest"] == 1  # only raw+frozen, one forecast protocol
+    assert calls["detect"] == 0
+
+    calls["backtest"] = 0
+    calls["detect"] = 0
+    gap_rules["value"] = "1-10=interp"
+    monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path / "run4")
+    (tmp_path / "run4").mkdir()
+    cp.run_benchmark_from_config()
+
+    assert calls["backtest"] == 1  # only the imputed arm changed
     assert calls["detect"] == 0

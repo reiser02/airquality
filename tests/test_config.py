@@ -6,6 +6,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 from airquality import config
+from airquality.forecasting.fill import parse_imputation_gap_rules
 
 
 def test_candidate_config_paths_prioritize_repo_config() -> None:
@@ -52,8 +53,12 @@ def test_repository_config_separates_explicit_model_catalogs() -> None:
     assert cfg.getint("anomaly", "min_series_points") == 8
     assert cfg.get("anomaly", "sub_pca_components") == "all"
     assert not cfg.has_option("anomaly", "raw_base_dir")
-    assert cfg.get("forecasting", "imputation_model") == "TSPulse"
-    assert cfg.getint("forecasting", "max_imputation_gap") == 5
+    assert not cfg.has_option("forecasting", "imputation_model")
+    assert not cfg.has_option("forecasting", "max_imputation_gap")
+    policy = parse_imputation_gap_rules(
+        cfg.get("forecasting", "imputation_gap_rules")
+    )
+    assert policy.rules
     assert cfg.get("forecasting", "pollutant") == "NO2"
     assert cfg.get("forecasting", "device") == "multi-gpu"
     assert cfg.getint("forecasting", "horizon") == 12

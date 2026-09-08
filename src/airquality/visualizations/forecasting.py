@@ -68,10 +68,11 @@ ARM_FAMILY_COLORS = {
     "unlabeled": "#3d7ab5",
     "inject-best": "#cf6f1e",
     "inject-vote": "#9b59b6",
+    "inject-soft": "#5b8c5a",
 }
 #: Assigned in order to strategy families beyond the known ones (never cycled
 #: within one run: each new family takes the next free slot).
-EXTRA_FAMILY_COLORS = ("#5b8c5a", "#cf6ba9", "#8c6d4b", "#27313a")
+EXTRA_FAMILY_COLORS = ("#cf6ba9", "#8c6d4b", "#27313a")
 
 #: Diverging map for "% improvement vs raw": blue = better, red = worse,
 #: neutral cream midpoint (never a hue at the center).
