@@ -34,9 +34,11 @@ def test_main_trains_from_config(monkeypatch) -> None:
         lambda: {"TiDE": object(), "NHiTS": object()},
     )
 
+    series_dfs = [pd.DataFrame({"S": [1.0]})]
+
     def fake_load_and_normalize_series(**kwargs):
         calls["series_kwargs"] = kwargs
-        return ["series"]
+        return series_dfs
 
     monkeypatch.setattr(
         "airquality.train.load_and_normalize_series",
@@ -53,11 +55,11 @@ def test_main_trains_from_config(monkeypatch) -> None:
         }
     )
     monkeypatch.setattr(
-        "airquality.train.select_retrospective_holdouts",
+        "airquality.train.select_retrospective_holdouts_with_exclusions",
         lambda series_dfs, **kwargs: calls.setdefault(
             "holdout_kwargs", {"series_dfs": series_dfs, **kwargs}
         )
-        and (holdouts, holdout_metadata),
+        and (holdouts, holdout_metadata, pd.DataFrame()),
     )
     monkeypatch.setattr(
         "airquality.train.build_holdout_manifest",
@@ -93,14 +95,14 @@ def test_main_trains_from_config(monkeypatch) -> None:
     main()
 
     assert calls["series_kwargs"] == {"freq": "h"}
-    assert calls["holdout_kwargs"] == {
-        "series_dfs": ["series"],
+    assert calls["holdout_kwargs"]["series_dfs"] is series_dfs
+    assert {key: value for key, value in calls["holdout_kwargs"].items() if key != "series_dfs"} == {
         "target_points": 192,
         "context_points": 72,
         "min_train_points": 125,
     }
     assert calls["bundle_kwargs"] == {
-        "series_dfs": ["series"],
+        "series_dfs": calls["holdout_kwargs"]["series_dfs"],
         "holdouts_by_series": holdouts,
         "val_size": 48,
         "min_train_len": 77,

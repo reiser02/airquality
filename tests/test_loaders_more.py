@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from airquality.data.loaders import _load_json_df, load_raw_5m, load_to_df
 
@@ -12,6 +13,19 @@ def _write_5m_csv(path, rows: list[tuple[str, float]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "fecha,value\n" + "".join(f"{ts},{value}\n" for ts, value in rows)
     path.write_text(body, encoding="utf-8")
+
+
+def _write_upct_csv(path, pollutant: str) -> None:
+    """Write a minimal UPCT export with its metadata row and decimal commas."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Data Validated + Temporary;\n"
+        f'Device;Datetime;"{pollutant} GCc (ug/m3)";"Flag {pollutant} GCc";'
+        f'"Description {pollutant} GCc";\n'
+        f'"UPCT CAMPUS PASEO";2024-01-01 00:01:44;18,31;T;"";\n'
+        f'"UPCT CAMPUS PASEO";2024-01-01 00:07:04;16,43;T;"";\n',
+        encoding="utf-8",
+    )
 
 
 def test_load_json_df_builds_hourly_index_from_rows_and_cols(tmp_path) -> None:
@@ -76,6 +90,26 @@ def test_load_raw_5m_filters_by_pollutant(tmp_path) -> None:
 
     assert len(out) == 1
     assert out[0][0] == "StationA"
+
+
+@pytest.mark.parametrize("pollutant", ["NO2", "O3"])
+def test_load_raw_5m_normalizes_upct_name_column_and_grid(
+    tmp_path, pollutant: str
+) -> None:
+    base = tmp_path / "raw"
+    path = base / "UPCT" / f"UPCT CAMPUS PASEO {pollutant} (ugm3).csv"
+    _write_upct_csv(path, pollutant)
+
+    out = load_raw_5m(pollutant, str(base))
+
+    assert len(out) == 1
+    series_name, df = out[0]
+    assert series_name == f"UPCT_{pollutant}"
+    assert list(df.columns) == [pollutant]
+    assert list(df.index) == list(
+        pd.DatetimeIndex(["2024-01-01 00:00:00", "2024-01-01 00:05:00"])
+    )
+    assert df.iloc[:, 0].tolist() == pytest.approx([18.31, 16.43])
 
 
 def test_load_raw_5m_skips_empty_frames(tmp_path) -> None:

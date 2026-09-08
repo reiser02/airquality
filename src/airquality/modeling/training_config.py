@@ -45,6 +45,7 @@ class BenchmarkDatasetBundle:
     all_series_unscaled: dict[str, Any] = field(default_factory=dict)
     holdout_metadata: Any = None
     holdout_manifest: dict[str, Any] = field(default_factory=dict)
+    excluded_series: Any = None
 
     def __post_init__(self) -> None:
         """Valida la coherencia columnas/series y la presencia de sus scalers."""
