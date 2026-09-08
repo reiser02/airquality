@@ -57,7 +57,8 @@ def test_load_series_list_applies_shared_preprocess(
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "airquality.imputation.tspulse_finetune.load_to_df", lambda *_args, **_kwargs: raw
+        "airquality.imputation.tspulse_finetune.load_pollutant_file",
+        lambda *_args, **_kwargs: ("Station_NO2", raw),
     )
     monkeypatch.setattr(
         "airquality.imputation.tspulse_finetune.preprocess",
@@ -78,6 +79,7 @@ def test_load_series_list_applies_shared_preprocess(
 
     assert calls["pollutant"] == "NO2"
     assert calls["frames"][0].equals(raw[["NO2"]])
+    assert list(out[0].columns) == ["Station_NO2"]
     assert out[0].iloc[:, 0].tolist() == [2.0, 3.0]
 
 
@@ -333,6 +335,7 @@ def test_run_smoke_executes_refactored_stages(
             {},
             pd.DataFrame(),
             0,
+            pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
         ),

@@ -17,12 +17,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from airquality.config import cfg_get_float, cfg_get_int, cfg_get_str
 from airquality.data.io import resolve_device
-from airquality.data.loaders import load_to_df
+from airquality.data.loaders import load_pollutant_file
 from airquality.data.preprocessing import preprocess
 from airquality.data.series import to_pd_series
 from airquality.data.holdout import (
     build_holdout_manifest,
-    select_retrospective_holdouts,
+    select_retrospective_holdouts_with_exclusions,
     write_holdout_manifest,
 )
 
@@ -143,22 +143,20 @@ def load_series_list(
     seen_names: set[str] = set()
 
     for csv_path in csv_files:
-        df = load_to_df(str(csv_path), name_from_path=False)
-        if df is None or df.empty:
+        loaded = load_pollutant_file(
+            str(csv_path),
+            pollutant,
+            target_column_index=target_column_index,
+        )
+        if loaded is None:
             continue
-
-        if target_column_index < 0 or target_column_index >= len(df.columns):
-            raise ValueError(
-                f"target_column_index={target_column_index} fuera de rango en '{csv_path}'. "
-                f"Columnas disponibles ({len(df.columns)}): {list(df.columns)}"
-            )
-        value_col = str(df.columns[int(target_column_index)])
+        name, df = loaded
+        value_col = str(df.columns[0])
         (hourly,), _ = preprocess([df[[value_col]]], pollutant)
         values = to_pd_series(hourly, freq=freq, name=value_col)
 
         # Use the canonical station identifier shared with Darts/benchmark so
         # both subsystems derive an identical holdout manifest.
-        name = csv_path.parent.name.strip()
         if name in seen_names:
             suffix = 1
             while f"{name}_{suffix}" in seen_names:
@@ -417,6 +415,7 @@ def _load_training_series_and_split(
     int,
     pd.DataFrame,
     pd.DataFrame,
+    pd.DataFrame,
 ]:
     """Load raw series, hold out the evaluation block, and build train/valid tables."""
     csv_files = discover_csv_files(
@@ -438,7 +437,7 @@ def _load_training_series_and_split(
     min_train_points = max(min_train_len, int(args.val_context_len)) + int(
         args.val_size
     )
-    holdouts, holdout_metadata = select_retrospective_holdouts(
+    holdouts, holdout_metadata, excluded_series = select_retrospective_holdouts_with_exclusions(
         series_dfs,
         target_points=args.holdout_target_points,
         context_points=args.holdout_context_points,
@@ -451,6 +450,10 @@ def _load_training_series_and_split(
         min_train_points=min_train_points,
         freq=args.freq,
     )
+    eligible_names = set(holdouts)
+    series_dfs = [
+        frame for frame in series_dfs if str(frame.columns[0]) in eligible_names
+    ]
 
     train_remainder_df, heldout_points = build_train_long_df_from_series(
         series_dfs,
@@ -466,6 +469,11 @@ def _load_training_series_and_split(
         "[info] Station holdouts: "
         f"{len(holdouts)} series, {int(holdout_metadata['Test_Block_Points'].sum())} points"
     )
+    if not excluded_series.empty:
+        print(
+            "[info] Excluding ineligible series from TSPulse fine-tuning: "
+            + ", ".join(excluded_series["Serie"].astype(str))
+        )
     print(f"[info] Points masked in train due to held-out test block: {heldout_points}")
     print(f"[info] Remaining long rows before train/valid split: {len(train_remainder_df)}")
 
@@ -486,6 +494,7 @@ def _load_training_series_and_split(
         heldout_points,
         train_df,
         valid_df,
+        excluded_series,
     )
 
 
@@ -669,6 +678,7 @@ def _save_finetuned_artifacts(
     tsp: TimeSeriesPreprocessor,
     holdout_manifest: dict[str, object],
     holdout_metadata: pd.DataFrame,
+    excluded_series: pd.DataFrame,
 ) -> None:
     """Persist the fine-tuned model and preprocessor to the output directory."""
     run_name = f"airquality_tspulse_ft_{args.mask_type}_{args.mask_ratio}"
@@ -678,6 +688,7 @@ def _save_finetuned_artifacts(
     tsp.save_pretrained(str(save_dir / "preprocessor"))
     write_holdout_manifest(holdout_manifest, save_dir / "holdout_manifest.json")
     holdout_metadata.to_csv(save_dir / "holdouts.csv", index=False)
+    excluded_series.to_csv(save_dir / "excluded_series.csv", index=False)
     print(f"[done] Fine-tuned model saved to: {save_dir}")
 
 
@@ -694,7 +705,17 @@ def run(args: argparse.Namespace) -> None:
     _validate_run_args(args)
 
     data_root, output_dir = _resolve_run_paths(args)
-    _, _, holdout_metadata, holdout_manifest, _, _, train_df, valid_df = _load_training_series_and_split(
+    (
+        _,
+        _,
+        holdout_metadata,
+        holdout_manifest,
+        _,
+        _,
+        train_df,
+        valid_df,
+        excluded_series,
+    ) = _load_training_series_and_split(
         args,
         data_root,
     )
@@ -758,6 +779,7 @@ def run(args: argparse.Namespace) -> None:
         tsp=tsp,
         holdout_manifest=holdout_manifest,
         holdout_metadata=holdout_metadata,
+        excluded_series=excluded_series,
     )
 
 

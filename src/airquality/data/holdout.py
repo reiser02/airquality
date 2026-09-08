@@ -14,6 +14,34 @@ from airquality.data.segments import contiguous_observed_segments
 
 
 HOLDOUT_PROTOCOL = "per_series_retrospective_v1"
+EXCLUSION_REASON = "no_fixed_test_or_training_host"
+
+EXCLUSION_COLUMNS = [
+    "Serie",
+    "Reason_Code",
+    "Reason",
+    "Observed_Points",
+    "Observed_Segments",
+    "Longest_Observed_Segment",
+    "Required_Holdout_Points",
+    "Required_Context_Points",
+    "Required_Min_Train_Points",
+    "Require_Post_Data",
+]
+
+HOLDOUT_METADATA_COLUMNS = [
+    "Serie",
+    "Test_Start",
+    "Test_End",
+    "Test_Block_Points",
+    "Target_Test_Points",
+    "Context_Points",
+    "Train_Points_Before",
+    "Train_Points_After",
+    "Source_Block_Start",
+    "Source_Block_End",
+    "Source_Block_Points",
+]
 
 
 def _single_series(frame: pd.DataFrame) -> tuple[str, pd.Series]:
@@ -33,14 +61,14 @@ def _candidate_starts(block_length: int, holdout_points: int, context_points: in
     return sorted({first, (first + last) // 2, last})
 
 
-def select_retrospective_holdouts(
+def _select_retrospective_holdouts(
     series_dfs: Sequence[pd.DataFrame],
     *,
     target_points: int,
     context_points: int,
     min_train_points: int,
     require_post_data: bool = True,
-) -> tuple[dict[str, pd.Series], pd.DataFrame]:
+) -> tuple[dict[str, pd.Series], pd.DataFrame, pd.DataFrame]:
     """Select one fixed-size station-local block while retaining training data.
 
     Every station must provide a complete block of ``target_points``. Candidate
@@ -56,12 +84,15 @@ def select_retrospective_holdouts(
 
     holdouts: dict[str, pd.Series] = {}
     metadata_rows: list[dict[str, Any]] = []
-    rejected: list[str] = []
+    exclusion_rows: list[dict[str, Any]] = []
 
     for frame in series_dfs:
         name, series = _single_series(frame)
         observed_segments = contiguous_observed_segments(series)
         selected: tuple[tuple[Any, ...], pd.Series, pd.Series] | None = None
+        holdout_candidates = 0
+        candidates_with_training = 0
+        candidates_without_post_data = 0
 
         candidates: list[tuple[tuple[Any, ...], pd.Series, pd.Series]] = []
         for block in observed_segments:
@@ -69,18 +100,21 @@ def select_retrospective_holdouts(
                 holdout = block.iloc[start_pos : start_pos + target].copy()
                 if len(holdout) != target:
                     continue
+                holdout_candidates += 1
 
                 masked = series.copy()
                 masked.loc[holdout.index] = np.nan
                 remaining = contiguous_observed_segments(masked, min_len=min_train)
                 if not remaining:
                     continue
+                candidates_with_training += 1
 
                 before = series.loc[series.index < holdout.index[0]].notna()
                 after = series.loc[series.index > holdout.index[-1]].notna()
                 before_points = int(before.sum())
                 after_points = int(after.sum())
                 if require_post_data and after_points == 0:
+                    candidates_without_post_data += 1
                     continue
 
                 before_longest = max(
@@ -106,7 +140,42 @@ def select_retrospective_holdouts(
             selected = max(candidates, key=lambda item: item[0])
 
         if selected is None:
-            rejected.append(name)
+            longest_segment = max((len(block) for block in observed_segments), default=0)
+            if not observed_segments:
+                reason_code = EXCLUSION_REASON
+                reason = "La serie no contiene puntos observados."
+            elif holdout_candidates == 0:
+                reason_code = EXCLUSION_REASON
+                reason = (
+                    "Ningún segmento observado alcanza el contexto y el holdout "
+                    f"requeridos ({context} + {target} puntos)."
+                )
+            elif candidates_with_training == 0:
+                reason_code = EXCLUSION_REASON
+                reason = (
+                    "Tras enmascarar el holdout no queda un segmento de entrenamiento "
+                    f"de al menos {min_train} puntos."
+                )
+            elif require_post_data and candidates_without_post_data == candidates_with_training:
+                reason_code = EXCLUSION_REASON
+                reason = "No quedan observaciones posteriores al holdout candidato."
+            else:
+                reason_code = EXCLUSION_REASON
+                reason = "No se encontró ningún candidato que cumpla el protocolo de holdout."
+            exclusion_rows.append(
+                {
+                    "Serie": name,
+                    "Reason_Code": reason_code,
+                    "Reason": reason,
+                    "Observed_Points": int(series.notna().sum()),
+                    "Observed_Segments": int(len(observed_segments)),
+                    "Longest_Observed_Segment": int(longest_segment),
+                    "Required_Holdout_Points": target,
+                    "Required_Context_Points": context,
+                    "Required_Min_Train_Points": min_train,
+                    "Require_Post_Data": bool(require_post_data),
+                }
+            )
             continue
 
         _, holdout, source_block = selected
@@ -130,16 +199,64 @@ def select_retrospective_holdouts(
             }
         )
 
-    if rejected:
+    metadata = pd.DataFrame(metadata_rows, columns=HOLDOUT_METADATA_COLUMNS)
+    if not metadata.empty:
+        metadata = metadata.sort_values("Serie").reset_index(drop=True)
+    exclusions = pd.DataFrame(exclusion_rows, columns=EXCLUSION_COLUMNS)
+    if not exclusions.empty:
+        exclusions = exclusions.sort_values("Serie").reset_index(drop=True)
+    return holdouts, metadata, exclusions
+
+
+def select_retrospective_holdouts(
+    series_dfs: Sequence[pd.DataFrame],
+    *,
+    target_points: int,
+    context_points: int,
+    min_train_points: int,
+    require_post_data: bool = True,
+) -> tuple[dict[str, pd.Series], pd.DataFrame]:
+    """Select holdouts and fail if any input series is ineligible."""
+    holdouts, metadata, exclusions = _select_retrospective_holdouts(
+        series_dfs,
+        target_points=target_points,
+        context_points=context_points,
+        min_train_points=min_train_points,
+        require_post_data=require_post_data,
+    )
+    if not exclusions.empty:
         raise ValueError(
             "No se pudo seleccionar un holdout retrospectivo para: "
-            + ", ".join(rejected)
+            + ", ".join(exclusions["Serie"].astype(str))
         )
     if not holdouts:
         raise ValueError("No se pudo seleccionar ningun holdout retrospectivo.")
-
-    metadata = pd.DataFrame(metadata_rows).sort_values("Serie").reset_index(drop=True)
     return holdouts, metadata
+
+
+def select_retrospective_holdouts_with_exclusions(
+    series_dfs: Sequence[pd.DataFrame],
+    *,
+    target_points: int,
+    context_points: int,
+    min_train_points: int,
+    require_post_data: bool = True,
+) -> tuple[dict[str, pd.Series], pd.DataFrame, pd.DataFrame]:
+    """Select holdouts while reporting and omitting ineligible series."""
+    holdouts, metadata, exclusions = _select_retrospective_holdouts(
+        series_dfs,
+        target_points=target_points,
+        context_points=context_points,
+        min_train_points=min_train_points,
+        require_post_data=require_post_data,
+    )
+    if not holdouts:
+        names = ", ".join(exclusions["Serie"].astype(str))
+        raise ValueError(
+            "No se pudo seleccionar ningun holdout retrospectivo; "
+            f"series descartadas: {names}."
+        )
+    return holdouts, metadata, exclusions
 
 
 def build_holdout_manifest(

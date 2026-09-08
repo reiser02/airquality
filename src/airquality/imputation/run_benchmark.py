@@ -18,7 +18,7 @@ from airquality.data.holdout import (
     build_holdout_manifest,
     manifests_match,
     read_holdout_manifest,
-    select_retrospective_holdouts,
+    select_retrospective_holdouts_with_exclusions,
 )
 from airquality.config import cfg_get_bool, cfg_get_csv_list, cfg_get_int, cfg_get_str
 
@@ -476,7 +476,7 @@ def build_dataset_bundle_for_imputation(
     )
     min_train_len = int(min_train_len_base + size_k)
     min_train_points = max(min_train_len, int(val_context_len)) + int(val_size)
-    holdouts, holdout_metadata = select_retrospective_holdouts(
+    holdouts, holdout_metadata, excluded_series = select_retrospective_holdouts_with_exclusions(
         series_dfs,
         target_points=holdout_target_points,
         context_points=holdout_context_points,
@@ -489,9 +489,19 @@ def build_dataset_bundle_for_imputation(
         min_train_points=min_train_points,
         freq=freq,
     )
+    eligible_names = set(holdouts)
+    eligible_series_dfs = [
+        frame for frame in series_dfs if str(frame.columns[0]) in eligible_names
+    ]
+    if not excluded_series.empty:
+        LOGGER.info(
+            "Excluding %d ineligible series from imputation benchmark: %s",
+            len(excluded_series),
+            ", ".join(excluded_series["Serie"].astype(str)),
+        )
 
     return build_benchmark_dataset_bundle(
-        series_dfs=series_dfs,
+        series_dfs=eligible_series_dfs,
         longest_segment=None,
         holdouts_by_series=holdouts,
         holdout_metadata=holdout_metadata,
@@ -499,6 +509,7 @@ def build_dataset_bundle_for_imputation(
         val_size=val_size,
         min_train_len=min_train_len,
         val_context_len=val_context_len,
+        excluded_series=excluded_series,
     )
 
 
@@ -1159,6 +1170,7 @@ def run_imputation_benchmark_parallel_montecarlo(
     seed_start: int = 42,
     seed_step: int = 1,
     progress: bool = True,
+    excluded_series_output_path: str | Path | None = None,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -1224,6 +1236,13 @@ def run_imputation_benchmark_parallel_montecarlo(
     )
 
     dataset_bundle = _build_dataset_bundle_from_config(config=config)
+    if excluded_series_output_path is not None:
+        exclusions = dataset_bundle.excluded_series
+        if not isinstance(exclusions, pd.DataFrame):
+            exclusions = pd.DataFrame()
+        output_path = Path(excluded_series_output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        exclusions.to_csv(output_path, index=False)
     _validate_model_holdout_manifests(
         repo_root=resolved_root,
         config=config,

@@ -222,6 +222,7 @@ def build_benchmark_dataset_bundle(
     holdout_manifest: Mapping[str, Any] | None = None,
     test_only_series: Sequence[pd.Series] | None = None,
     test_only_train_fraction: float = 0.6,
+    excluded_series: pd.DataFrame | None = None,
 ) -> BenchmarkDatasetBundle:
     """
     Construye las entradas de benchmark/evaluacion.
@@ -341,6 +342,9 @@ def build_benchmark_dataset_bundle(
             )
         ),
         holdout_manifest=dict(holdout_manifest or {}),
+        excluded_series=(
+            excluded_series.copy() if excluded_series is not None else pd.DataFrame()
+        ),
     )
 
 

@@ -7,6 +7,7 @@ from airquality.data.holdout import (
     build_holdout_manifest,
     manifests_match,
     select_retrospective_holdouts,
+    select_retrospective_holdouts_with_exclusions,
 )
 
 
@@ -38,6 +39,22 @@ def test_select_retrospective_holdouts_rejects_station_without_target() -> None:
             context_points=72,
             min_train_points=125,
         )
+
+
+def test_select_retrospective_holdouts_reports_and_omits_ineligible_station() -> None:
+    holdouts, metadata, exclusions = select_retrospective_holdouts_with_exclusions(
+        [_frame("eligible", 500), _frame("short", 136)],
+        target_points=192,
+        context_points=72,
+        min_train_points=125,
+    )
+
+    assert list(holdouts) == ["eligible"]
+    assert metadata["Serie"].tolist() == ["eligible"]
+    assert exclusions["Serie"].tolist() == ["short"]
+    assert exclusions["Reason_Code"].tolist() == ["no_fixed_test_or_training_host"]
+    assert exclusions["Longest_Observed_Segment"].tolist() == [136]
+    assert exclusions["Required_Holdout_Points"].tolist() == [192]
 
 
 def test_holdout_manifest_identity_changes_with_split() -> None:
