@@ -20,6 +20,11 @@ from airquality.forecasting.foundation_preprocessing import (
     build_synthetic_context_cases,
     summarize_foundation_preprocessing,
 )
+from airquality.forecasting.fill import (
+    GapImputationOutcome,
+    GapImputationResult,
+    nan_gap_windows,
+)
 
 
 def _test_series() -> pd.Series:
@@ -228,6 +233,7 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
     prepare_calls: list[int] = []
     synthetic_contexts: list[dict[str, object]] = []
     foundation_references: list[pd.Series] = []
+    imputation_policies: list[str] = []
 
     monkeypatch.setattr(
         pipeline,
@@ -247,8 +253,8 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
         pipeline,
         "cfg_get_str",
         lambda section, option, default, cfg=None: (
-            "interp"
-            if (section, option) == ("forecasting", "imputation_model")
+            "1=LinearInterp"
+            if (section, option) == ("forecasting", "imputation_gap_rules")
             else "drift"
             if (section, option) == ("synthetic", "injection_variant")
             else default
@@ -329,13 +335,24 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
     monkeypatch.setattr(pipeline, "backtest_forecast", fake_backtest)
     monkeypatch.setattr(pipeline, "prepare_foundation_model", fake_prepare)
     monkeypatch.setattr(pipeline, "forecast_foundation_context", fake_forecast)
-    monkeypatch.setattr(
-        pipeline,
-        "impute_series",
-        lambda values, *_args, **_kwargs: values.interpolate(
-            method="time", limit_direction="both"
-        ),
-    )
+    def fake_impute(values, policy, *_args, **_kwargs):
+        imputation_policies.append(policy.spec)
+        filled = values.interpolate(method="time", limit_direction="both")
+        outcomes = tuple(
+            GapImputationOutcome(
+                start=window[0],
+                end=window[-1],
+                hours=len(window),
+                configured_imputer=policy.model_for(len(window)) or "none",
+                effective_imputer=policy.model_for(len(window)) or "none",
+                fallback_used=False,
+                filled_hours=int(filled.loc[window].notna().sum()),
+            )
+            for window in nan_gap_windows(values)
+        )
+        return GapImputationResult(filled, outcomes)
+
+    monkeypatch.setattr(pipeline, "impute_series_by_gap_result", fake_impute)
 
     artifacts = pipeline.run_benchmark_from_config()
     results = artifacts["foundation_preprocessing_df"]
@@ -359,6 +376,11 @@ def test_pipeline_runs_paired_foundation_conditions_with_imputation_fallback(
     assert set(results.loc[results["imputation_applied"], "condition"]) == {
         "inject-vote",
     }
+    imputed_results = results.loc[results["imputation_applied"]]
+    assert set(imputed_results["imputation_policy"]) == {"1=LinearInterp"}
+    assert set(imputed_results["effective_imputer"]) == {"LinearInterp"}
+    assert not imputed_results["fallback_used"].any()
+    assert imputation_policies == ["1=LinearInterp"] * 4
     assert prepare_calls == [12]
     assert synthetic_contexts
     assert all(context["carla_stride"] == 7 for context in synthetic_contexts)

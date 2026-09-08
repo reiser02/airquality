@@ -13,6 +13,7 @@ from airquality.forecasting.cache import BenchmarkCache
 from airquality.forecasting.detection import (
     ConsensusDetection,
     DetectionResult,
+    InjectionSoftDetection,
     InjectionTopKDetection,
     SeriesDetectionContext,
     apply_mask_transforms,
@@ -219,6 +220,79 @@ def test_injection_vote_uses_configured_quorum_with_pointwise_backfill():
     assert result.scored_mask.iloc[5]
     assert not result.mask.iloc[5]
     assert result.n_unscored == 0
+
+
+def test_injection_soft_averages_station_minmax_scores_then_applies_mad():
+    n = 30
+    scores = {
+        "A": _spike_scores(n, [5]),
+        "B": 100.0 + 10.0 * _spike_scores(n, [5]),
+        "C": np.full(n, 7.0),
+    }
+    context = _StubContext(
+        n=n,
+        scores_by_model=scores,
+        ranking={"A": 0.9, "B": 0.8, "C": 0.7},
+    )
+
+    result = InjectionSoftDetection().detect(context)
+
+    assert result.strategy == "inject-soft"
+    assert result.detectors == ["A", "B", "C"]
+    assert result.scored_mask.all()
+    assert list(np.flatnonzero(result.mask.to_numpy())) == [5]
+    assert result.n_flagged == 1
+
+
+def test_injection_soft_backfills_pointwise_and_abstains_without_two_scores():
+    n = 30
+    scores = {
+        "A": _spike_scores(n, [5]),
+        "B": _spike_scores(n, [10]),
+        "C": _spike_scores(n, [15]),
+        "D": _spike_scores(n, [5]),
+    }
+    scores["B"][5] = np.nan
+    scores["C"][5] = np.nan
+    for values in scores.values():
+        values[20:] = np.nan
+    context = _StubContext(
+        n=n,
+        scores_by_model=scores,
+        ranking={name: 1.0 - index / 10 for index, name in enumerate(scores)},
+    )
+
+    result = InjectionSoftDetection().detect(context)
+
+    assert result.selected_by_segment == [["A", "B", "C", "D"]]
+    assert result.scored_mask.iloc[:20].all()
+    assert not result.scored_mask.iloc[20:].any()
+    assert result.mask.iloc[5]
+    assert result.n_unscored == 10
+
+
+def test_injection_soft_applies_mad_independently_per_segment():
+    class MultiSegmentContext(_StubContext):
+        def __init__(self) -> None:
+            super().__init__(
+                n=8,
+                scores_by_model={
+                    name: [
+                        np.array([0.0, 0.0, 0.0, 0.4]),
+                        np.array([0.6, 0.6, 0.6, 1.0]),
+                    ]
+                    for name in ("A", "B", "C")
+                },
+                ranking={"A": 0.9, "B": 0.8, "C": 0.7},
+            )
+            self.segments = [self.series.iloc[:4], self.series.iloc[4:]]
+
+        def real_scores(self, names):
+            return {name: self._scores[name] for name in names}
+
+    result = InjectionSoftDetection().detect(MultiSegmentContext())
+
+    assert list(np.flatnonzero(result.mask.to_numpy())) == [3, 7]
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +568,7 @@ def test_strategies_return_empty_result_without_segments():
     for strategy in (
         ConsensusDetection(),
         InjectionTopKDetection(name="inject-best", top_k=1, min_votes=1),
+        InjectionSoftDetection(),
     ):
         result = strategy.detect(context)
         assert result.detectors == []
@@ -616,6 +691,7 @@ def test_selection_excludes_detector_that_fails_all_segments(monkeypatch, failur
     for strategy in (
         InjectionTopKDetection(name="inject-best", top_k=1, min_votes=1),
         InjectionTopKDetection(name="inject-vote", top_k=3, min_votes=2),
+        InjectionSoftDetection(),
     ):
         result = strategy.detect(context)
         assert result.detectors == []
@@ -884,6 +960,10 @@ def test_build_detection_strategy_resolves_specs():
 
     vote = build_detection_strategy("inject-vote", vote_top_k=5, vote_min_votes=3)
     assert (vote.name, vote.top_k, vote.min_votes) == ("inject-vote", 5, 3)
+
+    soft = build_detection_strategy("inject-soft")
+    assert isinstance(soft, InjectionSoftDetection)
+    assert (soft.name, soft.top_k, soft.min_scores) == ("inject-soft", 3, 2)
 
     with pytest.raises(ValueError, match="entre 2 y top_k"):
         build_detection_strategy("inject-vote", vote_min_votes=1)

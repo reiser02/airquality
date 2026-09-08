@@ -33,7 +33,11 @@ from airquality.anomaly.benchmark import (
     recompute_ensemble,
     run_benchmark,
 )
-from airquality.anomaly.ensemble import rank_top_k, ranked_pointwise_vote
+from airquality.anomaly.ensemble import (
+    rank_top_k,
+    ranked_pointwise_minmax_mean,
+    ranked_pointwise_vote,
+)
 from airquality.anomaly.metrics import (
     MAD_SCALE,
     compute_metrics,
@@ -559,6 +563,46 @@ def test_ranked_pointwise_vote_backfills_and_requires_two_models():
     assert supported.tolist() == [True, True, False, True, True, True]
     assert fused.astype(bool).tolist() == [True, True, False, False, False, False]
     assert used == ["a", "b", "c", "d"]
+
+
+def test_ranked_pointwise_minmax_mean_normalizes_per_model_and_station():
+    scores = {
+        "a": [np.array([0.0, 5.0]), np.array([10.0, np.nan])],
+        "b": [np.array([100.0, 150.0]), np.array([200.0, 250.0])],
+        "c": [np.full(2, 7.0), np.full(2, 7.0)],
+        "d": [np.zeros(2), np.array([0.0, 1.0])],
+    }
+
+    fused, supported, used = ranked_pointwise_minmax_mean(
+        scores,
+        [{name: 1.0 - index / 10 for index, name in enumerate(scores)}] * 2,
+        (2, 2),
+    )
+
+    assert [part.tolist() for part in supported] == [[True, True], [True, True]]
+    assert fused[0].tolist() == pytest.approx([0.0, (0.5 + 1 / 3) / 3])
+    assert fused[1].tolist() == pytest.approx([(1.0 + 2 / 3) / 3, 2 / 3])
+    assert used == [["a", "b", "c"], ["a", "b", "c", "d"]]
+
+
+def test_ranked_pointwise_minmax_mean_backfills_and_requires_two_scores():
+    scores = {
+        "a": [np.array([0.0, np.nan, np.nan])],
+        "b": [np.array([np.nan, 0.0, np.nan])],
+        "c": [np.array([1.0, np.nan, np.nan])],
+        "d": [np.array([0.5, 1.0, np.nan])],
+    }
+
+    fused, supported, used = ranked_pointwise_minmax_mean(
+        scores,
+        [{"a": 0.9, "b": 0.8, "c": 0.7, "d": 0.6}],
+        (3,),
+    )
+
+    assert supported[0].tolist() == [True, True, False]
+    assert fused[0][:2].tolist() == pytest.approx([0.0, 0.5])
+    assert np.isnan(fused[0][2])
+    assert used == [["a", "b", "c", "d"]]
 
 
 @pytest.mark.parametrize("top_k", [1, 4])
@@ -1215,6 +1259,7 @@ def test_synthetic_ensemble_coverage_is_measured_after_pointwise_fallback():
         result["raw_metrics"]["vus_pr"] * 5 / 6
     )
     assert result["timing"]["fit_seconds"] == 4.0
+    assert result["training_summary"]["method"] == "MEAN_TOP_K_MINMAX"
 
 
 def test_synthetic_ensemble_support_does_not_depend_on_evaluation_labels():
@@ -1559,8 +1604,27 @@ def test_run_benchmark_end_to_end(tmp_path, monkeypatch):
                 "evaluated_segments": 1,
             }
     assert (tmp_path / "scores.npz").exists()
+    log_text = (tmp_path / "benchmark.log").read_text(encoding="utf-8")
+    assert "Run started: anomaly_benchmark" in log_text
+    assert "Anomaly benchmark artifacts saved" in log_text
+    assert "Run completed: anomaly_benchmark" in log_text
     # The benchmark itself does NOT render plots (that is a separate script).
     assert not (tmp_path / "detection_rate_distribution.png").exists()
+
+
+def test_run_benchmark_preserves_log_when_case_building_fails(tmp_path, monkeypatch):
+    def fail_cases(_config):
+        raise RuntimeError("case loading failed")
+
+    monkeypatch.setattr(benchmark_module, "build_cases", fail_cases)
+    config = AnomalyBenchmarkConfig(output_dir=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="case loading failed"):
+        run_benchmark(config)
+
+    log_text = (tmp_path / "benchmark.log").read_text(encoding="utf-8")
+    assert "Run failed: anomaly_benchmark" in log_text
+    assert "RuntimeError: case loading failed" in log_text
 
 
 def test_run_benchmark_expands_sub_pca_component_variants(tmp_path, monkeypatch):
@@ -1831,10 +1895,10 @@ def test_recompute_ensemble_synthetic_run(tmp_path, monkeypatch):
 
     out = recompute_ensemble(tmp_path, top_k=3)
 
-    assert "Ensemble(method=VOTE,top_k=3)" in out
+    assert "Ensemble(method=MEAN_MINMAX,top_k=3)" in out
     for name in ("ModifiedZScore", "IQR", "IsolationForest"):
         assert name in out
     assert all(np.isfinite(value) for value in out.values())
-    assert out["Ensemble(method=VOTE,top_k=3)"] == pytest.approx(
+    assert out["Ensemble(method=MEAN_MINMAX,top_k=3)"] == pytest.approx(
         summary["models"]["Ensemble"]["macro_metrics"]["vus_pr"]
     )

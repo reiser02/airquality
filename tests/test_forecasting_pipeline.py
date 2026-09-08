@@ -21,7 +21,14 @@ from airquality.forecasting.backtest import (
 )
 from airquality.forecasting.cleaning import remove_anomalies
 from airquality.forecasting.detection import DetectionResult
-from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
+from airquality.forecasting.fill import (
+    build_imputer,
+    impute_series,
+    impute_series_by_gap,
+    impute_series_by_gap_result,
+    nan_gap_windows,
+    parse_imputation_gap_rules,
+)
 from airquality.imputation.registry import resolve_imputer_family
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +194,136 @@ def test_impute_series_only_fills_complete_gaps_up_to_five():
     pd.testing.assert_series_equal(
         filled[series.notna()], original[series.notna()], check_names=False
     )
+
+
+def test_parse_imputation_gap_rules_resolves_inclusive_ranges():
+    policy = parse_imputation_gap_rules(
+        "1-1=LinearInterp;2-5=TSPulse;6-10=TSPulse_FineTuned"
+    )
+
+    assert policy.model_for(1) == "LinearInterp"
+    assert policy.model_for(2) == "TSPulse"
+    assert policy.model_for(5) == "TSPulse"
+    assert policy.model_for(6) == "TSPulse_FineTuned"
+    assert policy.model_for(10) == "TSPulse_FineTuned"
+    assert policy.model_for(11) is None
+    assert policy.model_names == (
+        "LinearInterp",
+        "TSPulse",
+        "TSPulse_FineTuned",
+    )
+    assert policy.spec == (
+        "1=LinearInterp;2-5=TSPulse;6-10=TSPulse_FineTuned"
+    )
+
+
+@pytest.mark.parametrize(
+    "rules, match",
+    [
+        ("0-1=interp", "positivos"),
+        ("5-2=interp", "inicial"),
+        ("1-5=interp;5-10=LinearInterp", "solapan"),
+        ("1-5=NotAModel", "desconocido"),
+        ("1-5", "formato"),
+        ("", "no puede estar vacio"),
+    ],
+)
+def test_parse_imputation_gap_rules_rejects_invalid_policies(rules, match):
+    with pytest.raises(ValueError, match=match):
+        parse_imputation_gap_rules(rules)
+
+
+def test_impute_series_by_gap_routes_models_and_leaves_unmatched_gaps_nan():
+    series = _seasonal_series(n=50)
+    original = series.copy()
+    gaps = {
+        "LinearInterp": series.index[3:4],
+        "TSPulse": series.index[8:11],
+        "TSPulse_FineTuned": series.index[16:22],
+        "unmatched": series.index[30:41],
+    }
+    for index in gaps.values():
+        series.loc[index] = np.nan
+
+    calls: dict[str, list[list[int]]] = {}
+    values = {
+        "LinearInterp": 101.0,
+        "TSPulse": 202.0,
+        "TSPulse_FineTuned": 303.0,
+    }
+
+    class StubImputer:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def impute_gaps(self, *, gap_windows, **_kwargs):
+            calls.setdefault(self.model_name, []).append(
+                [len(window) for window in gap_windows]
+            )
+            index = gap_windows[0].append(gap_windows[1:])
+            return pd.Series(values[self.model_name], index=index), []
+
+    policy = parse_imputation_gap_rules(
+        "1=LinearInterp;2-5=TSPulse;6-10=TSPulse_FineTuned"
+    )
+    built: dict[str, StubImputer] = {}
+
+    def get_imputer(model_name):
+        return built.setdefault(model_name, StubImputer(model_name))
+
+    filled = impute_series_by_gap(series, policy, get_imputer, freq="h")
+
+    assert calls == {
+        "LinearInterp": [[1]],
+        "TSPulse": [[3]],
+        "TSPulse_FineTuned": [[6]],
+    }
+    for model_name, index in gaps.items():
+        if model_name == "unmatched":
+            assert filled.loc[index].isna().all()
+        else:
+            assert (filled.loc[index] == values[model_name]).all()
+    pd.testing.assert_series_equal(
+        filled[series.notna()], original[series.notna()], check_names=False
+    )
+
+
+def test_impute_series_by_gap_falls_back_only_for_selected_unfilled_points():
+    index = pd.date_range("2024-01-01", periods=20, freq="h")
+    series = pd.Series(np.arange(20, dtype=float), index=index, name="ST")
+    selected = index[5:7]
+    unmatched = index[10:16]
+    series.loc[selected] = np.nan
+    series.loc[unmatched] = np.nan
+
+    class EmptyImputer:
+        model_name = "TSPulse"
+
+        def impute_gaps(self, *, gap_windows, **_kwargs):
+            mask = gap_windows[0].append(gap_windows[1:])
+            prediction = pd.Series(np.nan, index=mask)
+            prediction.iloc[0] = 999.0
+            return prediction, []
+
+    policy = parse_imputation_gap_rules("1-5=TSPulse")
+    result = impute_series_by_gap_result(
+        series,
+        policy,
+        lambda _model_name: EmptyImputer(),
+        freq="h",
+    )
+    filled = result.series
+
+    assert filled.loc[selected].notna().all()
+    assert filled.loc[unmatched].isna().all()
+    selected_outcome, unmatched_outcome = result.outcomes
+    assert selected_outcome.configured_imputer == "TSPulse"
+    assert selected_outcome.fallback_used
+    assert selected_outcome.effective_imputer == "TSPulse+interp"
+    assert selected_outcome.filled_hours == 2
+    assert unmatched_outcome.configured_imputer == "none"
+    assert not unmatched_outcome.fallback_used
+    assert unmatched_outcome.effective_imputer == "none"
 
 
 def test_build_imputer_routes_base_and_finetuned_tspulse(
@@ -572,7 +709,7 @@ def test_darts_error_metrics_pool_overlapping_forecasts():
 # Arm construction
 # --------------------------------------------------------------------------- #
 def test_build_arms_expands_strategies_and_imputation_variants():
-    arms = cp.build_arms(["unlabeled", "inject-vote"], "both")
+    arms = cp.build_arms(["unlabeled", "inject-vote", "inject-soft"], "both")
     assert [arm.name for arm in arms] == [
         "raw",
         "raw+frozen",
@@ -580,11 +717,14 @@ def test_build_arms_expands_strategies_and_imputation_variants():
         "unlabeled+noimpute",
         "inject-vote+impute",
         "inject-vote+noimpute",
+        "inject-soft+impute",
+        "inject-soft+noimpute",
     ]
     assert arms[0].strategy is None and not arms[0].impute
     assert arms[1].strategy is None and not arms[1].impute
     assert arms[2].strategy == "unlabeled" and arms[2].impute
     assert arms[3].strategy == "unlabeled" and not arms[3].impute
+    assert cp.DEFAULT_STRATEGIES[-1] == "inject-soft"
 
     only_impute = cp.build_arms(["unlabeled"], "impute")
     assert [arm.name for arm in only_impute] == [
@@ -831,6 +971,8 @@ def test_run_benchmark_selects_holdout_from_full_series_common_support(
         lambda section, option, default, cfg=None: (
             "none"
             if (section, option) == ("forecasting", "imputation")
+            else "1-10=interp"
+            if (section, option) == ("forecasting", "imputation_gap_rules")
             else "drift"
             if (section, option) == ("synthetic", "injection_variant")
             else default
@@ -999,7 +1141,9 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         ("forecasting", "context_len"): 72,
         ("forecasting", "min_series_points"): 300,
     }
-    str_map = {("forecasting", "imputation_model"): "interp"}
+    str_map = {
+        ("forecasting", "imputation_gap_rules"): "1-10=interp",
+    }
 
     def fake_csv(section, option, default, *, cfg=None):
         return csv_map.get((section, option), default)
@@ -1040,7 +1184,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
     raw_rows = results_df[results_df["arm"] == "raw"]
     assert (raw_rows["strategy"] == "none").all() and (~raw_rows["imputed"]).all()
     imputed_rows = results_df[results_df["imputed"]]
-    assert set(imputed_rows["imputation_model"]) == {"interp"}
+    assert set(imputed_rows["imputation_policy"]) == {"1-10=interp"}
     # The public forecasting metric contract contains only scaled and relative metrics.
     assert set(results_df.columns) >= {"rmsse", "mase", "relmae", "relrmse"}
     assert (results_df["status"] == "ok").all()
@@ -1089,6 +1233,7 @@ def test_run_benchmark_from_config_end_to_end(tmp_path, monkeypatch):
         assert (tmp_path / artifact).exists()
     assert artifacts["manifest"]["status"] == "complete"
     assert artifacts["manifest"]["result_rows"] == len(results_df)
+    assert artifacts["manifest"]["config"]["imputation_gap_rules"] == "1-10=interp"
     from airquality.forecasting.statistics import _validate_manifest
 
     _validate_manifest(results_df, artifacts["manifest"])
@@ -1133,7 +1278,10 @@ def test_run_benchmark_applies_mask_transforms(tmp_path, monkeypatch):
         ("forecasting", "context_len"): 72,
         ("forecasting", "min_series_points"): 300,
     }
-    str_map = {("forecasting", "imputation"): "none"}
+    str_map = {
+        ("forecasting", "imputation"): "none",
+        ("forecasting", "imputation_gap_rules"): "1-10=interp",
+    }
 
     monkeypatch.setattr(cp, "_load_raw_hourly_series", fake_loader)
     monkeypatch.setattr(cp, "cfg_get_csv_list", lambda s, o, d, *, cfg=None: csv_map.get((s, o), d))

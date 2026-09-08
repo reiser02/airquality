@@ -22,6 +22,7 @@ from airquality.forecasting.detection import (
     ConsensusDetection,
     DetectionResult,
     DetectionStrategy,
+    InjectionSoftDetection,
     InjectionTopKDetection,
     MaskTransform,
     SeriesDetectionContext,
@@ -29,7 +30,18 @@ from airquality.forecasting.detection import (
     build_detection_strategy,
     common_detection_support,
 )
-from airquality.forecasting.fill import build_imputer, impute_series, nan_gap_windows
+from airquality.forecasting.fill import (
+    GapImputationOutcome,
+    GapImputationPolicy,
+    GapImputationResult,
+    GapImputationRule,
+    build_imputer,
+    impute_series,
+    impute_series_by_gap,
+    impute_series_by_gap_result,
+    nan_gap_windows,
+    parse_imputation_gap_rules,
+)
 
 _PIPELINE_EXPORTS = {
     "ForecastArm",
@@ -55,6 +67,7 @@ __all__ = [
     "DetectionResult",
     "DetectionStrategy",
     "ConsensusDetection",
+    "InjectionSoftDetection",
     "InjectionTopKDetection",
     "SeriesDetectionContext",
     "MaskTransform",
@@ -62,8 +75,15 @@ __all__ = [
     "build_detection_strategy",
     "common_detection_support",
     "build_imputer",
+    "GapImputationOutcome",
+    "GapImputationPolicy",
+    "GapImputationResult",
+    "GapImputationRule",
     "impute_series",
+    "impute_series_by_gap",
+    "impute_series_by_gap_result",
     "nan_gap_windows",
+    "parse_imputation_gap_rules",
     "backtest_forecast",
     "get_forecast_model_requirements",
     "get_strict_forecast_requirements",

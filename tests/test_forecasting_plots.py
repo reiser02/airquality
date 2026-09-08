@@ -49,7 +49,7 @@ def _results_df(n_series: int = 3, models: tuple[str, ...] = ("NLinear", "TiDE")
                         "arm": arm,
                         "strategy": "none" if is_raw_view else family,
                         "imputed": arm.endswith("+impute"),
-                        "imputation_model": "interp" if arm.endswith("+impute") else "none",
+                        "imputation_policy": "1-5=interp" if arm.endswith("+impute") else "none",
                         "detectors": "" if is_raw_view else "IQR,Hampel_w24",
                         "n_anomalies": 0 if is_raw_view else 5,
                         "model": model,
@@ -136,10 +136,11 @@ def test_imputation_pairs_requires_both_variants():
 
 
 def test_family_colors_fixed_and_extended():
-    colors = family_colors(ARMS + ["custom+impute"])
+    colors = family_colors(ARMS + ["inject-soft+impute", "custom+impute"])
     assert colors["raw"] == "#6d6258"
     assert colors["raw+frozen"] == "#2a7f76"
     assert colors["unlabeled"] == "#3d7ab5"
+    assert colors["inject-soft"] == "#5b8c5a"
     assert colors["custom"] not in ("", None)
 
 
