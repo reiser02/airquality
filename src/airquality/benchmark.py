@@ -15,6 +15,7 @@ from airquality.imputation.run_benchmark import (
     run_imputation_benchmark_parallel_montecarlo,
 )
 from airquality.paths import create_run_dir
+from airquality.run_logging import RunLogging
 
 
 LOGGER = logging.getLogger(__name__)
@@ -29,75 +30,59 @@ def _build_output_dir() -> Path:
     )
 
 
-def _configure_logging(output_dir: Path) -> Path:
-    """Log benchmark progress to both the terminal and the run directory."""
-    log_path = output_dir / "benchmark.log"
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    package_logger = logging.getLogger("airquality")
-    package_logger.setLevel(logging.INFO)
-    package_logger.propagate = False
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    package_logger.handlers.clear()
-    package_logger.addHandler(stream_handler)
-    package_logger.addHandler(file_handler)
-    return log_path
-
-
 def run_benchmark_from_config() -> dict[str, Any]:
     """Run the configured Monte Carlo benchmark and persist all artifacts."""
     output_dir = _build_output_dir()
-    log_path = _configure_logging(output_dir)
-    LOGGER.info("Benchmark run directory: %s", output_dir)
-    results_mc_df, summary_mc_df, ranking_by_seed_df, plot_store = (
-        run_imputation_benchmark_parallel_montecarlo()
-    )
-    results_mc_df.to_csv(output_dir / "results_mc.csv", index=False)
-    summary_mc_df.to_csv(output_dir / "summary_mc.csv", index=False)
-    ranking_by_seed_df.to_csv(output_dir / "ranking_by_seed.csv", index=False)
-    holdout_columns = [
-        column
-        for column in (
-            "Serie",
-            "Test_Start",
-            "Test_End",
-            "Test_Block_Points",
-            "Train_Points_Before",
-            "Train_Points_After",
+    with RunLogging(output_dir, "imputation_benchmark") as run_logging:
+        results_mc_df, summary_mc_df, ranking_by_seed_df, plot_store = (
+            run_imputation_benchmark_parallel_montecarlo(
+                excluded_series_output_path=output_dir / "excluded_series.csv"
+            )
         )
-        if column in results_mc_df.columns
-    ]
-    holdout_coverage_df = (
-        results_mc_df[holdout_columns].drop_duplicates("Serie").sort_values("Serie")
-        if "Serie" in holdout_columns
-        else None
-    )
-    if holdout_coverage_df is not None:
-        holdout_coverage_df.to_csv(output_dir / "holdout_coverage.csv", index=False)
+        LOGGER.info("Saving imputation benchmark tables")
+        results_mc_df.to_csv(output_dir / "results_mc.csv", index=False)
+        summary_mc_df.to_csv(output_dir / "summary_mc.csv", index=False)
+        ranking_by_seed_df.to_csv(output_dir / "ranking_by_seed.csv", index=False)
+        holdout_columns = [
+            column
+            for column in (
+                "Serie",
+                "Test_Start",
+                "Test_End",
+                "Test_Block_Points",
+                "Train_Points_Before",
+                "Train_Points_After",
+            )
+            if column in results_mc_df.columns
+        ]
+        holdout_coverage_df = (
+            results_mc_df[holdout_columns].drop_duplicates("Serie").sort_values("Serie")
+            if "Serie" in holdout_columns
+            else None
+        )
+        if holdout_coverage_df is not None:
+            holdout_coverage_df.to_csv(output_dir / "holdout_coverage.csv", index=False)
 
-    plot_store_path = save_plot_store(plot_store, output_dir / "plot_store.csv.gz")
-    plot_artifacts = render_run_figures(
-        output_dir,
-        results_mc_df=results_mc_df,
-        plot_store=plot_store,
-    )
+        plot_store_path = save_plot_store(plot_store, output_dir / "plot_store.csv.gz")
+        LOGGER.info("Rendering imputation benchmark figures")
+        plot_artifacts = render_run_figures(
+            output_dir,
+            results_mc_df=results_mc_df,
+            plot_store=plot_store,
+        )
+        LOGGER.info("Imputation benchmark artifacts saved under %s", output_dir)
 
-    return {
-        "output_dir": output_dir,
-        "log_path": log_path,
-        "results_mc_df": results_mc_df,
-        "summary_mc_df": summary_mc_df,
-        "ranking_by_seed_df": ranking_by_seed_df,
-        "holdout_coverage_df": holdout_coverage_df,
-        **plot_artifacts,
-        "plot_store_path": plot_store_path,
-    }
+        return {
+            "output_dir": output_dir,
+            "log_path": run_logging.log_path,
+            "results_mc_df": results_mc_df,
+            "summary_mc_df": summary_mc_df,
+            "ranking_by_seed_df": ranking_by_seed_df,
+            "holdout_coverage_df": holdout_coverage_df,
+            "excluded_series_path": output_dir / "excluded_series.csv",
+            **plot_artifacts,
+            "plot_store_path": plot_store_path,
+        }
 
 
 def main() -> None:
@@ -120,6 +105,8 @@ def main() -> None:
     print(f"[info] Ranking CSV: {output_dir / 'ranking_by_seed.csv'}")
     if artifacts.get("holdout_coverage_df") is not None:
         print(f"[info] Holdout coverage CSV: {output_dir / 'holdout_coverage.csv'}")
+    if artifacts.get("excluded_series_path") is not None:
+        print(f"[info] Excluded series CSV: {artifacts['excluded_series_path']}")
     print(f"[info] Plot data CSV: {artifacts['plot_store_path']}")
     if artifacts.get("metric_gap_plot_path") is not None:
         print(f"[info] Metrics-by-gap plot: {artifacts['metric_gap_plot_path']}")
