@@ -17,6 +17,12 @@ from airquality.visualizations.anomaly import (
 
 
 PROTOCOL_COLOR = "#3d7ab5"
+HISTOGRAM_ALPHA = 0.55
+POLLUTANT_COLORS = {
+    "NO2": "#b46f44",
+    "O3": "#4f8b8c",
+}
+POLLUTANT_FALLBACK_COLORS = ("#7b6aa6", "#c28e3f", "#6b8e62")
 
 
 def _requirement_note(table: pd.DataFrame) -> str:
@@ -59,28 +65,56 @@ def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
     )
 
 
-def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
-    """Contrast the share of usable blocks with their retained hour share."""
-    total = summary.loc[summary["pollutant"] == "TOTAL"].iloc[0]
-    minimum = int(total["minimum_hours"])
-    stride = int(total["stride_hours"])
-    host_minimum = int(total["host_minimum_hours"])
-    validation = int(total["validation_reserve_hours"])
-    forecasts = int(total["validation_forecasts"])
-    labels = [
-        f"Protocolo\ntrain mínimo nativo: {minimum} h\n"
-        f"validación: +{validation} h, stride {stride} ({forecasts} ventanas; "
-        f"anfitrión: {host_minimum} h)"
-    ]
-    validation_labels = [f"validación {validation} h ({forecasts} ventanas)"]
-    block_counts = np.asarray([total["used_blocks"]], dtype=int)
-    hour_counts = np.asarray([total["effective_training_hours"]], dtype=int)
-    block_pct = 100.0 * block_counts / float(total["total_blocks"])
-    hour_pct = 100.0 * hour_counts / float(total["observed_hours"])
+def _summary_rows_for_plot(summary: pd.DataFrame) -> pd.DataFrame:
+    """Return pollutant rows plus TOTAL only for multi-pollutant reports."""
+    individual = summary.loc[summary["pollutant"] != "TOTAL"].copy()
+    if individual.empty:
+        return summary.loc[summary["pollutant"] == "TOTAL"].copy()
+    if individual["pollutant"].nunique() > 1:
+        total = summary.loc[summary["pollutant"] == "TOTAL"]
+        if not total.empty:
+            individual = pd.concat([individual, total], ignore_index=True)
+    return individual.reset_index(drop=True)
 
-    figure, axis = plt.subplots(figsize=(10, 6.5), facecolor=FIGURE_FACE)
-    x = np.arange(1)
-    width = 0.32
+
+def _pollutant_color(pollutant: str, index: int) -> str:
+    """Return a stable histogram color for one pollutant panel."""
+    if pollutant in POLLUTANT_COLORS:
+        return POLLUTANT_COLORS[pollutant]
+    return POLLUTANT_FALLBACK_COLORS[index % len(POLLUTANT_FALLBACK_COLORS)]
+
+
+def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
+    """Contrast usable blocks and retained hours separately per pollutant."""
+    rows = _summary_rows_for_plot(summary)
+    minimum = int(rows["minimum_hours"].iloc[0])
+    stride = int(rows["stride_hours"].iloc[0])
+    host_minimum = int(rows["host_minimum_hours"].iloc[0])
+    validation = int(rows["validation_reserve_hours"].iloc[0])
+    forecasts = int(rows["validation_forecasts"].iloc[0])
+    labels = rows["pollutant"].astype(str).tolist()
+    block_counts = rows["used_blocks"].to_numpy(dtype=int)
+    hour_counts = rows["effective_training_hours"].to_numpy(dtype=int)
+    block_totals = rows["total_blocks"].to_numpy(dtype=float)
+    hour_totals = rows["observed_hours"].to_numpy(dtype=float)
+    block_pct = np.divide(
+        100.0 * block_counts,
+        block_totals,
+        out=np.zeros(len(rows), dtype=float),
+        where=block_totals > 0,
+    )
+    hour_pct = np.divide(
+        100.0 * hour_counts,
+        hour_totals,
+        out=np.zeros(len(rows), dtype=float),
+        where=hour_totals > 0,
+    )
+
+    figure, axis = plt.subplots(
+        figsize=(max(10, 2.8 * len(rows)), 6.5), facecolor=FIGURE_FACE
+    )
+    x = np.arange(len(rows))
+    width = 0.34
     block_bars = axis.bar(
         x - width / 2,
         block_pct,
@@ -114,7 +148,7 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
 
     axis.set_xticks(x, labels)
     axis.set_ylim(0, 100)
-    axis.set_ylabel("Porcentaje del total")
+    axis.set_ylabel("Porcentaje del total de cada contaminante")
     axis.set_facecolor("#fffaf2")
     axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.65)
     axis.grid(axis="x", visible=False)
@@ -129,10 +163,9 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
     )
     _figure_header(
         figure,
-        "Pocos bloques concentran la mayoría de las horas",
-        "La proporción retenida ya descuenta validación por serie: "
-        + " y ".join(validation_labels)
-        + ".\n"
+        "Retención por contaminante",
+        "Cada porcentaje se calcula dentro del contaminante mostrado; "
+        f"validación: +{validation} h, stride {stride} ({forecasts} ventanas).\n"
         + _requirement_note(summary),
     )
     figure.tight_layout(rect=(0.03, 0.14, 0.98, 0.89))
@@ -143,29 +176,44 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
 def save_block_length_distribution(
     path: Path, blocks: pd.DataFrame, series: pd.DataFrame
 ) -> None:
-    """Plot the distribution of contiguous block lengths and model minima."""
+    """Plot all pollutant block-length distributions on one colored axis."""
+    pollutants = list(dict.fromkeys(blocks["pollutant"].astype(str)))
     lengths = blocks["hours"].to_numpy(dtype=float)
     bins = np.geomspace(1, lengths.max() + 1, 45)
-    minimum = int(series["minimum_hours"].iloc[0])
-    host_minimum = int(series["host_minimum_hours"].iloc[0])
-
     figure, axis = plt.subplots(figsize=(11, 6), facecolor=FIGURE_FACE)
-    axis.hist(lengths, bins=bins, color="#8c6d4b", edgecolor="#fffaf2", alpha=0.9)
-    lines = (
-        (minimum, PROTOCOL_COLOR, f"Train: {minimum} h"),
-        (host_minimum, PROTOCOL_COLOR, f"Train + validación: {host_minimum} h"),
-    )
-    for value, color, label in lines:
+    thresholds: set[tuple[int, int]] = set()
+    for index, pollutant in enumerate(pollutants):
+        pollutant_blocks = blocks.loc[blocks["pollutant"].eq(pollutant)]
+        pollutant_series = series.loc[series["pollutant"].eq(pollutant)]
+        minimum = int(pollutant_series["minimum_hours"].iloc[0])
+        host_minimum = int(pollutant_series["host_minimum_hours"].iloc[0])
+        thresholds.add((minimum, host_minimum))
+        axis.hist(
+            pollutant_blocks["hours"].to_numpy(dtype=float),
+            bins=bins,
+            color=_pollutant_color(pollutant, index),
+            edgecolor=_pollutant_color(pollutant, index),
+            linewidth=0.7,
+            alpha=HISTOGRAM_ALPHA,
+            label=pollutant,
+        )
+    for minimum, host_minimum in sorted(thresholds):
         axis.axvline(
-            value,
-            color=color,
-            linestyle="--" if "validación" in label else "-",
-            label=label,
+            minimum,
+            color=PROTOCOL_COLOR,
+            linestyle="-",
+            label=f"Train: {minimum} h",
+        )
+        axis.axvline(
+            host_minimum,
+            color=PROTOCOL_COLOR,
+            linestyle="--",
+            label=f"Train + validación: {host_minimum} h",
         )
 
     axis.set_xscale("log")
     axis.set_yscale("log")
-    axis.set_xlabel("Longitud del bloque continuo (horas, escala log)")
+    axis.set_xlabel("Longitud del bloque (horas, escala log)")
     axis.set_ylabel("Número de bloques (escala log)")
     axis.set_facecolor("#fffaf2")
     axis.grid(axis="both", color=GRID_COLOR, linestyle="--", alpha=0.5)
@@ -174,7 +222,8 @@ def save_block_length_distribution(
     _figure_header(
         figure,
         "Distribución de longitudes",
-        "Cada hueco rompe la serie; las líneas marcan los mínimos de entrenamiento y validación.\n"
+        "Los colores distinguen los contaminantes; cada hueco rompe la serie y las líneas "
+        "marcan los mínimos de entrenamiento y validación.\n"
         + _requirement_note(series),
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.89))

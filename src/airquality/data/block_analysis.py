@@ -7,8 +7,9 @@ Run with::
 The command preprocesses the raw 5-minute NO2/O3 files, reserves one complete
 observed block for an exact 96-hour test, and audits the configured rolling
 validation requirement. It writes CSV tables plus figures under
-``reports/data_blocks/<timestamp>/`` without running detectors or models, so its
-raw-support coverage is an upper bound for the detector-aware benchmark.
+``reports/data_blocks/<pollutants>_<timestamp>/`` without running detectors or
+models, so its raw-support coverage is an upper bound for the detector-aware
+benchmark.
 """
 
 from __future__ import annotations
@@ -34,6 +35,16 @@ from airquality.paths import create_run_dir
 
 
 DEFAULT_POLLUTANTS = ("NO2", "O3")
+
+
+def _pollutant_run_label(pollutants: tuple[str, ...]) -> str:
+    """Return the underscore-separated pollutant label used in run directories."""
+    labels = [
+        str(pollutant).strip().upper()
+        for pollutant in pollutants
+        if str(pollutant).strip()
+    ]
+    return "_".join(labels) or "UNKNOWN"
 
 
 def _requirement_note(table: pd.DataFrame) -> str:
@@ -432,18 +443,20 @@ def main() -> None:
     parser.add_argument("--forecast-models", nargs="+", default=None)
     parser.add_argument("--seasonality-m", type=int, default=None)
     args = parser.parse_args()
+    pollutants = tuple(args.pollutants)
 
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
         else create_run_dir(
-            Path("reports/data_blocks"), datetime.now().strftime("%Y%m%d_%H%M%S")
+            Path("reports/data_blocks"),
+            f"{_pollutant_run_label(pollutants)}_{datetime.now():%Y%m%d_%H%M%S}",
         )
     )
     run_analysis(
         base_dir=args.base_dir,
         output_dir=output_dir,
-        pollutants=tuple(args.pollutants),
+        pollutants=pollutants,
         context=args.context,
         horizon=args.horizon,
         stride=args.stride,
