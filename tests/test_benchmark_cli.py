@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from airquality.benchmark import main, run_benchmark_from_config
 from airquality.visualizations.montecarlo import (
@@ -41,9 +42,15 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
         }
     }
 
+    def fake_benchmark(**kwargs):
+        pd.DataFrame(columns=["Serie", "Reason_Code", "Reason"]).to_csv(
+            kwargs["excluded_series_output_path"], index=False
+        )
+        return results, summary, ranking_by_seed, plot_store
+
     monkeypatch.setattr(
         "airquality.benchmark.run_imputation_benchmark_parallel_montecarlo",
-        lambda: (results, summary, ranking_by_seed, plot_store),
+        fake_benchmark,
     )
     monkeypatch.setattr("airquality.benchmark._build_output_dir", lambda: tmp_path)
 
@@ -55,9 +62,15 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     assert (tmp_path / "results_mc.csv").exists()
     assert (tmp_path / "summary_mc.csv").exists()
     assert (tmp_path / "ranking_by_seed.csv").exists()
+    assert (tmp_path / "excluded_series.csv").exists()
     assert artifacts["plot_store_path"] == tmp_path / "plot_store.csv.gz"
     assert (tmp_path / "plot_store.csv.gz").exists()
     assert (tmp_path / "plot_images.csv").exists()
+    assert artifacts["log_path"] == tmp_path / "benchmark.log"
+    log_text = artifacts["log_path"].read_text(encoding="utf-8")
+    assert "Run started: imputation_benchmark" in log_text
+    assert "Imputation benchmark artifacts saved" in log_text
+    assert "Run completed: imputation_benchmark" in log_text
     assert (tmp_path / "plots" / "gap_1" / "Series_A.png").exists()
     # Aggregated metric-by-gap artifacts (previously never generated).
     assert artifacts["metric_gap_plot_path"] == tmp_path / "metrics_by_gap.png"
@@ -134,3 +147,24 @@ def test_main_prints_ranking_summary(monkeypatch, capsys) -> None:
     assert "TiDE" in out
     assert "TCN" in out
     assert "Saved benchmark artifacts under /tmp/bench" in out
+
+
+def test_run_benchmark_from_config_preserves_log_on_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def fail_benchmark(**kwargs):
+        del kwargs
+        raise RuntimeError("imputation failed")
+
+    monkeypatch.setattr(
+        "airquality.benchmark.run_imputation_benchmark_parallel_montecarlo",
+        fail_benchmark,
+    )
+    monkeypatch.setattr("airquality.benchmark._build_output_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="imputation failed"):
+        run_benchmark_from_config()
+
+    log_text = (tmp_path / "benchmark.log").read_text(encoding="utf-8")
+    assert "Run failed: imputation_benchmark" in log_text
+    assert "RuntimeError: imputation failed" in log_text
