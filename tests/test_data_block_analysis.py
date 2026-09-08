@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+
 import pandas as pd
 import pytest
 
 import airquality.data.block_analysis as block_analysis
 from airquality.data.block_analysis import (
     _worst_case_requirements,
+    _pollutant_run_label,
     analyze_raw_blocks,
     classify_blocks,
     observed_blocks,
@@ -17,6 +20,67 @@ from airquality.data.block_analysis import (
 from airquality.data.segments import contiguous_observed_segments
 from airquality.forecasting.backtest import get_strict_forecast_requirements
 from airquality.forecasting.registry import resolve_forecasting_model_configs
+from airquality.visualizations.block_analysis import (
+    _pollutant_color,
+    _summary_rows_for_plot,
+)
+
+
+def test_pollutant_run_label_is_explicit_and_ordered() -> None:
+    assert _pollutant_run_label(("o3",)) == "O3"
+    assert _pollutant_run_label(("no2", "O3")) == "NO2_O3"
+    assert _pollutant_run_label(()) == "UNKNOWN"
+
+
+def test_main_includes_pollutants_in_default_output_dir(monkeypatch, tmp_path) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_create_run_dir(_base_dir, name):
+        calls["name"] = name
+        return tmp_path
+
+    def fake_run_analysis(**kwargs):
+        calls["kwargs"] = kwargs
+        return {}
+
+    monkeypatch.setattr(block_analysis, "create_run_dir", fake_create_run_dir)
+    monkeypatch.setattr(block_analysis, "run_analysis", fake_run_analysis)
+    monkeypatch.setattr(sys, "argv", ["block_analysis", "--pollutants", "O3"])
+
+    block_analysis.main()
+
+    assert str(calls["name"]).startswith("O3_")
+    assert calls["kwargs"]["pollutants"] == ("O3",)
+
+
+def test_summary_plot_rows_keep_pollutants_and_optional_total() -> None:
+    summary = pd.DataFrame(
+        [
+            {"pollutant": "NO2", "used_blocks": 1014},
+            {"pollutant": "O3", "used_blocks": 1041},
+            {"pollutant": "TOTAL", "used_blocks": 2055},
+        ]
+    )
+
+    rows = _summary_rows_for_plot(summary)
+
+    assert rows["pollutant"].tolist() == ["NO2", "O3", "TOTAL"]
+    assert rows["used_blocks"].tolist() == [1014, 1041, 2055]
+
+    individual = _summary_rows_for_plot(
+        pd.DataFrame(
+            [
+                {"pollutant": "O3", "used_blocks": 1041},
+                {"pollutant": "TOTAL", "used_blocks": 1041},
+            ]
+        )
+    )
+    assert individual["pollutant"].tolist() == ["O3"]
+
+
+def test_block_length_plot_uses_distinct_stable_pollutant_colors() -> None:
+    assert _pollutant_color("NO2", 0) != _pollutant_color("O3", 1)
+    assert _pollutant_color("NO2", 0) == _pollutant_color("NO2", 1)
 
 
 def test_observed_blocks_and_validation_chronology() -> None:

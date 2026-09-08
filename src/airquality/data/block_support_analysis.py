@@ -12,6 +12,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -36,8 +37,6 @@ from airquality.forecasting.backtest import (
 from airquality.forecasting.cache import (
     CACHE_VERSION,
     BenchmarkCache,
-    artifact_fingerprint,
-    effective_config,
     series_fingerprint,
     transform_fingerprints,
 )
@@ -57,12 +56,14 @@ from airquality.forecasting.detection import (
     normalize_injection_variant,
 )
 from airquality.forecasting.fill import (
-    DEFAULT_MAX_GAP_SIZE,
+    GapImputationOutcome,
+    GapImputationPolicy,
     _repo_root,
-    _resolve_tspulse_model_path,
     build_imputer,
-    impute_series,
+    imputation_policy_cache_identity,
+    impute_series_by_gap_result,
     nan_gap_windows,
+    parse_imputation_gap_rules,
 )
 from airquality.forecasting.pipeline import (
     DEFAULT_STRATEGIES,
@@ -71,10 +72,11 @@ from airquality.forecasting.pipeline import (
     resolve_forecasting_devices,
 )
 from airquality.forecasting.registry import resolve_forecasting_model_configs
-from airquality.imputation.registry import DARTS_GLOBAL, TSPULSE, resolve_imputer_family
 from airquality.paths import create_run_dir
+from airquality.run_logging import RunLogging
 
-ANALYSIS_VERSION = 6
+ANALYSIS_VERSION = 8
+LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_pollutant(value: str) -> str:
@@ -96,50 +98,27 @@ def _age_stats(
     return float(np.median(ages)), float(np.max(ages))
 
 
-def _imputer_identity(
-    model_name: str, *, size_k: int, max_gap_size: int
-) -> dict[str, Any]:
-    family = resolve_imputer_family(model_name)
-    config: dict[str, Any] = {
-        "model": model_name,
-        "family": family,
-        "size_k": size_k,
-        "max_gap_size": max_gap_size,
-    }
-    artifacts: dict[str, str | None] = {}
-    if family == DARTS_GLOBAL:
-        weights = _repo_root() / "models" / f"{model_name}_k{size_k}.pt"
-        artifacts = {
-            "model": artifact_fingerprint(weights),
-            "checkpoint": artifact_fingerprint(Path(f"{weights}.ckpt")),
-        }
-    elif family == TSPULSE:
-        model_path = _resolve_tspulse_model_path(model_name)
-        model_id = cfg_get_str(
-            "tspulse", "model_id", "ibm-granite/granite-timeseries-tspulse-r1"
-        )
-        config["tspulse"] = effective_config(
-            {
-                "model_path": model_path,
-                "model_id": model_id,
-                "revision": cfg_get_str(
-                    "tspulse", "revision", "tspulse-hybrid-dualhead-512-p8-r1"
-                ),
-                "context_length": cfg_get_int("tspulse", "context_length", 512),
-                "device": cfg_get_str("tspulse", "device", "cpu"),
-            }
-        )
-        local_source = Path(model_path or model_id).expanduser()
-        if local_source.exists():
-            artifacts["model"] = artifact_fingerprint(local_source)
-    return {"config": config, "artifacts": artifacts}
-
-
 def _block_index(blocks: pd.DataFrame, selected: pd.Series) -> pd.DatetimeIndex:
     values: list[pd.Timestamp] = []
     for row in blocks.loc[selected].itertuples(index=False):
         values.extend(pd.date_range(row.start, row.end, freq="h"))
     return pd.DatetimeIndex(values)
+
+
+def _effective_block_index(
+    blocks: pd.DataFrame, validation_hours: int
+) -> pd.DatetimeIndex:
+    """Return the points actually available for training before the holdout."""
+    values: list[pd.Timestamp] = []
+    for row in blocks.loc[blocks["used"]].itertuples(index=False):
+        block_index = pd.date_range(row.start, row.end, freq="h")
+        if row.validation_host and validation_hours:
+            block_index = block_index[:-validation_hours]
+        values.extend(block_index)
+    effective = pd.DatetimeIndex(values)
+    if len(effective) != int(blocks["training_hours"].sum()):
+        raise RuntimeError("El indice efectivo no coincide con las horas de entrenamiento")
+    return effective
 
 
 def _analyze_arm(
@@ -149,7 +128,7 @@ def _analyze_arm(
     arm: str,
     stage: str,
     strategy: str,
-    imputation_model: str,
+    imputation_policy: str,
     detection: DetectionResult | None,
     imputed_mask: pd.Series,
     anomaly_imputed_mask: pd.Series,
@@ -200,6 +179,18 @@ def _analyze_arm(
     valid_preexisting_imputed = valid_index.intersection(
         preexisting_imputed_mask.index[preexisting_imputed_mask]
     )
+    effective_index = _effective_block_index(
+        blocks, int(requirements["validation_hours"])
+    )
+    effective_imputed = effective_index.intersection(
+        imputed_mask.index[imputed_mask]
+    )
+    effective_anomaly_imputed = effective_index.intersection(
+        anomaly_imputed_mask.index[anomaly_imputed_mask]
+    )
+    effective_preexisting_imputed = effective_index.intersection(
+        preexisting_imputed_mask.index[preexisting_imputed_mask]
+    )
     valid_real = valid_index.difference(valid_imputed)
     imputed_age_median, imputed_age_max = _age_stats(
         valid_imputed, test_target_start
@@ -211,7 +202,7 @@ def _analyze_arm(
             "stage": stage,
             "strategy": strategy,
             "imputed": stage == "imputed",
-            "imputation_model": imputation_model,
+            "imputation_policy": imputation_policy,
             "detectors": (
                 ",".join(detection.detectors) if detection is not None else ""
             ),
@@ -235,6 +226,11 @@ def _analyze_arm(
             "valid_imputed_hours": len(valid_imputed),
             "valid_imputed_anomaly_hours": len(valid_anomaly_imputed),
             "valid_imputed_preexisting_gap_hours": len(valid_preexisting_imputed),
+            "effective_imputed_hours": len(effective_imputed),
+            "effective_imputed_anomaly_hours": len(effective_anomaly_imputed),
+            "effective_imputed_preexisting_gap_hours": len(
+                effective_preexisting_imputed
+            ),
             "host_capable_blocks": int(blocks["host_capable"].sum()),
             "used_blocks": int(blocks["used"].sum()),
             "effective_training_hours": int(blocks["training_hours"].sum()),
@@ -253,9 +249,13 @@ def _gap_diagnostics(
     detection: DetectionResult,
     *,
     strategy: str,
-    max_gap_size: int,
+    policy: GapImputationPolicy,
+    outcomes: Sequence[GapImputationOutcome],
 ) -> list[dict[str, Any]]:
     mask = detection.mask.reindex(raw_train.index, fill_value=False).astype(bool)
+    outcome_by_window = {
+        (outcome.start, outcome.end): outcome for outcome in outcomes
+    }
     rows = []
     for window in nan_gap_windows(cleaned):
         anomaly_hours = int((raw_train.loc[window].notna() & mask.loc[window]).sum())
@@ -267,6 +267,8 @@ def _gap_diagnostics(
         else:
             origin = "preexisting"
         n_filled = int(imputed.loc[window].notna().sum())
+        configured_imputer = policy.model_for(len(window))
+        outcome = outcome_by_window[(window[0], window[-1])]
         rows.append(
             {
                 "series": str(raw_train.name),
@@ -277,7 +279,10 @@ def _gap_diagnostics(
                 "origin": origin,
                 "anomaly_hours": anomaly_hours,
                 "preexisting_gap_hours": preexisting_hours,
-                "eligible_for_imputation": len(window) <= max_gap_size,
+                "eligible_for_imputation": configured_imputer is not None,
+                "configured_imputer": configured_imputer or "none",
+                "fallback_used": outcome.fallback_used,
+                "effective_imputer": outcome.effective_imputer,
                 "filled_hours": n_filled,
                 "fully_filled": n_filled == len(window),
             }
@@ -310,6 +315,7 @@ def _add_comparisons(table: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
             )
             if out.loc[index, "stage"] != "imputed":
                 out.loc[index, "imputation_gain_valid_hours"] = 0
+                out.loc[index, "imputation_gain_effective_hours"] = 0
                 continue
             detected = group.loc[
                 (group["strategy"] == out.loc[index, "strategy"])
@@ -318,6 +324,10 @@ def _add_comparisons(table: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
             if not detected.empty:
                 out.loc[index, "imputation_gain_valid_hours"] = (
                     valid - int(detected.iloc[0]["valid_hours"])
+                )
+                out.loc[index, "imputation_gain_effective_hours"] = (
+                    effective
+                    - int(detected.iloc[0]["effective_training_hours"])
                 )
     return out
 
@@ -342,6 +352,15 @@ def _summarize(series_summary: pd.DataFrame) -> pd.DataFrame:
             valid_imputed_anomaly_hours=("valid_imputed_anomaly_hours", "sum"),
             valid_imputed_preexisting_gap_hours=(
                 "valid_imputed_preexisting_gap_hours",
+                "sum",
+            ),
+            effective_imputed_hours=("effective_imputed_hours", "sum"),
+            effective_imputed_anomaly_hours=(
+                "effective_imputed_anomaly_hours",
+                "sum",
+            ),
+            effective_imputed_preexisting_gap_hours=(
+                "effective_imputed_preexisting_gap_hours",
                 "sum",
             ),
             host_capable_blocks=("host_capable_blocks", "sum"),
@@ -381,20 +400,22 @@ def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
             "- `summary.csv`: comparacion agregada frente a raw.",
             "- `series_summary.csv`: soporte por serie y brazo.",
             "- `blocks.csv`: bloques resultantes y elegibilidad del protocolo.",
-            "- `gaps.csv`: origen, longitud y resultado real de cada gap.",
+            "- `gaps.csv`: origen, longitud, imputador asignado y resultado real de cada gap.",
             "- `detection.csv`: cobertura y tasa por estrategia.",
             "- `excluded_series.csv`: series sin test comun viable.",
             "- `manifest.json`: configuracion efectiva.",
+            "- `benchmark.log`: progreso y estado final de la ejecucion.",
             "",
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def run_analysis(
+def _run_analysis(
     *,
     output_dir: str | Path | None = None,
     pollutant: str | None = None,
+    strategies: Sequence[str] | None = None,
     mask_transforms: Sequence[MaskTransform] | None = None,
 ) -> dict[str, Any]:
     """Run the config-driven support audit and persist tables."""
@@ -465,9 +486,14 @@ def run_analysis(
     train_requirement = int(all_requirements["minimum_hours"])
     host_requirement = int(all_requirements["host_minimum_hours"])
 
+    configured_strategies = (
+        strategies
+        if strategies is not None
+        else cfg_get_csv_list("forecasting", "strategies", DEFAULT_STRATEGIES)
+    )
     strategy_specs = [
         spec.strip().lower()
-        for spec in cfg_get_csv_list("forecasting", "strategies", DEFAULT_STRATEGIES)
+        for spec in configured_strategies
     ]
     threshold_k = cfg_get_float("forecasting", "threshold_k", 3.5)
     max_detection_rate = cfg_get_float("forecasting", "max_detection_rate", 0.07)
@@ -515,29 +541,24 @@ def run_analysis(
     detectors = resolve_model_names(
         list(cfg_get_csv_list("forecasting", "detectors", ("all",)))
     )
-    imputation_model = cfg_get_str("forecasting", "imputation_model", "TSPulse")
-    max_imputation_gap = cfg_get_int(
-        "forecasting", "max_imputation_gap", DEFAULT_MAX_GAP_SIZE
+    imputation_policy = parse_imputation_gap_rules(
+        cfg_get_str("forecasting", "imputation_gap_rules", "")
     )
-    if max_imputation_gap < 1:
-        raise ValueError("max_imputation_gap debe ser positivo")
-    imputer_key = _imputer_identity(
-        imputation_model,
+    imputer_key = imputation_policy_cache_identity(
+        imputation_policy,
         size_k=imputation_size_k,
-        max_gap_size=max_imputation_gap,
     )
-    use_scaler = imputation_model not in ("interp", "LinearInterp")
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
     cache_dir = cfg_get_str("forecasting", "cache_dir", "reports/forecasting/cache")
     cache = BenchmarkCache((_repo_root() / cache_dir) if use_cache else None)
-    imputer_ref: list[Any] = []
+    imputer_ref: dict[str, Any] = {}
 
-    def get_imputer() -> Any:
-        if not imputer_ref:
-            imputer_ref.append(
-                build_imputer(imputation_model, freq=freq, size_k=imputation_size_k)
+    def get_imputer(model_name: str) -> Any:
+        if model_name not in imputer_ref:
+            imputer_ref[model_name] = build_imputer(
+                model_name, freq=freq, size_k=imputation_size_k
             )
-        return imputer_ref[0]
+        return imputer_ref[model_name]
 
     series_rows: list[dict[str, Any]] = []
     block_frames: list[pd.DataFrame] = []
@@ -552,10 +573,26 @@ def run_analysis(
     if not series_dfs:
         raise RuntimeError("No se cargaron series para el analisis")
 
+    LOGGER.info(
+        "Block support initialized: pollutant=%s series=%d strategies=%s detectors=%s device=%s cache=%s",
+        pollutant,
+        len(series_dfs),
+        ",".join(strategy.name for strategy in strategies),
+        ",".join(detectors),
+        device,
+        "enabled" if use_cache else "disabled",
+    )
     transform_names = transform_fingerprints(mask_transforms)
-    for frame in series_dfs:
+    for series_index, frame in enumerate(series_dfs, start=1):
         series = frame.iloc[:, 0]
         name = str(series.name)
+        LOGGER.info(
+            "Series %d/%d started: %s (%d observed hours)",
+            series_index,
+            len(series_dfs),
+            name,
+            int(series.notna().sum()),
+        )
         series_fp = series_fingerprint(series)
         base_key = {
             "version": CACHE_VERSION,
@@ -625,6 +662,12 @@ def run_analysis(
                     "exclusion_reason": "no_common_fixed_test_and_training_host",
                 }
             )
+            LOGGER.warning(
+                "Series %d/%d excluded: %s (no common fixed test and training host)",
+                series_index,
+                len(series_dfs),
+                name,
+            )
             continue
 
         train_raw = series.loc[window["train_index"]]
@@ -650,7 +693,7 @@ def run_analysis(
             arm="raw",
             stage="raw",
             strategy="none",
-            imputation_model="none",
+            imputation_policy="none",
             detection=None,
             imputed_mask=false_mask,
             anomaly_imputed_mask=false_mask,
@@ -689,6 +732,15 @@ def run_analysis(
                     "detection_rate_pct": 100.0 * detection.detection_rate,
                 }
             )
+            LOGGER.info(
+                "Series %d/%d strategy=%s coverage=%.2f%% detection_rate=%.2f%% flagged_train=%d",
+                series_index,
+                len(series_dfs),
+                strategy.name,
+                100.0 * n_scored / n_observed if n_observed else 0.0,
+                100.0 * detection.detection_rate,
+                int((train_mask & train_raw.notna()).sum()),
+            )
             cleaned = remove_anomalies(train_raw, detection)
             clean_rows, clean_blocks = _analyze_arm(
                 cleaned,
@@ -696,7 +748,7 @@ def run_analysis(
                 arm=f"{strategy.name}+noimpute",
                 stage="detected",
                 strategy=strategy.name,
-                imputation_model="none",
+                imputation_policy="none",
                 detection=detection,
                 imputed_mask=false_mask,
                 anomaly_imputed_mask=false_mask,
@@ -716,16 +768,29 @@ def run_analysis(
                 "strategy": asdict(strategy),
                 "imputer": imputer_key,
             }
-            imputed = cache.get("imputation_support", imputation_key)
-            if imputed is None:
-                imputed = impute_series(
-                    cleaned,
-                    get_imputer(),
-                    freq=freq,
-                    use_scaler=use_scaler,
-                    max_gap_size=max_imputation_gap,
+            imputation_result = cache.get("imputation_support", imputation_key)
+            if imputation_result is None:
+                LOGGER.info(
+                    "Series %d/%d strategy=%s imputation cache miss",
+                    series_index,
+                    len(series_dfs),
+                    strategy.name,
                 )
-                cache.put("imputation_support", imputation_key, imputed)
+                imputation_result = impute_series_by_gap_result(
+                    cleaned,
+                    imputation_policy,
+                    get_imputer,
+                    freq=freq,
+                )
+                cache.put("imputation_support", imputation_key, imputation_result)
+            else:
+                LOGGER.info(
+                    "Series %d/%d strategy=%s imputation cache hit",
+                    series_index,
+                    len(series_dfs),
+                    strategy.name,
+                )
+            imputed = imputation_result.series
             imputed_mask = cleaned.isna() & imputed.notna()
             anomaly_imputed_mask = imputed_mask & train_raw.notna() & train_mask
             preexisting_imputed_mask = imputed_mask & train_raw.isna()
@@ -735,7 +800,7 @@ def run_analysis(
                 arm=f"{strategy.name}+impute",
                 stage="imputed",
                 strategy=strategy.name,
-                imputation_model=imputation_model,
+                imputation_policy=imputation_policy.spec,
                 detection=detection,
                 imputed_mask=imputed_mask,
                 anomaly_imputed_mask=anomaly_imputed_mask,
@@ -753,9 +818,11 @@ def run_analysis(
                     imputed,
                     detection,
                     strategy=strategy.name,
-                    max_gap_size=max_imputation_gap,
+                    policy=imputation_policy,
+                    outcomes=imputation_result.outcomes,
                 )
             )
+        LOGGER.info("Series %d/%d completed: %s", series_index, len(series_dfs), name)
 
     series_summary = _add_comparisons(pd.DataFrame(series_rows), ["series"])
     summary = _summarize(series_summary)
@@ -773,8 +840,7 @@ def run_analysis(
         "injection_seed": injection_seed,
         "injection_variant": injection_variant,
         "injection_policy": INJECTION_POLICY_VERSION,
-        "imputation_model": imputation_model,
-        "max_imputation_gap": max_imputation_gap,
+        "imputation_gap_rules": imputation_policy.spec,
         "holdout": holdout,
         "context_len": context_len,
         "horizon": horizon,
@@ -803,10 +869,11 @@ def run_analysis(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     _write_readme(output / "README.md", manifest)
-    print(f"[cache] {cache.stats()}")
-    print(f"[info] Diagnostico de soporte en {output}")
+    LOGGER.info("Cache summary: %s", cache.stats())
+    LOGGER.info("Block support artifacts saved under %s", output)
     return {
         "output_dir": output,
+        "log_path": output / "benchmark.log",
         "summary_df": summary,
         "series_summary_df": series_summary,
         "blocks_df": blocks,
@@ -814,6 +881,37 @@ def run_analysis(
         "detection_df": detection,
         "excluded_df": excluded,
     }
+
+
+def run_analysis(
+    *,
+    output_dir: str | Path | None = None,
+    pollutant: str | None = None,
+    strategies: Sequence[str] | None = None,
+    mask_transforms: Sequence[MaskTransform] | None = None,
+) -> dict[str, Any]:
+    """Run the support audit with a persistent log in its output directory."""
+    requested_pollutant = (
+        pollutant
+        if pollutant is not None
+        else cfg_get_str("forecasting", "pollutant", "NO2")
+    )
+    normalized_pollutant = _normalize_pollutant(requested_pollutant)
+    output = (
+        Path(output_dir)
+        if output_dir is not None
+        else create_run_dir(
+            _repo_root() / "reports" / "data_blocks",
+            f"forecast_support_{normalized_pollutant}_{datetime.now():%Y%m%d_%H%M%S}",
+        )
+    )
+    with RunLogging(output, "block_support_analysis"):
+        return _run_analysis(
+            output_dir=output,
+            pollutant=normalized_pollutant,
+            strategies=strategies,
+            mask_transforms=mask_transforms,
+        )
 
 
 def main() -> None:
@@ -824,10 +922,20 @@ def main() -> None:
     parser.add_argument(
         "--pollutant",
         default=None,
-        help="Contaminante (CO o NO2); por defecto usa [forecasting] pollutant.",
+        help="Contaminante (CO, NO2 u O3); por defecto usa [forecasting] pollutant.",
+    )
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        default=None,
+        help="Estrategias de deteccion para este informe; por defecto usa [forecasting] strategies.",
     )
     args = parser.parse_args()
-    run_analysis(output_dir=args.output_dir, pollutant=args.pollutant)
+    run_analysis(
+        output_dir=args.output_dir,
+        pollutant=args.pollutant,
+        strategies=args.strategies,
+    )
 
 
 if __name__ == "__main__":
