@@ -2069,15 +2069,8 @@ def _save_plot_images(
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    scale_by_series: dict[str, float] = {}
     example_seed: int | None = None
     if results_mc_df is not None and not results_mc_df.empty:
-        if {"Serie", "Scale_Std"}.issubset(results_mc_df.columns):
-            scales = results_mc_df[["Serie", "Scale_Std"]].copy()
-            scales["Scale_Std"] = pd.to_numeric(scales["Scale_Std"], errors="coerce")
-            scale_by_series = (
-                scales.dropna().groupby("Serie")["Scale_Std"].first().to_dict()
-            )
         if "Seed" in results_mc_df.columns:
             seed_rows = results_mc_df
             if "MonteCarlo_Run" in seed_rows.columns:
@@ -2122,22 +2115,57 @@ def _save_plot_images(
                     mask_index = mask_index.union(pd.DatetimeIndex(pred_series.index))
 
             gap_real = actual.reindex(mask_index).dropna().sort_index()
-            metric_scale = float(scale_by_series.get(str(series_name), float("nan")))
-            scaled_local_mae = np.isfinite(metric_scale) and metric_scale > 0.0
-            model_scores: dict[str, float] = {}
-            for model_name, pred_series in clean_preds.items():
-                common = gap_real.index.intersection(pred_series.index)
-                if len(common) > 0:
-                    error = np.abs(
-                        gap_real.reindex(common).to_numpy(dtype=float)
-                        - pred_series.reindex(common).to_numpy(dtype=float)
+            model_values: dict[str, np.ndarray] = {}
+            if (
+                results_mc_df is not None
+                and {"Modelo", "Serie", "Gap_Size", "MASE"}.issubset(
+                    results_mc_df.columns
+                )
+            ):
+                metric_rows = results_mc_df[
+                    (results_mc_df["Serie"].astype(str) == str(series_name))
+                    & (
+                        pd.to_numeric(results_mc_df["Gap_Size"], errors="coerce")
+                        == int(gap_size)
                     )
-                    finite = error[np.isfinite(error)]
-                    if len(finite) > 0:
-                        score = float(finite.mean())
-                        model_scores[model_name] = (
-                            score / metric_scale if scaled_local_mae else score
+                ].copy()
+                metric_rows["MASE"] = pd.to_numeric(
+                    metric_rows["MASE"], errors="coerce"
+                )
+                sample_columns = [
+                    column
+                    for column in ("MonteCarlo_Run", "Seed")
+                    if column in metric_rows.columns
+                ]
+                if sample_columns:
+                    metric_rows = metric_rows.groupby(
+                        ["Modelo", *sample_columns], as_index=False, sort=False
+                    )["MASE"].mean()
+                for model_name, model_rows in metric_rows.groupby("Modelo", sort=False):
+                    values = model_rows["MASE"].to_numpy(dtype=float)
+                    values = values[np.isfinite(values)]
+                    if len(values):
+                        model_values[str(model_name)] = values
+
+            # Old plot stores can be rendered without results_mc.csv metrics.
+            # In that case, retain an explicitly unscaled absolute-error panel.
+            metric_name = "MASE" if model_values else "Error absoluto"
+            if not model_values:
+                for model_name, pred_series in clean_preds.items():
+                    common = gap_real.index.intersection(pred_series.index)
+                    if len(common) > 0:
+                        errors = np.abs(
+                            gap_real.reindex(common).to_numpy(dtype=float)
+                            - pred_series.reindex(common).to_numpy(dtype=float)
                         )
+                        errors = errors[np.isfinite(errors)]
+                        if len(errors):
+                            model_values[model_name] = errors
+
+            model_scores = {
+                model_name: float(values.mean())
+                for model_name, values in model_values.items()
+            }
 
             ranked_models = sorted(model_scores, key=lambda name: (model_scores[name], name))
             colors = _model_color_map(list(clean_preds))
@@ -2170,7 +2198,6 @@ def _save_plot_images(
             context_ax.tick_params(axis="x", labelrotation=0)
 
             gap_index = pd.DatetimeIndex(gap_real.index)
-            x = np.arange(len(gap_real))
             boundaries = [0]
             if len(gap_index) > 1:
                 actual_steps = pd.DatetimeIndex(actual.index).to_series().diff().dropna()
@@ -2183,22 +2210,11 @@ def _save_plot_images(
             boundaries.append(len(gap_real))
             gap_count = max(0, len(boundaries) - 1)
 
-            real_values = gap_real.to_numpy(dtype=float)
-            error_values: dict[str, np.ndarray] = {}
-            for model_name in ranked_models:
-                predictions = clean_preds[model_name].reindex(gap_index).to_numpy(dtype=float)
-                valid = np.isfinite(real_values) & np.isfinite(predictions)
-                errors = np.abs(real_values[valid] - predictions[valid])
-                if scaled_local_mae:
-                    errors = errors / metric_scale
-                if len(errors) > 0:
-                    error_values[model_name] = errors
-
-            error_models = [model for model in ranked_models if model in error_values]
+            error_models = [model for model in ranked_models if model in model_values]
             positions = np.arange(len(error_models))
             for position, model_name in zip(positions, error_models, strict=True):
                 box = error_ax.boxplot(
-                    error_values[model_name],
+                    model_values[model_name],
                     positions=[position],
                     widths=0.62,
                     orientation="horizontal",
@@ -2227,7 +2243,7 @@ def _save_plot_images(
                     artist.set_edgecolor(colors[model_name])
                 error_ax.annotate(
                     f"media={model_scores[model_name]:.2f}",
-                    (float(np.mean(error_values[model_name])), position),
+                    (model_scores[model_name], position),
                     xytext=(5, 0),
                     textcoords="offset points",
                     va="center",
@@ -2235,12 +2251,15 @@ def _save_plot_images(
                     color=TEXT_COLOR,
                 )
             error_ax.set_title(
-                "Distribucion del error absoluto por modelo",
+                (
+                    "Distribucion del MASE entre semillas por modelo"
+                    if metric_name == "MASE"
+                    else "Distribucion del error absoluto por modelo"
+                ),
                 loc="left", fontsize=11, fontweight="bold",
             )
             error_ax.set_xlabel(
-                ("Error absoluto escalado" if scaled_local_mae else "Error absoluto")
-                + " en los valores ocultados"
+                "MASE" if metric_name == "MASE" else "Error absoluto en los valores ocultados"
             )
             error_ax.set_ylabel("Modelo")
             error_ax.set_yticks(positions)
@@ -2262,16 +2281,16 @@ def _save_plot_images(
 
             fig.suptitle(
                 f"Imputacion de {series_name} | Huecos de {int(gap_size)} h",
-                x=0.07, y=0.975, ha="left", fontsize=15, fontweight="bold", color=TEXT_COLOR,
+                x=0.07, y=0.98, ha="left", fontsize=15, fontweight="bold", color=TEXT_COLOR,
             )
             fig.text(
-                0.07, 0.94,
+                0.07, 0.91,
                 f"{gap_count} huecos, {len(gap_real)} puntos ocultados. "
-                "Abajo se resume una semilla representativa.\n"
-                "Cómo leer: cajas más a la izquierda y estrechas indican menor error y mayor estabilidad entre puntos ocultados.",
+                "Arriba se muestra una semilla representativa; abajo se resumen todas las semillas.\n"
+                "Como leer: cajas mas a la izquierda y estrechas indican menor MASE y mayor estabilidad entre semillas.",
                 ha="left", fontsize=9, color="#6d6258",
             )
-            fig.subplots_adjust(left=0.07, right=0.96, bottom=0.09, top=0.87)
+            fig.subplots_adjust(left=0.07, right=0.96, bottom=0.09, top=0.82)
 
             image_path = gap_dir / f"{_sanitize_filename(str(series_name))}.png"
             fig.savefig(image_path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
@@ -2284,6 +2303,116 @@ def _save_plot_images(
                     "seed": example_seed,
                     "gap_count": gap_count,
                     "target_points": len(gap_real),
+                    "model_count": len(ranked_models),
+                    "image_path": str(image_path.relative_to(output_dir)),
+                }
+            )
+
+    if (
+        results_mc_df is not None
+        and {"Modelo", "Serie", "Gap_Size", "MASE"}.issubset(results_mc_df.columns)
+    ):
+        _, station_means = _station_seed_metric_tables(results_mc_df, ["MASE"])
+        for gap_size, gap_rows in station_means.groupby("Gap_Size", sort=True):
+            model_values = {}
+            for model_name, model_rows in gap_rows.groupby("Modelo", sort=False):
+                values = model_rows["MASE"].to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if len(values):
+                    model_values[str(model_name)] = values
+            if not model_values:
+                continue
+
+            model_scores = {
+                model_name: float(values.mean())
+                for model_name, values in model_values.items()
+            }
+            ranked_models = sorted(model_scores, key=lambda name: (model_scores[name], name))
+            colors = _model_color_map(ranked_models)
+            positions = np.arange(len(ranked_models))
+
+            fig, ax = plt.subplots(figsize=(13.2, 7.8), facecolor=FIGURE_FACE)
+            _style_metric_axis(ax)
+            for position, model_name in zip(positions, ranked_models, strict=True):
+                box = ax.boxplot(
+                    model_values[model_name],
+                    positions=[position],
+                    widths=0.62,
+                    orientation="horizontal",
+                    patch_artist=True,
+                    showmeans=True,
+                    meanline=False,
+                    boxprops={"facecolor": colors[model_name], "alpha": 0.72},
+                    medianprops={"color": TEXT_COLOR, "linewidth": 1.5},
+                    meanprops={
+                        "marker": "D",
+                        "markerfacecolor": "#f3b43f",
+                        "markeredgecolor": TEXT_COLOR,
+                        "markersize": 5,
+                    },
+                    whiskerprops={"color": colors[model_name], "linewidth": 1.2},
+                    capprops={"color": colors[model_name], "linewidth": 1.2},
+                    flierprops={
+                        "marker": ".",
+                        "markerfacecolor": colors[model_name],
+                        "markeredgecolor": colors[model_name],
+                        "alpha": 0.45,
+                        "markersize": 4,
+                    },
+                )
+                for artist in box["boxes"]:
+                    artist.set_edgecolor(colors[model_name])
+                ax.annotate(
+                    f"media={model_scores[model_name]:.2f}",
+                    (model_scores[model_name], position),
+                    xytext=(5, 0),
+                    textcoords="offset points",
+                    va="center",
+                    fontsize=7.5,
+                    color=TEXT_COLOR,
+                )
+
+            ax.axvline(1.0, color="#d6453c", linestyle="--", linewidth=1.1, alpha=0.7)
+            ax.set_xlabel("MASE medio por estacion")
+            ax.set_ylabel("Modelo")
+            ax.set_yticks(positions)
+            ax.set_yticklabels(ranked_models, fontsize=8)
+            ax.invert_yaxis()
+            ax.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.55)
+            ax.grid(False, axis="y")
+            ax.margins(x=0.14)
+            fig.suptitle(
+                f"MASE medio entre estaciones | Huecos de {int(gap_size)} h",
+                x=0.07,
+                y=0.98,
+                ha="left",
+                fontsize=15,
+                fontweight="bold",
+                color=TEXT_COLOR,
+            )
+            fig.text(
+                0.07,
+                0.91,
+                "Cada observacion es el MASE medio de una estacion tras promediar sus semillas.\n"
+                "El diamante indica la media de todas las estaciones; la linea roja marca MASE = 1.",
+                ha="left",
+                fontsize=9,
+                color="#6d6258",
+            )
+            fig.subplots_adjust(left=0.18, right=0.96, bottom=0.1, top=0.82)
+
+            gap_dir = plots_dir / f"gap_{int(gap_size)}"
+            gap_dir.mkdir(parents=True, exist_ok=True)
+            image_path = gap_dir / "media_estaciones.png"
+            fig.savefig(image_path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
+            plt.close(fig)
+            rows.append(
+                {
+                    "gap_size": int(gap_size),
+                    "series_name": "Media de estaciones",
+                    "seed": None,
+                    "gap_count": None,
+                    "target_points": None,
                     "model_count": len(ranked_models),
                     "image_path": str(image_path.relative_to(output_dir)),
                 }
