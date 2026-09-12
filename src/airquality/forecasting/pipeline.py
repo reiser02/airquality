@@ -743,12 +743,19 @@ def _run_benchmark_from_config(
         )
     vote_top_k = cfg_get_int("forecasting", "vote_top_k", DEFAULT_VOTE_TOP_K)
     vote_min_votes = cfg_get_int("forecasting", "vote_min_votes", DEFAULT_VOTE_MIN_VOTES)
+    preserve_frozen = cfg_get_bool("forecasting", "preserve_frozen", False)
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
     cache_dir = cfg_get_str("forecasting", "cache_dir", "reports/forecasting/cache")
     heartbeat_seconds = cfg_get_int("forecasting", "heartbeat_seconds", 60)
     if heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds debe ser positivo")
     cache = BenchmarkCache((_repo_root() / cache_dir) if use_cache else None)
+    PROGRESS_LOGGER.info(
+        "[preprocess] preserve_frozen=%s exclude_frozen=%s remove_repeated=%s",
+        preserve_frozen,
+        not preserve_frozen,
+        not preserve_frozen,
+    )
     foundation_test_enabled = foundation_test_requested and bool(
         foundation_model_configs
     )
@@ -782,7 +789,10 @@ def _run_benchmark_from_config(
     )
 
     series_dfs = _load_raw_hourly_series(
-        pollutant=pollutant, raw_base_dir=raw_base_dir, freq=freq
+        pollutant=pollutant,
+        raw_base_dir=raw_base_dir,
+        freq=freq,
+        preserve_frozen=preserve_frozen,
     )
     if not series_dfs:
         raise RuntimeError("No se cargaron series para el benchmark.")
@@ -849,6 +859,7 @@ def _run_benchmark_from_config(
             "min_selection_points": min_selection_points,
             "vote_top_k": vote_top_k,
             "vote_min_votes": vote_min_votes,
+            "preserve_frozen": preserve_frozen,
         }
     )
     foundation_test_config = effective_config(
@@ -877,7 +888,6 @@ def _run_benchmark_from_config(
         if foundation_test_enabled
         else None
     )
-
     global _ACTIVE_DEVICE_QUEUE, _ACTIVE_GPU_EXECUTOR, _ACTIVE_PROGRESS
     output_dir = _build_output_dir()
     progress = BenchmarkProgress(
