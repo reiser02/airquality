@@ -25,6 +25,17 @@ matching ``raw`` arm (see ``airquality.forecasting.pipeline.METRIC_COLS``).
   region is fast and precise.
 - ``foundation_preprocessing_recovery_{mase,rmsse}.png`` — paired error recovered
   after preprocessing synthetic context anomalies, by model, strategy and type.
+- ``executive_branch_summary_{relmae,relrmse}.png`` — station-balanced branch
+  improvement vs ``raw`` with bootstrap intervals and practical win/tie/loss rates.
+- ``raw_model_ranking_{mase,rmsse}.png`` — all models ranked on the common ``raw``
+  view; foundation training cost is treated as zero.
+- ``executive_model_arm_{mase,rmsse}.png`` — compact model×arm mean-error matrix.
+- ``executive_imputation_{mase,rmsse}.png`` — aggregated with/without-imputation
+  comparison by detection strategy.
+- ``executive_cost_accuracy_{mase,rmsse}.png`` — predictor training/inference cost
+  vs error, with the Pareto frontier highlighted.
+- ``foundation_anomaly_robustness_{mase,rmsse}.png`` — per-run synthetic anomaly
+  damage before and after foundation-context preprocessing.
 
 Arm colors follow the strategy *family* and stay fixed across figures
 (``raw`` is deliberately neutral: it is the baseline, not a competing series).
@@ -81,6 +92,15 @@ IMPROVEMENT_CMAP = LinearSegmentedColormap.from_list(
 )
 
 MODEL_MARKERS = ("o", "s", "^", "D", "v", "P")
+
+MODEL_MODE_COLORS = {
+    "trained": "#3d7ab5",
+    "local": "#cf6f1e",
+    "foundation": "#5b8c5a",
+}
+MODEL_MODE_MARKERS = {"trained": "o", "local": "s", "foundation": "*"}
+PRACTICAL_EQUIVALENCE_PCT = 1.0
+BOOTSTRAP_SAMPLES = 10_000
 
 #: Display names for the benchmark metrics.
 METRIC_LABELS = {
@@ -190,6 +210,654 @@ def imputation_pairs(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
 def _finite(values: pd.Series) -> np.ndarray:
     array = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
     return array[np.isfinite(array)]
+
+
+def _successful_results(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Return successful rows while remaining compatible with small plot fixtures."""
+    if "status" not in results_df.columns:
+        return results_df.copy()
+    return results_df.loc[results_df["status"].astype(str) == "ok"].copy()
+
+
+def _foundation_mask(results_df: pd.DataFrame) -> pd.Series:
+    """Identify zero-shot foundation rows, or none in legacy/minimal fixtures."""
+    if "model_mode" not in results_df.columns:
+        return pd.Series(False, index=results_df.index)
+    return results_df["model_mode"].astype(str).eq("foundation")
+
+
+def _common_nonfoundation_results(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Rows whose arms share the primary raw targets and can be compared directly."""
+    frame = _successful_results(results_df)
+    return frame.loc[
+        ~_foundation_mask(frame) & frame["arm"].astype(str).ne(RAW_FROZEN_ARM)
+    ].copy()
+
+
+def _station_arm_scores(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Balanced station×arm errors after equally averaging non-foundation models."""
+    frame = _common_nonfoundation_results(results_df)
+    if frame.empty or metric not in frame.columns:
+        return pd.DataFrame()
+    frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
+    arms = list(dict.fromkeys(frame["arm"].astype(str)))
+    models = list(dict.fromkeys(frame["model"].astype(str)))
+    stations = list(dict.fromkeys(frame["series"].astype(str)))
+    if RAW_ARM not in arms or not models or not stations:
+        return pd.DataFrame()
+    panel = frame.pivot_table(
+        index=["series", "model"], columns="arm", values=metric, aggfunc="first", sort=False
+    ).reindex(
+        pd.MultiIndex.from_product([stations, models], names=["series", "model"]),
+        columns=arms,
+    )
+    finite = np.isfinite(panel.to_numpy(dtype=float))
+    complete = pd.Series(finite.all(axis=1), index=panel.index).groupby(level="series").all()
+    kept = complete[complete].index
+    if len(kept) == 0:
+        return pd.DataFrame()
+    panel = panel.loc[panel.index.get_level_values("series").isin(kept)]
+    return panel.groupby(level="series", sort=False).mean()
+
+
+def _bootstrap_mean_interval(
+    values: np.ndarray,
+    *,
+    seed: int = 13,
+    samples: int = BOOTSTRAP_SAMPLES,
+) -> tuple[float, float]:
+    """Deterministic percentile interval for a station-level arithmetic mean."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(values), size=(samples, len(values)))
+    means = values[indices].mean(axis=1)
+    low, high = np.quantile(means, (0.025, 0.975))
+    return float(low), float(high)
+
+
+def _pareto_mask(cost: np.ndarray, error: np.ndarray) -> np.ndarray:
+    """Return points not dominated jointly on lower cost and lower error."""
+    cost = np.asarray(cost, dtype=float)
+    error = np.asarray(error, dtype=float)
+    keep = np.zeros(len(cost), dtype=bool)
+    for index, (this_cost, this_error) in enumerate(zip(cost, error, strict=True)):
+        valid = np.isfinite(cost) & np.isfinite(error)
+        dominates = valid & (cost <= this_cost) & (error <= this_error)
+        strictly = (cost < this_cost) | (error < this_error)
+        keep[index] = not bool(np.any(dominates & strictly))
+    return keep
+
+
+def save_executive_branch_summary_plot(
+    output_path: Path,
+    results_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Summarize branch improvement and practical outcomes after averaging models."""
+    scores = _station_arm_scores(results_df, metric)
+    if scores.empty or RAW_ARM not in scores:
+        return False
+    raw = scores[RAW_ARM].to_numpy(dtype=float)
+    rows = []
+    for index, arm in enumerate(column for column in scores.columns if column != RAW_ARM):
+        values = scores[arm].to_numpy(dtype=float)
+        valid = np.isfinite(raw) & np.isfinite(values) & (raw != 0.0)
+        improvement = 100.0 * (raw[valid] - values[valid]) / raw[valid]
+        if improvement.size == 0:
+            continue
+        low, high = _bootstrap_mean_interval(improvement, seed=13 + index)
+        rows.append(
+            {
+                "arm": arm,
+                "mean": float(np.mean(improvement)),
+                "low": low,
+                "high": high,
+                "better": int(np.sum(improvement > PRACTICAL_EQUIVALENCE_PCT)),
+                "tie": int(np.sum(np.abs(improvement) <= PRACTICAL_EQUIVALENCE_PCT)),
+                "worse": int(np.sum(improvement < -PRACTICAL_EQUIVALENCE_PCT)),
+                "n": len(improvement),
+            }
+        )
+    if not rows:
+        return False
+    summary = pd.DataFrame(rows).sort_values("mean", ascending=False).reset_index(drop=True)
+    colors = family_colors(summary["arm"].astype(str).tolist())
+    metric_name = {
+        "relmae": "relMAE",
+        "relrmse": "relRMSE",
+    }.get(metric, _metric_label(metric))
+    metric_definition = {
+        "relmae": "relMAE = MAE de la rama / MAE de raw",
+        "relrmse": "relRMSE = RMSE de la rama / RMSE de raw",
+    }.get(metric, f"Métrica = {_metric_label(metric)}")
+
+    figure, (effect_axis, outcome_axis) = plt.subplots(
+        1,
+        2,
+        figsize=(13.5, 3.4 + 0.55 * len(summary)),
+        facecolor=FIGURE_FACE,
+        gridspec_kw={"width_ratios": [1.2, 1.0]},
+    )
+    top = _add_header(
+        figure,
+        f"Resumen ejecutivo de ramas — {metric_name}",
+        f"{metric_definition}. Cada estación pesa lo mismo después de promediar los modelos no-foundation; positivo = mejora frente a raw.\n"
+        f"IC 95% bootstrap por estación; empate práctico = ±{PRACTICAL_EQUIVALENCE_PCT:g}%.",
+    )
+    y = np.arange(len(summary))
+
+    style_axis(effect_axis)
+    effect_axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
+    effect_axis.grid(False, axis="y")
+    effect_axis.axvline(0.0, color=MUTED_TEXT, linestyle="--", linewidth=1.1)
+    for position, row in summary.iterrows():
+        color = colors[_family(str(row["arm"]))]
+        center = float(row["mean"])
+        effect_axis.errorbar(
+            center,
+            position,
+            xerr=[
+                [max(0.0, center - float(row["low"]))],
+                [max(0.0, float(row["high"]) - center)],
+            ],
+            fmt="o",
+            color=color,
+            markerfacecolor=color,
+            markeredgecolor="white",
+            capsize=3,
+            linewidth=1.4,
+            zorder=3,
+        )
+        effect_axis.annotate(
+            f"{center:+.1f}%",
+            (center, position),
+            textcoords="offset points",
+            xytext=(7 if center >= 0 else -7, 0),
+            ha="left" if center >= 0 else "right",
+            va="center",
+            fontsize=8,
+            color=TEXT_COLOR,
+        )
+    effect_axis.set_yticks(y, summary["arm"])
+    effect_axis.invert_yaxis()
+    effect_axis.set_xlabel("mejora media frente a raw (%)")
+    effect_axis.set_title("Efecto medio", loc="left", fontsize=11)
+
+    style_axis(outcome_axis)
+    outcome_axis.grid(False)
+    left = np.zeros(len(summary))
+    outcome_specs = (
+        ("better", "mejora >1%", "#3d7ab5"),
+        ("tie", "equivalente", "#d7cbbb"),
+        ("worse", "empeora >1%", "#d6453c"),
+    )
+    for column, label, color in outcome_specs:
+        width = 100.0 * summary[column].to_numpy(dtype=float) / summary["n"].to_numpy(dtype=float)
+        bars = outcome_axis.barh(
+            y, width, left=left, color=color, edgecolor=FIGURE_FACE, linewidth=1.0, label=label
+        )
+        for bar, value, count in zip(bars, width, summary[column], strict=True):
+            if value >= 5.0:
+                outcome_axis.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{value:.1f}%\n({int(count)}/{int(summary['n'].iloc[0])})",
+                    ha="center",
+                    va="center",
+                    fontsize=7.5,
+                    color="white" if column != "tie" else TEXT_COLOR,
+                )
+        left += width
+    outcome_axis.set_yticks(y, [])
+    outcome_axis.invert_yaxis()
+    outcome_axis.set_xlim(0.0, 100.0)
+    outcome_axis.set_xticks([])
+    outcome_axis.set_xlabel("")
+    outcome_axis.spines["bottom"].set_visible(False)
+    outcome_axis.set_title("Distribución entre estaciones", loc="left", fontsize=11)
+    outcome_axis.legend(loc="lower center", bbox_to_anchor=(0.5, -0.16), ncols=3, fontsize=8)
+
+    figure.tight_layout(rect=(0, 0.12, 1, top))
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+    return True
+
+
+def save_raw_model_ranking_plot(
+    output_path: Path,
+    results_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Rank every model on raw only, including zero-training-cost foundations."""
+    frame = _successful_results(results_df)
+    if metric not in frame.columns:
+        return False
+    frame = frame.loc[frame["arm"].astype(str).eq(RAW_ARM)].copy()
+    frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
+    frame = frame[np.isfinite(frame[metric])]
+    if frame.empty:
+        return False
+    if "model_mode" not in frame:
+        frame["model_mode"] = "trained"
+    summaries = []
+    for index, (model, group) in enumerate(frame.groupby("model", sort=False)):
+        values = group[metric].to_numpy(dtype=float)
+        low, high = _bootstrap_mean_interval(values, seed=101 + index)
+        mode = str(group["model_mode"].iloc[0])
+        measured_train = float(pd.to_numeric(group["train_seconds"], errors="coerce").mean())
+        inference = float(pd.to_numeric(group["inference_seconds"], errors="coerce").mean())
+        summaries.append(
+            {
+                "model": str(model),
+                "mode": mode,
+                "mean": float(np.mean(values)),
+                "low": low,
+                "high": high,
+                "train": 0.0 if mode == "foundation" else measured_train,
+                "inference": inference,
+                "values": values,
+            }
+        )
+    summary = sorted(summaries, key=lambda row: row["mean"])
+    figure, axis = plt.subplots(
+        figsize=(11.5, 3.0 + 0.52 * len(summary)), facecolor=FIGURE_FACE
+    )
+    top = _add_header(
+        figure,
+        f"Ranking de modelos usando solo raw — {_metric_label(metric)}",
+        "Puntos pequeños = estaciones; punto grande = media e IC 95% bootstrap. Menor = mejor.\n"
+        "Foundation: entrenamiento efectivo 0 s (carga del modelo excluida); la inferencia sí es tiempo medido.",
+    )
+    rng = np.random.default_rng(13)
+    for position, row in enumerate(summary):
+        mode = str(row["mode"])
+        color = MODEL_MODE_COLORS.get(mode, MUTED_TEXT)
+        values = np.asarray(row["values"], dtype=float)
+        axis.scatter(
+            values,
+            position + rng.normal(0.0, 0.055, len(values)),
+            s=22,
+            color=color,
+            alpha=0.48,
+            edgecolors="white",
+            linewidths=0.35,
+            zorder=2,
+        )
+        center = float(row["mean"])
+        axis.errorbar(
+            center,
+            position,
+            xerr=[
+                [max(0.0, center - float(row["low"]))],
+                [max(0.0, float(row["high"]) - center)],
+            ],
+            fmt=MODEL_MODE_MARKERS.get(mode, "o"),
+            color=color,
+            markerfacecolor=color,
+            markeredgecolor="white",
+            markersize=8 if mode == "foundation" else 6,
+            capsize=3,
+            linewidth=1.4,
+            zorder=3,
+        )
+        axis.text(
+            1.01,
+            position,
+            f"train {row['train']:.2f}s · infer {row['inference']:.2f}s",
+            transform=axis.get_yaxis_transform(),
+            va="center",
+            fontsize=8,
+            color=TEXT_COLOR,
+            clip_on=False,
+        )
+    style_axis(axis)
+    axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
+    axis.grid(False, axis="y")
+    axis.set_yticks(np.arange(len(summary)), [row["model"] for row in summary])
+    axis.invert_yaxis()
+    axis.set_xlabel(_metric_label(metric))
+    axis.legend(
+        handles=[
+            Line2D(
+                [0], [0], marker=MODEL_MODE_MARKERS[mode], linestyle="none",
+                markerfacecolor=color, markeredgecolor="white", markersize=8, label=mode,
+            )
+            for mode, color in MODEL_MODE_COLORS.items()
+            if any(row["mode"] == mode for row in summary)
+        ],
+        loc="lower right",
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0, 0, 0.79, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
+
+
+def save_executive_model_arm_plot(
+    output_path: Path,
+    results_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Render a compact absolute-error matrix and annotate foundation equivalence."""
+    frame = _successful_results(results_df)
+    if frame.empty or metric not in frame.columns:
+        return False
+    frame = frame.loc[frame["arm"].astype(str).ne(RAW_FROZEN_ARM)].copy()
+    frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
+    if "model_mode" not in frame:
+        frame["model_mode"] = "trained"
+    arms = list(dict.fromkeys(frame["arm"].astype(str)))
+    if RAW_ARM not in arms:
+        return False
+    modes = frame.groupby("model", sort=False)["model_mode"].first().astype(str)
+    means = frame.pivot_table(
+        index="model", columns="arm", values=metric, aggfunc="mean", sort=False
+    ).reindex(columns=arms)
+    if means.empty:
+        return False
+    model_order = means[RAW_ARM].sort_values().index
+    means = means.reindex(model_order)
+    values = means.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return False
+    figure, axis = plt.subplots(
+        figsize=(max(11.0, 1.25 * len(arms) + 3.0), 3.1 + 0.52 * len(means)),
+        facecolor=FIGURE_FACE,
+    )
+    top = _add_header(
+        figure,
+        f"Mapa compacto modelo × rama — {_metric_label(metric)}",
+        "Media sobre estaciones; menor = mejor. Solo ramas con targets raw comunes.\n"
+        "Foundation se evalúa una vez en raw: las ramas de limpieza del histórico son equivalentes porque no hay entrenamiento.",
+    )
+    image = axis.imshow(values, aspect="auto", cmap="RdYlBu_r", vmin=float(finite.min()), vmax=float(finite.max()))
+    for row, model in enumerate(means.index):
+        mode = modes.get(model, "trained")
+        if mode == "foundation" and len(arms) > 1:
+            axis.add_patch(
+                plt.Rectangle(
+                    (0.5, row - 0.5),
+                    len(arms) - 1,
+                    1.0,
+                    facecolor="#e7ded1",
+                    edgecolor=FIGURE_FACE,
+                    linewidth=2.0,
+                    zorder=2,
+                )
+            )
+            axis.text(
+                (len(arms)) / 2.0,
+                row,
+                "= raw (equivalencia; no entrena)",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=MUTED_TEXT,
+                zorder=3,
+            )
+        for col in range(len(arms)):
+            value = values[row, col]
+            if not np.isfinite(value):
+                continue
+            axis.text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=8, color=TEXT_COLOR)
+    axis.set_xticks(range(len(arms)), arms, rotation=30, ha="right", fontsize=8.5)
+    axis.set_yticks(range(len(means)), means.index, fontsize=9)
+    axis.set_xlabel("Rama")
+    axis.set_ylabel("Modelo")
+    style_axis(axis)
+    axis.grid(False)
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
+    colorbar.set_label(f"{_metric_label(metric)} medio")
+    figure.tight_layout(rect=(0, 0, 1, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
+
+
+def save_executive_imputation_plot(
+    output_path: Path,
+    results_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Compare mean imputed and non-imputed errors in four readable dumbbells."""
+    frame = _common_nonfoundation_results(results_df)
+    if frame.empty or metric not in frame.columns:
+        return False
+    frame = frame.loc[frame["strategy"].astype(str).ne("none")].copy()
+    frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
+    is_imputed = (
+        frame["imputed"]
+        if pd.api.types.is_bool_dtype(frame["imputed"])
+        else frame["imputed"].astype(str).str.lower().eq("true")
+    )
+    frame["variant"] = np.where(is_imputed, "impute", "noimpute")
+    pairs = frame.pivot_table(
+        index=["series", "model", "strategy"],
+        columns="variant",
+        values=metric,
+        aggfunc="first",
+        sort=False,
+    ).dropna(subset=["impute", "noimpute"])
+    if pairs.empty:
+        return False
+    station = pairs.groupby(level=["series", "strategy"], sort=False).mean()
+    rows = []
+    for index, strategy in enumerate(dict.fromkeys(frame["strategy"].astype(str))):
+        try:
+            values = station.xs(strategy, level="strategy")
+        except KeyError:
+            continue
+        noimpute = values["noimpute"].to_numpy(dtype=float)
+        impute = values["impute"].to_numpy(dtype=float)
+        no_low, no_high = _bootstrap_mean_interval(noimpute, seed=201 + index)
+        im_low, im_high = _bootstrap_mean_interval(impute, seed=301 + index)
+        valid = noimpute != 0.0
+        gain = 100.0 * (noimpute[valid] - impute[valid]) / noimpute[valid]
+        rows.append(
+            {
+                "strategy": strategy,
+                "noimpute": float(noimpute.mean()),
+                "impute": float(impute.mean()),
+                "no_low": no_low,
+                "no_high": no_high,
+                "im_low": im_low,
+                "im_high": im_high,
+                "gain": float(gain.mean()),
+            }
+        )
+    if not rows:
+        return False
+    rows.sort(key=lambda row: row["gain"], reverse=True)
+    colors = family_colors([row["strategy"] for row in rows])
+    figure, axis = plt.subplots(figsize=(10.2, 3.3 + 0.72 * len(rows)), facecolor=FIGURE_FACE)
+    top = _add_header(
+        figure,
+        f"Efecto agregado de la imputación — {_metric_label(metric)}",
+        "Cada extremo promedia primero modelos dentro de cada estación; barras = IC 95% bootstrap.\n"
+        "La flecha apunta de sin imputación a con imputación; hacia la izquierda significa que imputar mejora.",
+    )
+    for position, row in enumerate(rows):
+        color = colors[_family(str(row["strategy"]))]
+        axis.annotate(
+            "",
+            xy=(row["impute"], position),
+            xytext=(row["noimpute"], position),
+            arrowprops={"arrowstyle": "->", "color": color, "linewidth": 1.8},
+            zorder=2,
+        )
+        for variant, filled in (("noimpute", False), ("impute", True)):
+            center = float(row[variant])
+            low = float(row[f"{'no' if variant == 'noimpute' else 'im'}_low"])
+            high = float(row[f"{'no' if variant == 'noimpute' else 'im'}_high"])
+            axis.errorbar(
+                center,
+                position,
+                xerr=[[max(0.0, center - low)], [max(0.0, high - center)]],
+                fmt="o",
+                color=color,
+                markerfacecolor=color if filled else FIGURE_FACE,
+                markeredgecolor=color,
+                capsize=3,
+                linewidth=1.2,
+                zorder=3,
+            )
+        axis.text(
+            1.01,
+            position,
+            f"Δ {row['gain']:+.1f}%",
+            transform=axis.get_yaxis_transform(),
+            va="center",
+            fontsize=9,
+            color=TEXT_COLOR,
+            clip_on=False,
+        )
+    style_axis(axis)
+    axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
+    axis.grid(False, axis="y")
+    axis.set_yticks(np.arange(len(rows)), [row["strategy"] for row in rows])
+    axis.invert_yaxis()
+    axis.set_xlabel(f"{_metric_label(metric)} medio (menor = mejor)")
+    axis.legend(
+        handles=[
+            Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=FIGURE_FACE,
+                   markeredgecolor=TEXT_COLOR, label="sin imputación"),
+            Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=TEXT_COLOR,
+                   markeredgecolor=TEXT_COLOR, label="con imputación"),
+        ],
+        loc="lower right",
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0, 0, 0.88, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
+
+
+def save_executive_cost_accuracy_plot(
+    output_path: Path,
+    results_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Compare all unique predictor choices on training/inference Pareto fronts."""
+    frame = _successful_results(results_df)
+    required = {metric, "train_seconds", "inference_seconds", "arm", "model"}
+    if frame.empty or not required <= set(frame.columns):
+        return False
+    if "model_mode" not in frame:
+        frame["model_mode"] = "trained"
+    foundation = _foundation_mask(frame)
+    frame = frame.loc[
+        frame["arm"].astype(str).ne(RAW_FROZEN_ARM)
+        & (~foundation | frame["arm"].astype(str).eq(RAW_ARM))
+    ].copy()
+    for column in (metric, "train_seconds", "inference_seconds"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    aggregate = (
+        frame.groupby(["model", "arm", "model_mode"], sort=False)[
+            [metric, "train_seconds", "inference_seconds"]
+        ]
+        .mean()
+        .reset_index()
+        .dropna()
+        .reset_index(drop=True)
+    )
+    if aggregate.empty:
+        return False
+    aggregate["effective_train_seconds"] = aggregate["train_seconds"]
+    aggregate.loc[
+        aggregate["model_mode"].astype(str).eq("foundation"), "effective_train_seconds"
+    ] = 0.0
+    colors = family_colors(aggregate["arm"].astype(str).tolist())
+    figure, axes = plt.subplots(1, 2, figsize=(14.0, 7.0), facecolor=FIGURE_FACE)
+    top = _add_header(
+        figure,
+        f"Coste del predictor frente a precisión — {_metric_label(metric)}",
+        "Cada punto = media por (modelo, rama) sobre estaciones; abajo-izquierda = mejor. Contorno = frontera de Pareto.\n"
+        "Foundation tiene entrenamiento efectivo 0 s; no se incluyen los tiempos de detección/imputación ni la carga del modelo.\n"
+        "Cada foundation aparece una sola vez: su punto raw representa las ramas que solo modificarían el entrenamiento.",
+    )
+    foundation_order = {
+        model: position
+        for position, model in enumerate(
+            aggregate.loc[
+                aggregate["model_mode"].astype(str).eq("foundation")
+            ].sort_values(metric)["model"]
+        )
+    }
+    jobs = (
+        (axes[0], "effective_train_seconds", "Entrenamiento efectivo", True),
+        (axes[1], "inference_seconds", "Inferencia medida", False),
+    )
+    for axis, cost_column, title, includes_zero in jobs:
+        style_axis(axis)
+        axis.grid(True, axis="both", color=GRID_COLOR, linestyle="--", alpha=0.55)
+        cost = aggregate[cost_column].to_numpy(dtype=float)
+        error = aggregate[metric].to_numpy(dtype=float)
+        frontier = _pareto_mask(cost, error)
+        for index, row in aggregate.iterrows():
+            mode = str(row["model_mode"])
+            color = colors[_family(str(row["arm"]))]
+            is_frontier = bool(frontier[index])
+            axis.scatter(
+                row[cost_column],
+                row[metric],
+                s=115 if mode == "foundation" else 54,
+                marker=MODEL_MODE_MARKERS.get(mode, "o"),
+                facecolor=color,
+                edgecolor=TEXT_COLOR if is_frontier else "white",
+                linewidths=2.0 if is_frontier else 0.6,
+                alpha=0.95 if is_frontier or mode == "foundation" else 0.58,
+                zorder=4 if is_frontier else 3,
+            )
+            if is_frontier or mode == "foundation":
+                if mode == "foundation" and includes_zero:
+                    rank = foundation_order.get(str(row["model"]), 0)
+                    label_offset = (8, -10 if rank == 0 else 8)
+                else:
+                    label_offset = (6, 6)
+                axis.annotate(
+                    str(row["model"]) if mode == "foundation" else f"{row['model']}\n{row['arm']}",
+                    (row[cost_column], row[metric]),
+                    textcoords="offset points",
+                    xytext=label_offset,
+                    fontsize=7.5,
+                    color=TEXT_COLOR,
+                )
+        if includes_zero:
+            axis.set_xscale("symlog", linthresh=0.01, linscale=0.8)
+        elif np.all(cost > 0.0):
+            axis.set_xscale("log")
+        axis.set_xlabel("tiempo (s)")
+        axis.set_ylabel(_metric_label(metric))
+        axis.set_title(title, loc="left", fontsize=11)
+    mode_handles = [
+        Line2D([0], [0], marker=marker, linestyle="none", markerfacecolor=MUTED_TEXT,
+               markeredgecolor="white", markersize=8, label=mode)
+        for mode, marker in MODEL_MODE_MARKERS.items()
+        if mode in set(aggregate["model_mode"].astype(str))
+    ]
+    family_handles = [
+        Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=color,
+               markeredgecolor="white", markersize=8, label=family)
+        for family, color in colors.items()
+        if family in {_family(arm) for arm in aggregate["arm"].astype(str)}
+    ]
+    figure.legend(
+        handles=mode_handles + family_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.0),
+        ncols=5,
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0, 0.11, 1, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
 
 
 def _save_arm_dot_plot(
@@ -740,6 +1408,111 @@ def save_foundation_preprocessing_plot(
     return True
 
 
+def save_foundation_anomaly_robustness_plot(
+    output_path: Path,
+    summary_df: pd.DataFrame,
+    metric: str = "mase",
+) -> bool:
+    """Show per-case foundation damage before and after synthetic-context cleaning."""
+    required = {
+        "model",
+        "strategy",
+        "anomaly_type",
+        f"{metric}_clean",
+        f"{metric}_corrupted",
+        f"{metric}_processed",
+    }
+    if summary_df.empty or not required <= set(summary_df.columns):
+        return False
+    data = summary_df.copy()
+    for suffix in ("clean", "corrupted", "processed"):
+        column = f"{metric}_{suffix}"
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data["damage"] = data[f"{metric}_corrupted"] - data[f"{metric}_clean"]
+    data["residual"] = data[f"{metric}_processed"] - data[f"{metric}_clean"]
+    data["panel"] = data["model"].astype(str) + " / " + data["strategy"].astype(str)
+    panels = list(dict.fromkeys(data["panel"]))
+    anomaly_types = list(dict.fromkeys(data["anomaly_type"].astype(str)))
+    finite = np.concatenate([_finite(data["damage"]), _finite(data["residual"])])
+    if not panels or not anomaly_types or finite.size == 0:
+        return False
+
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(1.2 + 5.0 * len(panels), 6.7),
+        facecolor=FIGURE_FACE,
+        sharey=True,
+        squeeze=False,
+    )
+    top = _add_header(
+        figure,
+        f"Robustez foundation ante anomalías sintéticas — {_metric_label(metric)}",
+        "Cada punto = una ejecución/estación. Naranja: contexto corrupto − limpio; azul: tras limpiar − limpio.\n"
+        "Positivo = la anomalía empeora el forecast; cero = mismo error que con contexto limpio. Rombo = mediana.",
+    )
+    rng = np.random.default_rng(13)
+    for axis, panel in zip(axes[0], panels, strict=True):
+        style_axis(axis)
+        axis.grid(True, axis="y", color=GRID_COLOR, linestyle="--", alpha=0.6)
+        axis.grid(False, axis="x")
+        axis.axhline(0.0, color=MUTED_TEXT, linestyle="--", linewidth=1.1, zorder=2)
+        subset = data[data["panel"] == panel]
+        for position, anomaly_type in enumerate(anomaly_types):
+            group = subset[subset["anomaly_type"].astype(str) == anomaly_type]
+            for column, offset, color in (
+                ("damage", -0.13, "#cf6f1e"),
+                ("residual", 0.13, "#3d7ab5"),
+            ):
+                values = _finite(group[column])
+                if values.size == 0:
+                    continue
+                jitter = rng.normal(0.0, 0.025, len(values))
+                axis.scatter(
+                    position + offset + jitter,
+                    values,
+                    s=27,
+                    color=color,
+                    edgecolors="white",
+                    linewidths=0.4,
+                    alpha=0.62,
+                    zorder=3,
+                )
+                axis.scatter(
+                    [position + offset],
+                    [float(np.median(values))],
+                    marker="D",
+                    s=48,
+                    color=color,
+                    edgecolors=TEXT_COLOR,
+                    linewidths=0.6,
+                    zorder=4,
+                )
+        axis.set_xticks(range(len(anomaly_types)), anomaly_types, rotation=25, ha="right")
+        axis.set_title(panel, loc="left", fontsize=11)
+        axis.set_xlabel("Tipo de anomalía")
+        axis.set_yscale("symlog", linthresh=0.1, linscale=0.8)
+    axes[0][0].set_ylabel(f"Δ {_metric_label(metric)} respecto al contexto limpio")
+    figure.legend(
+        handles=[
+            Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="#cf6f1e",
+                   markeredgecolor="white", markersize=8, label="daño con contexto corrupto"),
+            Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="#3d7ab5",
+                   markeredgecolor="white", markersize=8, label="residuo tras limpieza"),
+            Line2D([0], [0], marker="D", linestyle="none", markerfacecolor=MUTED_TEXT,
+                   markeredgecolor=TEXT_COLOR, markersize=7, label="mediana"),
+        ],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.0),
+        ncols=3,
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0, 0.09, 1, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
+
+
 def render_run_figures(run_dir: Path) -> list[Path]:
     """Render every applicable figure for one run directory; return saved paths."""
     results_df = pd.read_csv(run_dir / "results.csv")
@@ -756,6 +1529,51 @@ def render_run_figures(run_dir: Path) -> list[Path]:
 
     saved: list[Path] = []
     jobs = [
+        *(
+            (
+                run_dir / f"executive_branch_summary_{metric}.png",
+                lambda path, metric=metric: save_executive_branch_summary_plot(
+                    path, results_df, metric
+                ),
+            )
+            for metric in ("relmae", "relrmse")
+        ),
+        *(
+            (
+                run_dir / f"raw_model_ranking_{metric}.png",
+                lambda path, metric=metric: save_raw_model_ranking_plot(
+                    path, results_df, metric
+                ),
+            )
+            for metric in FOUNDATION_METRICS
+        ),
+        *(
+            (
+                run_dir / f"executive_model_arm_{metric}.png",
+                lambda path, metric=metric: save_executive_model_arm_plot(
+                    path, results_df, metric
+                ),
+            )
+            for metric in FOUNDATION_METRICS
+        ),
+        *(
+            (
+                run_dir / f"executive_imputation_{metric}.png",
+                lambda path, metric=metric: save_executive_imputation_plot(
+                    path, results_df, metric
+                ),
+            )
+            for metric in FOUNDATION_METRICS
+        ),
+        *(
+            (
+                run_dir / f"executive_cost_accuracy_{metric}.png",
+                lambda path, metric=metric: save_executive_cost_accuracy_plot(
+                    path, results_df, metric
+                ),
+            )
+            for metric in FOUNDATION_METRICS
+        ),
         *(
             (
                 run_dir / f"arm_error_{metric}.png",
@@ -798,6 +1616,15 @@ def render_run_figures(run_dir: Path) -> list[Path]:
             (
                 run_dir / f"foundation_preprocessing_recovery_{metric}.png",
                 lambda path, metric=metric: save_foundation_preprocessing_plot(path, foundation_df, metric),
+            )
+            for metric in FOUNDATION_METRICS
+        ),
+        *(
+            (
+                run_dir / f"foundation_anomaly_robustness_{metric}.png",
+                lambda path, metric=metric: save_foundation_anomaly_robustness_plot(
+                    path, foundation_df, metric
+                ),
             )
             for metric in FOUNDATION_METRICS
         ),

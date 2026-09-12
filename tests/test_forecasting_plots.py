@@ -13,11 +13,17 @@ from airquality.visualizations.forecasting import (
     render_run_figures,
     save_arm_error_plot,
     save_detector_selection_plot,
+    save_executive_branch_summary_plot,
+    save_executive_cost_accuracy_plot,
+    save_executive_imputation_plot,
+    save_executive_model_arm_plot,
+    save_foundation_anomaly_robustness_plot,
     save_foundation_preprocessing_plot,
     save_imputation_effect_plot,
     save_improvement_heatmap,
     save_inference_time_plot,
     save_inference_time_vs_error_plot,
+    save_raw_model_ranking_plot,
     save_train_time_plot,
     save_train_time_vs_error_plot,
     selection_counts,
@@ -53,6 +59,7 @@ def _results_df(n_series: int = 3, models: tuple[str, ...] = ("NLinear", "TiDE")
                         "detectors": "" if is_raw_view else "IQR,Hampel_w24",
                         "n_anomalies": 0 if is_raw_view else 5,
                         "model": model,
+                        "model_mode": "trained",
                         "rmsse": base * (1 + rng.uniform(-0.3, 0.3)),
                         "mase": base * (1 + rng.uniform(-0.2, 0.2)),
                         "relmae": 1.0 if arm == "raw" else base * (1 + rng.uniform(-0.2, 0.2)),
@@ -161,6 +168,11 @@ def test_save_figures_smoke(tmp_path):
     outputs["cost"] = tmp_path / "cost.png"
     outputs["inf_time"] = tmp_path / "inf_time.png"
     outputs["inf_cost"] = tmp_path / "inf_cost.png"
+    outputs["branch_summary"] = tmp_path / "branch_summary.png"
+    outputs["raw_ranking"] = tmp_path / "raw_ranking.png"
+    outputs["model_arm"] = tmp_path / "model_arm.png"
+    outputs["executive_imputation"] = tmp_path / "executive_imputation.png"
+    outputs["executive_cost"] = tmp_path / "executive_cost.png"
     assert save_arm_error_plot(outputs["arm"], results_df, "mase")
     assert save_improvement_heatmap(outputs["heat"], results_df, "relrmse")
     assert save_detector_selection_plot(outputs["sel"], detection_df)
@@ -169,6 +181,13 @@ def test_save_figures_smoke(tmp_path):
     assert save_train_time_vs_error_plot(outputs["cost"], results_df, "rmsse")
     assert save_inference_time_plot(outputs["inf_time"], results_df)
     assert save_inference_time_vs_error_plot(outputs["inf_cost"], results_df, "relmae")
+    assert save_executive_branch_summary_plot(outputs["branch_summary"], results_df, "mase")
+    assert save_raw_model_ranking_plot(outputs["raw_ranking"], results_df, "mase")
+    assert save_executive_model_arm_plot(outputs["model_arm"], results_df, "mase")
+    assert save_executive_imputation_plot(
+        outputs["executive_imputation"], results_df, "mase"
+    )
+    assert save_executive_cost_accuracy_plot(outputs["executive_cost"], results_df, "mase")
     for path in outputs.values():
         assert path.exists() and path.stat().st_size > 5_000
 
@@ -189,6 +208,14 @@ def test_save_figures_report_empty_inputs(tmp_path):
     assert not save_inference_time_plot(tmp_path / "g.png", empty)
     assert not save_inference_time_vs_error_plot(tmp_path / "h.png", empty, "relmae")
     assert not save_foundation_preprocessing_plot(tmp_path / "i.png", pd.DataFrame())
+    assert not save_executive_branch_summary_plot(tmp_path / "j.png", empty)
+    assert not save_raw_model_ranking_plot(tmp_path / "k.png", empty)
+    assert not save_executive_model_arm_plot(tmp_path / "l.png", empty)
+    assert not save_executive_imputation_plot(tmp_path / "m.png", empty)
+    assert not save_executive_cost_accuracy_plot(tmp_path / "n.png", empty)
+    assert not save_foundation_anomaly_robustness_plot(
+        tmp_path / "o.png", pd.DataFrame()
+    )
     assert not list(tmp_path.iterdir())
 
 
@@ -207,6 +234,23 @@ def test_save_foundation_preprocessing_plot(tmp_path):
     assert output.exists() and output.stat().st_size > 5_000
 
 
+def test_save_foundation_anomaly_robustness_plot(tmp_path):
+    summary = pd.DataFrame(
+        {
+            "model": ["Chronos2"] * 4,
+            "strategy": ["inject-vote"] * 4,
+            "anomaly_type": ["spikes", "scale", "noise", "drift"],
+            "mase_clean": [0.8, 0.8, 0.8, 0.8],
+            "mase_corrupted": [1.2, 0.9, 1.4, 1.0],
+            "mase_processed": [0.9, 0.85, 1.1, 0.95],
+        }
+    )
+    output = tmp_path / "foundation_robustness.png"
+
+    assert save_foundation_anomaly_robustness_plot(output, summary, "mase")
+    assert output.exists() and output.stat().st_size > 5_000
+
+
 def test_render_run_figures_from_csvs(tmp_path):
     _results_df().to_csv(tmp_path / "results.csv", index=False)
     _detection_df().to_csv(tmp_path / "detection.csv", index=False)
@@ -217,6 +261,12 @@ def test_render_run_figures_from_csvs(tmp_path):
             "anomaly_type": ["spikes", "scale", "noise", "drift"],
             "rmsse_recovery": [0.2, -0.1, 0.3, 0.05],
             "mase_recovery": [0.1, -0.05, 0.2, 0.02],
+            "mase_clean": [0.8, 0.8, 0.8, 0.8],
+            "mase_corrupted": [1.0, 0.75, 1.1, 0.82],
+            "mase_processed": [0.9, 0.8, 0.9, 0.80],
+            "rmsse_clean": [0.7, 0.7, 0.7, 0.7],
+            "rmsse_corrupted": [0.9, 0.6, 1.0, 0.75],
+            "rmsse_processed": [0.7, 0.7, 0.7, 0.70],
         }
     ).to_csv(tmp_path / "foundation_preprocessing_summary.csv", index=False)
 
@@ -224,6 +274,16 @@ def test_render_run_figures_from_csvs(tmp_path):
 
     names = {path.name for path in saved}
     assert names == {
+        "executive_branch_summary_relrmse.png",
+        "executive_branch_summary_relmae.png",
+        "raw_model_ranking_rmsse.png",
+        "raw_model_ranking_mase.png",
+        "executive_model_arm_rmsse.png",
+        "executive_model_arm_mase.png",
+        "executive_imputation_rmsse.png",
+        "executive_imputation_mase.png",
+        "executive_cost_accuracy_rmsse.png",
+        "executive_cost_accuracy_mase.png",
         "arm_error_rmsse.png",
         "arm_error_mase.png",
         "arm_error_relmae.png",
@@ -249,6 +309,8 @@ def test_render_run_figures_from_csvs(tmp_path):
         "inference_time_vs_relrmse.png",
         "foundation_preprocessing_recovery_mase.png",
         "foundation_preprocessing_recovery_rmsse.png",
+        "foundation_anomaly_robustness_mase.png",
+        "foundation_anomaly_robustness_rmsse.png",
     }
 
     legacy = _results_df()
