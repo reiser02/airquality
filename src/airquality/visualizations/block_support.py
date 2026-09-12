@@ -10,11 +10,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from airquality.visualizations.anomaly import (
+from airquality.visualizations.style import (
+    AXIS_FACE,
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
+    MUTED_TEXT,
     TEXT_COLOR,
+    add_plot_header,
+    save_figure,
     style_axis,
 )
 
@@ -23,7 +27,7 @@ def _repo_root() -> Path:
     """Return the repository root used to discover persisted report runs."""
     return Path(__file__).resolve().parents[3]
 
-RAW_COLOR = "#6d6258"
+RAW_COLOR = MUTED_TEXT
 DETECTED_COLOR = "#3d7ab5"
 IMPUTED_COLOR = "#cf6f1e"
 RECOVERED_COLOR = "#5b8c5a"
@@ -121,25 +125,7 @@ def _stage_color(stage: str) -> str:
 def _figure_header(
     figure: plt.Figure, title: str, subtitle: str, pollutant: str
 ) -> None:
-    height = float(figure.get_size_inches()[1])
-    figure.suptitle(
-        f"{pollutant}: {title}",
-        x=0.04,
-        y=1.0 - 0.08 / height,
-        ha="left",
-        fontsize=15,
-        fontweight="bold",
-        color=TEXT_COLOR,
-    )
-    figure.text(
-        0.04,
-        1.0 - 0.45 / height,
-        subtitle,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color=RAW_COLOR,
-    )
+    add_plot_header(figure, f"{pollutant}: {title}", subtitle)
 
 
 def _save_retention_overview(
@@ -210,8 +196,7 @@ def _save_retention_overview(
         pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.12, 0.98, 0.86))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -238,7 +223,7 @@ def _save_block_distribution(
         lengths,
         bins=bins,
         color="#8c6d4b" if stage == "raw" else _stage_color(stage),
-        edgecolor="#fffaf2",
+        edgecolor=AXIS_FACE,
         alpha=0.9,
     )
     axis.axvline(
@@ -268,8 +253,7 @@ def _save_block_distribution(
         pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.86))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -322,8 +306,7 @@ def _save_series_comparison(
     axis.legend(loc="lower right")
     _figure_header(figure, title, subtitle, pollutant)
     figure.tight_layout(rect=(0.03, 0.02, 0.98, 0.88))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -376,7 +359,7 @@ def _save_detected_block_distribution(
                     lengths,
                     bins=bins,
                     color=color,
-                    edgecolor="#fffaf2",
+                    edgecolor=AXIS_FACE,
                     alpha=0.8,
                     label=stage_label,
                 )
@@ -422,7 +405,7 @@ def _save_detected_block_distribution(
                         color=TEXT_COLOR,
                         bbox={
                             "boxstyle": "round,pad=0.35",
-                            "facecolor": "#fffaf2",
+                            "facecolor": AXIS_FACE,
                             "edgecolor": EDGE_COLOR,
                             "alpha": 0.9,
                         },
@@ -452,8 +435,7 @@ def _save_detected_block_distribution(
         wspace=0.06,
         hspace=0.35,
     )
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -513,8 +495,7 @@ def _save_support_overview(
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.08, 1, 0.88))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -563,13 +544,12 @@ def _save_matrix(
     axis.set_xticks(np.arange(len(arms)), arms, rotation=35, ha="right", fontsize=8)
     axis.set_yticks(np.arange(len(series)), series, fontsize=8)
     axis.set_title("Protocolo", loc="left", fontweight="bold", color=TEXT_COLOR)
-    axis.set_facecolor("#fffaf2")
+    axis.set_facecolor(AXIS_FACE)
     color_axis = figure.add_axes((0.925, 0.23, 0.015, 0.52))
     figure.colorbar(image, cax=color_axis, label=label)
     _figure_header(figure, title, subtitle, pollutant)
     figure.subplots_adjust(left=0.2, right=0.9, bottom=0.2, top=0.84, wspace=0.08)
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -614,8 +594,7 @@ def _save_block_survival(
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.12, 1, 0.86))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -717,8 +696,7 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.13, 1, 0.86))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -755,8 +733,7 @@ def _save_detection_summary(
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 
@@ -942,8 +919,7 @@ def _save_imputation_age(
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return True
 
 

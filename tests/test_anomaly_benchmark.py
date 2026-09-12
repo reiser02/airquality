@@ -1680,8 +1680,36 @@ def test_save_benchmark_plots_from_results(tmp_path, monkeypatch):
         assert plot_paths[key].exists()
 
 
+def test_synthetic_anomaly_plot_uses_short_window_without_series_name(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    def capture_savefig(figure, *_args, **_kwargs):
+        captured["figure"] = figure
+
+    monkeypatch.setattr(presentation_module.plt.Figure, "savefig", capture_savefig)
+
+    presentation_module.save_synthetic_anomaly_types_plot(
+        tmp_path / "anomalies.png",
+        np.arange(300, dtype=np.float32),
+        index=np.arange(300),
+    )
+
+    figure = captured["figure"]
+    assert len(figure.axes[0].lines[0].get_xdata()) == 168
+    assert figure.texts[-1].get_text() == "Anomalías inyectadas sobre la serie real"
+    assert figure.axes[1].get_legend_handles_labels()[1] == ["anomalía"]
+    assert set(figure.axes[5].get_legend_handles_labels()[1]) == {
+        "spikes",
+        "scale",
+        "noise",
+        "drift",
+    }
+
+
 @pytest.mark.parametrize("mode", ["unlabeled", "synthetic"])
-def test_time_plots_exclude_ensemble(tmp_path, monkeypatch, mode):
+def test_inference_plots_include_ensemble_but_training_does_not(tmp_path, monkeypatch, mode):
     results_path = tmp_path / "results.json"
     results_path.write_text(
         json.dumps(
@@ -1721,7 +1749,10 @@ def test_time_plots_exclude_ensemble(tmp_path, monkeypatch, mode):
 
     save_benchmark_plots(results_path)
 
-    assert received == {"training": {"Detector"}, "scatter": {"Detector"}}
+    assert received == {
+        "training": {"Detector"},
+        "scatter": {"Detector", "Ensemble"},
+    }
 
 
 def test_recompute_ensemble_matches_saved_run(tmp_path, monkeypatch):

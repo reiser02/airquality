@@ -9,13 +9,15 @@ from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from airquality.visualizations.anomaly import (
+from airquality.visualizations.style import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
+    MUTED_TEXT,
     SERIES_COLOR,
     SERIES_GHOST_COLOR,
     TEXT_COLOR,
+    save_figure,
     style_axis,
 )
 from airquality.config import cfg_get_str
@@ -26,6 +28,14 @@ from airquality.data.segments import observed_blocks
 
 DEFAULT_POLLUTANTS = ("NO2", "O3")
 POLLUTANT_COLORS = {"CO": SERIES_COLOR, "NO2": "#f28c38", "O3": "#5b8c8a"}
+
+
+def _combined_station_name(station: str) -> str:
+    """Return the shared station label used by multi-pollutant figures."""
+    normalized = str(station).strip()
+    if normalized.casefold() in {"upct_no2", "upct_o3"}:
+        return "UPCT"
+    return normalized
 
 
 def _coverage_summary(series: pd.Series) -> tuple[pd.DataFrame, float]:
@@ -152,14 +162,13 @@ def save_station_coverage(
         ha="left",
         va="top",
         fontsize=9,
-        color="#6d6258",
+        color=MUTED_TEXT,
     )
     figure.tight_layout(rect=(0.02, 0.05, 0.88, 1.0 - 0.72 / height))
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return path
 
 
@@ -173,11 +182,17 @@ def save_combined_station_coverage(
         raise ValueError("No hay contaminantes que representar")
     colors = {pollutant: POLLUTANT_COLORS[pollutant] for pollutant in pollutants}
     station_maps = {
-        pollutant: {station: frame for station, frame in stations}
+        pollutant: {
+            _combined_station_name(station): frame for station, frame in stations
+        }
         for pollutant, stations in stations_by_pollutant.items()
     }
     station_names = sorted(
-        {station for stations in stations_by_pollutant.values() for station, _ in stations}
+        {
+            _combined_station_name(station)
+            for stations in stations_by_pollutant.values()
+            for station, _ in stations
+        }
     )
     if not station_names:
         raise ValueError("No hay estaciones que representar")
@@ -303,14 +318,13 @@ def save_combined_station_coverage(
         ha="left",
         va="top",
         fontsize=9,
-        color="#6d6258",
+        color=MUTED_TEXT,
     )
     figure.tight_layout(rect=(0.02, 0.05, 0.86, 1.0 - 0.72 / height))
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return path
 
 
@@ -338,7 +352,9 @@ def save_comparison_station_coverage(
     }
     station_maps = {
         source: {
-            pollutant: {station: frame for station, frame in stations}
+            pollutant: {
+                _combined_station_name(station): frame for station, frame in stations
+            }
             for pollutant, stations in source_data.items()
         }
         for source, source_data in sources.items()
@@ -506,14 +522,13 @@ def save_comparison_station_coverage(
         ha="left",
         va="top",
         fontsize=9,
-        color="#6d6258",
+        color=MUTED_TEXT,
     )
     figure.tight_layout(rect=(0.02, 0.05, 0.84, 1.0 - 0.72 / height))
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
     return path
 
 

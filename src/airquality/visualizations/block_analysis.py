@@ -8,11 +8,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from airquality.visualizations.anomaly import (
+from airquality.visualizations.style import (
+    AXIS_FACE,
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
     TEXT_COLOR,
+    add_plot_header,
+    save_figure,
+    style_axis,
 )
 
 
@@ -44,25 +48,7 @@ def _requirement_note(table: pd.DataFrame) -> str:
 
 def _figure_header(figure: plt.Figure, title: str, subtitle: str) -> None:
     """Add the title and requirement summary above a block-analysis figure."""
-    height = float(figure.get_size_inches()[1])
-    figure.suptitle(
-        title,
-        x=0.06,
-        y=1.0 - 0.10 / height,
-        ha="left",
-        fontsize=15,
-        fontweight="bold",
-        color=TEXT_COLOR,
-    )
-    figure.text(
-        0.06,
-        1.0 - 0.48 / height,
-        subtitle,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color="#6d6258",
-    )
+    add_plot_header(figure, title, subtitle)
 
 
 def _summary_rows_for_plot(summary: pd.DataFrame) -> pd.DataFrame:
@@ -149,7 +135,7 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
     axis.set_xticks(x, labels)
     axis.set_ylim(0, 100)
     axis.set_ylabel("Porcentaje del total de cada contaminante")
-    axis.set_facecolor("#fffaf2")
+    axis.set_facecolor(AXIS_FACE)
     axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.65)
     axis.grid(axis="x", visible=False)
     axis.spines[["top", "right"]].set_visible(False)
@@ -169,8 +155,7 @@ def save_retention_overview(path: Path, summary: pd.DataFrame) -> None:
         + _requirement_note(summary),
     )
     figure.tight_layout(rect=(0.03, 0.14, 0.98, 0.89))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
 
 
 def save_block_length_distribution(
@@ -215,7 +200,7 @@ def save_block_length_distribution(
     axis.set_yscale("log")
     axis.set_xlabel("Longitud del bloque (horas, escala log)")
     axis.set_ylabel("Número de bloques (escala log)")
-    axis.set_facecolor("#fffaf2")
+    axis.set_facecolor(AXIS_FACE)
     axis.grid(axis="both", color=GRID_COLOR, linestyle="--", alpha=0.5)
     axis.spines[["top", "right"]].set_visible(False)
     axis.legend(ncol=2, loc="upper right")
@@ -227,8 +212,7 @@ def save_block_length_distribution(
         + _requirement_note(series),
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.89))
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
 
 
 def _save_series_comparison(
@@ -267,7 +251,7 @@ def _save_series_comparison(
         axis.set_xlabel(xlabel)
         if xlim is not None:
             axis.set_xlim(*xlim)
-        axis.set_facecolor("#fffaf2")
+        axis.set_facecolor(AXIS_FACE)
         axis.grid(axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
         axis.grid(axis="y", visible=False)
         axis.spines[["top", "right"]].set_visible(False)
@@ -275,8 +259,7 @@ def _save_series_comparison(
     axes[0, -1].legend(loc="lower right")
     _figure_header(figure, title, subtitle + "\n" + _requirement_note(series))
     figure.tight_layout(rect=(0.03, 0.02, 0.98, 0.91), w_pad=3)
-    figure.savefig(path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, path)
 
 
 def save_figures(

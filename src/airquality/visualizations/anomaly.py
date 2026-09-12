@@ -22,27 +22,18 @@ from airquality.anomaly.anomalies import (
     inject_synthetic_anomalies,
 )
 from airquality.anomaly.metrics import DEFAULT_MAX_DETECTION_RATE
-
-plt.rcParams.update(
-    {
-        "font.family": "DejaVu Sans",
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.linewidth": 0.8,
-        "axes.grid": True,
-        "grid.alpha": 0.25,
-        "grid.linestyle": "--",
-        "legend.frameon": True,
-        "legend.framealpha": 0.95,
-        "legend.edgecolor": "#d0d0d0",
-    }
+from airquality.visualizations.style import (
+    AXIS_FACE,
+    EDGE_COLOR,
+    FIGURE_FACE,
+    GRID_COLOR,
+    SERIES_COLOR,
+    SERIES_GHOST_COLOR,
+    TEXT_COLOR,
+    add_plot_header,
+    save_figure,
+    style_axis,
 )
-
-FIGURE_FACE = "#f6f1e8"
-AXIS_FACE = "#fffaf2"
-TEXT_COLOR = "#27313a"
-EDGE_COLOR = "#3c4650"
-GRID_COLOR = "#d8cabb"
 BUDGET_LINE_COLOR = "#d6453c"
 MODEL_CATEGORY_COLORS = {
     "Statistical": "#5b8c5a",
@@ -78,8 +69,6 @@ STATISTICAL_MODELS = {
 MACHINE_LEARNING_MODELS = {"IsolationForest", "LOF"}
 ENSEMBLE_MODELS = {"Ensemble"}
 
-SERIES_COLOR = "#4b79a8"
-SERIES_GHOST_COLOR = "#c9bdac"
 ANOMALY_POINT_COLOR = "#d6453c"
 # One colour per synthetic anomaly type, used to tell them apart in the
 # ``combined`` panel where one segment of every type is shown side by side.
@@ -93,23 +82,10 @@ ANOMALY_TYPE_LABELS = {
     "spikes": "spikes — pico puntual (±4σ)",
     "scale": "scale — segmento ×0.25 o ×2",
     "noise": "noise — ruido gaussiano añadido (2σ)",
-    "drift": "drift — descalibración progresiva del sensor (sesgo + ganancia + ruido crecientes)",
+    "drift": "drift — descalibración progresiva\n(sesgo + ganancia + ruido crecientes)",
     "combined": "combined — un segmento de cada tipo",
 }
-
-
-def style_axis(axis: plt.Axes) -> None:
-    """Apply the shared cream background, grid, and spine styling to one axis."""
-    axis.set_facecolor(AXIS_FACE)
-    axis.tick_params(labelsize=9)
-    axis.tick_params(colors=TEXT_COLOR)
-    axis.xaxis.label.set_color(TEXT_COLOR)
-    axis.yaxis.label.set_color(TEXT_COLOR)
-    axis.title.set_color(TEXT_COLOR)
-    axis.grid(True, axis="y", color=GRID_COLOR, linestyle="--", alpha=0.65)
-    axis.grid(False, axis="x")
-    axis.spines["left"].set_color("#c2b3a3")
-    axis.spines["bottom"].set_color("#c2b3a3")
+DEFAULT_ANOMALY_PLOT_POINTS = 168  # Seven days of hourly observations.
 
 
 def model_category(model_name: str) -> str:
@@ -126,12 +102,6 @@ def model_category(model_name: str) -> str:
 def model_color(model_name: str) -> str:
     """Return the palette colour assigned to the model's category."""
     return MODEL_CATEGORY_COLORS[model_category(model_name)]
-
-
-def add_plot_header(figure: plt.Figure, title: str, subtitle: str) -> None:
-    """Add the left-aligned title + subtitle header shared by all figures."""
-    figure.suptitle(title, x=0.075, y=0.98, ha="left", fontsize=14, fontweight="bold", color=TEXT_COLOR)
-    figure.text(0.075, 0.94, subtitle, ha="left", fontsize=9, color="#6d6258")
 
 
 def category_legend_handles(alpha: float = 0.9) -> list[plt.Rectangle]:
@@ -297,8 +267,7 @@ def save_detection_rate_distribution_plot(
         ncols=4,
     )
     figure.tight_layout(rect=(0, 0.08, 1, 0.925))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def save_training_time_plot(
@@ -341,15 +310,20 @@ def save_training_time_plot(
             fontsize=9,
             color=TEXT_COLOR,
         )
+    represented_categories = {model_category(model_name) for model_name in model_names}
+    legend_handles = [
+        handle
+        for handle in category_legend_handles(alpha=0.92)
+        if handle.get_label() in represented_categories
+    ]
     figure.legend(
-        handles=category_legend_handles(alpha=0.92),
+        handles=legend_handles,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.015),
-        ncols=4,
+        ncols=len(legend_handles),
     )
     figure.tight_layout(rect=(0, 0.08, 1, 0.925))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def save_detection_rate_vs_inference_plot(
@@ -399,8 +373,7 @@ def save_detection_rate_vs_inference_plot(
         ncols=4,
     )
     figure.tight_layout(rect=(0, 0.08, 1, 1))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 # --- synthetic-mode figures -------------------------------------------------
@@ -484,8 +457,7 @@ def save_vus_pr_distribution_plot(
         ncols=4,
     )
     figure.tight_layout(rect=(0, 0.08, 1, 0.925))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def save_vus_pr_vs_inference_plot(
@@ -536,8 +508,7 @@ def save_vus_pr_vs_inference_plot(
         ncols=4,
     )
     figure.tight_layout(rect=(0, 0.08, 1, 1))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def save_vus_pr_raw_vs_coverage_plot(
@@ -620,8 +591,7 @@ def save_vus_pr_raw_vs_coverage_plot(
     axis.set_ylabel("Raw VUS-PR on scored support")
     axis.set_title("Raw VUS-PR vs. Coverage", fontsize=13)
     figure.subplots_adjust(left=0.08, right=0.98, bottom=0.13, top=0.92)
-    figure.savefig(output_path, dpi=150, facecolor=FIGURE_FACE)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def _inject_all_anomaly_types(
@@ -673,6 +643,7 @@ def save_synthetic_anomaly_types_plot(
     *,
     series_label: str = "",
     seed: int = 7,
+    max_points: int | None = DEFAULT_ANOMALY_PLOT_POINTS,
 ) -> None:
     """Plot a clean series and each synthetic anomaly type injected into it.
 
@@ -680,10 +651,24 @@ def save_synthetic_anomaly_types_plot(
     :data:`airquality.anomaly.anomalies.ANOMALY_TYPES` plus a ``combined``
     panel where one segment of each type is laid out side by side and coloured by
     type (see :data:`ANOMALY_TYPE_COLORS`). ``index`` supplies the x-axis (e.g. a
-    ``DatetimeIndex``); a plain range is used when omitted.
+    ``DatetimeIndex``); a plain range is used when omitted. By default, a
+    centered seven-day window is plotted so the injected shapes remain legible;
+    pass ``None`` to retain the complete series.
     """
     values = np.asarray(values, dtype=np.float32)
     x_values = np.asarray(index) if index is not None else np.arange(len(values))
+    if values.ndim != 1:
+        raise ValueError("values must be one-dimensional")
+    if len(x_values) != len(values):
+        raise ValueError("index and values must have the same length")
+    if max_points is not None:
+        if max_points < 1:
+            raise ValueError("max_points must be positive or None")
+        if len(values) > max_points:
+            start = (len(values) - max_points) // 2
+            stop = start + max_points
+            values = values[start:stop]
+            x_values = x_values[start:stop]
     types = [*ANOMALY_TYPES, "combined"]
 
     ncols = 2
@@ -703,13 +688,13 @@ def save_synthetic_anomaly_types_plot(
 
     for axis, anomaly_type in zip(flat_axes[1:], types, strict=False):
         style_axis(axis)
-        axis.plot(x_values, values, color=SERIES_GHOST_COLOR, lw=0.9, label="normal", zorder=1)
+        axis.plot(x_values, values, color=SERIES_GHOST_COLOR, lw=0.9, zorder=1)
         axis.set_title(ANOMALY_TYPE_LABELS[anomaly_type], fontsize=11, loc="left")
         axis.set_ylabel("valor")
 
         if anomaly_type == "combined":
             injected, segments = _inject_all_anomaly_types(values, seed)
-            axis.plot(x_values, injected, color=SERIES_COLOR, lw=1.0, label="con anomalía", zorder=2)
+            axis.plot(x_values, injected, color=SERIES_COLOR, lw=1.0, zorder=2)
             seen: set[str] = set()
             for start, end, segment_type in segments:
                 color = ANOMALY_TYPE_COLORS[segment_type]
@@ -723,7 +708,7 @@ def save_synthetic_anomaly_types_plot(
             axis.legend(fontsize=7, loc="best", ncols=2, title="tipo de segmento")
         else:
             injected, labels = inject_synthetic_anomalies(values, anomaly_type, seed)
-            axis.plot(x_values, injected, color=SERIES_COLOR, lw=1.0, label="con anomalía", zorder=2)
+            axis.plot(x_values, injected, color=SERIES_COLOR, lw=1.0, zorder=2)
             mask = labels.astype(bool)
             axis.scatter(x_values[mask], injected[mask], color=ANOMALY_POINT_COLOR, s=18, zorder=3, label="anomalía")
             _shade_spans(axis, x_values, mask, ANOMALY_POINT_COLOR)
@@ -733,5 +718,4 @@ def save_synthetic_anomaly_types_plot(
         axis.set_visible(False)
 
     figure.tight_layout(rect=(0, 0, 1, 0.93))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)

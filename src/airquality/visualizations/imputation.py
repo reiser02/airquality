@@ -42,16 +42,15 @@ import numpy as np
 import pandas as pd
 
 from airquality.metrics import metric_higher_is_better
-from airquality.visualizations.anomaly import (
+from airquality.visualizations.style import (
     EDGE_COLOR,
     FIGURE_FACE,
     GRID_COLOR,
     TEXT_COLOR,
     add_plot_header,
+    save_figure,
     style_axis,
 )
-
-MUTED_TEXT = "#6d6258"
 
 TRAIN_COL = "Train_Seconds"
 IMPUTE_COL = "Impute_Seconds"
@@ -224,8 +223,7 @@ def save_time_by_model_plot(
     ]
     axis.legend(handles=handles, loc="lower right", fontsize=8)
     figure.tight_layout(rect=(0, 0, 1, 0.9))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
     return True
 
 
@@ -277,8 +275,7 @@ def save_time_vs_error_plot(
     axis.set_xlabel("tiempo de imputacion (s)")
     axis.set_ylabel(metric_label)
     figure.tight_layout(rect=(0, 0, 1, 0.9))
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    save_figure(figure, output_path)
     return True
 
 
