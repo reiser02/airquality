@@ -110,6 +110,17 @@ def main() -> None:
     print(f"[info] Plot data CSV: {artifacts['plot_store_path']}")
     if artifacts.get("metric_gap_plot_path") is not None:
         print(f"[info] Metrics-by-gap plot: {artifacts['metric_gap_plot_path']}")
+    for metric, path in artifacts.get("metric_gap_plot_paths", {}).items():
+        print(f"[info] Metrics-by-gap plot ({metric}): {path}")
+    if artifacts.get("station_mean_grid_path") is not None:
+        print(f"[info] Station-mean grid: {artifacts['station_mean_grid_path']}")
+    for name, path in artifacts.get("metric_gap_uncertainty_plot_paths", {}).items():
+        print(f"[info] Metric uncertainty plot ({name}): {path}")
+    if artifacts.get("metric_gap_uncertainty_table_path") is not None:
+        print(
+            f"[info] Metric uncertainty table: "
+            f"{artifacts['metric_gap_uncertainty_table_path']}"
+        )
     summary_plot_count = sum(
         len(artifacts.get(key, {}))
         for key in (

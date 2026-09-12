@@ -74,8 +74,18 @@ def test_run_benchmark_from_config_uses_parallel_runners_and_saves_outputs(
     assert (tmp_path / "plots" / "gap_1" / "Series_A.png").exists()
     # Aggregated metric-by-gap artifacts (previously never generated).
     assert artifacts["metric_gap_plot_path"] == tmp_path / "metrics_by_gap.png"
+    assert set(artifacts["metric_gap_plot_paths"]) == {"MAE"}
+    assert artifacts["metric_gap_plot_paths"]["MAE"] == (
+        tmp_path / "metrics_by_gap_mae.png"
+    )
+    assert artifacts["metric_gap_uncertainty_plot_paths"] == {}
+    assert artifacts["metric_gap_uncertainty_table_path"] == (
+        tmp_path / "metrics_by_gap_uncertainty.csv"
+    )
     assert (tmp_path / "metrics_by_gap.csv").exists()
     assert (tmp_path / "metrics_by_gap.png").exists()
+    assert (tmp_path / "metrics_by_gap_mae.png").exists()
+    assert (tmp_path / "metrics_by_gap_uncertainty.csv").exists()
     assert set(artifacts["model_performance_by_gap_plot_paths"]) == {"MAE"}
     assert set(artifacts["overall_model_performance_plot_paths"]) == {"MAE"}
     assert set(artifacts["global_station_error_plot_paths"]) == {"MAE"}

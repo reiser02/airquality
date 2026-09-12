@@ -16,17 +16,20 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import t as student_t
 
 from airquality.metrics import metric_higher_is_better
-
-# Base palette mirrored from `airquality.visualizations.anomaly` (same "base color"
-# the anomaly benchmark plots use). Copied verbatim on purpose: importing that
-# module would drag in the heavy STL/anomaly stack just for a handful of colours.
-FIGURE_FACE = "#f6f1e8"
-AXIS_FACE = "#fffaf2"
-TEXT_COLOR = "#27313a"
-GRID_COLOR = "#d8cabb"
-SPINE_COLOR = "#c2b3a3"
+from airquality.visualizations.style import (
+    AXIS_FACE,
+    FIGURE_FACE,
+    GRID_COLOR,
+    MUTED_TEXT,
+    SPINE_COLOR,
+    TEXT_COLOR,
+    add_plot_header,
+    save_figure,
+    style_axis,
+)
 PLOT_STORE_COLUMNS = (
     "gap_size",
     "series_name",
@@ -98,16 +101,7 @@ def _model_color_map(models: list[str]) -> dict[str, str]:
 
 def _style_metric_axis(ax: "plt.Axes") -> None:
     """Apply the shared cream/base styling to one metric subplot."""
-    ax.set_facecolor(AXIS_FACE)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
-    ax.xaxis.label.set_color(TEXT_COLOR)
-    ax.yaxis.label.set_color(TEXT_COLOR)
-    ax.title.set_color(TEXT_COLOR)
-    ax.grid(True, axis="y", color=GRID_COLOR, linestyle="--", alpha=0.65)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    ax.spines["left"].set_color(SPINE_COLOR)
-    ax.spines["bottom"].set_color(SPINE_COLOR)
+    style_axis(ax)
 
 
 def _aggregate_metrics_by_gap(
@@ -142,10 +136,30 @@ def _aggregate_metrics_by_gap(
         }
         for metric in metrics:
             values = station_means[metric].dropna()
-            row[f"{metric}_Mean"] = float(values.mean()) if len(values) else float("nan")
-            row[f"{metric}_P05"] = float(values.quantile(0.05)) if len(values) else float("nan")
-            row[f"{metric}_P95"] = float(values.quantile(0.95)) if len(values) else float("nan")
-            row[f"{metric}_N_Stations"] = int(len(values))
+            n_stations = len(values)
+            mean = float(values.mean()) if n_stations else float("nan")
+            standard_deviation = (
+                float(values.std(ddof=1)) if n_stations > 1 else float("nan")
+            )
+            if n_stations > 1 and np.isfinite(standard_deviation):
+                critical_value = float(student_t.ppf(0.975, n_stations - 1))
+                half_width = critical_value * standard_deviation / np.sqrt(n_stations)
+                ci_low = mean - half_width
+                ci_high = mean + half_width
+            else:
+                half_width = ci_low = ci_high = float("nan")
+            row[f"{metric}_Mean"] = mean
+            row[f"{metric}_SD"] = standard_deviation
+            row[f"{metric}_CI95_Low"] = ci_low
+            row[f"{metric}_CI95_High"] = ci_high
+            row[f"{metric}_CI95_Half_Width"] = half_width
+            row[f"{metric}_P05"] = (
+                float(values.quantile(0.05)) if n_stations else float("nan")
+            )
+            row[f"{metric}_P95"] = (
+                float(values.quantile(0.95)) if n_stations else float("nan")
+            )
+            row[f"{metric}_N_Stations"] = n_stations
         if "Support_Fraction" in group.columns:
             station_support = group.groupby("Serie", sort=False)[
                 "Support_Fraction"
@@ -908,21 +922,14 @@ def _save_global_station_error_plots(
         )
         ax.set_ylabel("Modelo")
         if metric in {"MASE", "RMSSE"}:
-            ax.axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
+            ax.axvline(1.0, color=MUTED_TEXT, linewidth=1.1, linestyle="--")
 
         display_metric = _metric_display_name(
             metric, scaled_errors=scaled_errors
         )
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Variación global entre estaciones: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(overall)
             + " Cada punto es una estación; caja P25-P75, línea naranja mediana y diamante media.\n"
             + (
@@ -930,17 +937,10 @@ def _save_global_station_error_plots(
                 if metric_higher_is_better(metric)
                 else "Cómo leer: más a la izquierda es mejor; una caja corta indica comportamiento homogéneo entre estaciones."
             ),
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         image_path = output_dir / f"global_station_error_{metric.lower()}.png"
-        fig.savefig(
-            image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight"
-        )
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1021,30 +1021,16 @@ def _save_pairwise_win_rate_plots(
         display_metric = _metric_display_name(
             metric, scaled_errors=scaled_errors
         )
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Comparación global por pares: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(overall)
             + " La celda indica cuánto gana la fila a la columna; los empates cuentan 0.5.\n"
             "Cómo leer: más de 50% favorece a la fila, menos de 50% a la columna; compare siempre una pareja concreta.",
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         image_path = output_dir / f"pairwise_win_rate_{metric.lower()}.png"
-        fig.savefig(
-            image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight"
-        )
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1096,7 +1082,7 @@ def _save_gap_degradation_plots(
             )
         _style_metric_axis(ax)
         ax.grid(True, axis="both", color=GRID_COLOR, linestyle="--", alpha=0.58)
-        ax.axhline(0.0, color="#6d6258", linewidth=1.1)
+        ax.axhline(0.0, color=MUTED_TEXT, linewidth=1.1)
         ax.set_xticks(gap_sizes)
         ax.set_xlabel("Tamaño del hueco (h)")
         ax.set_ylabel(f"Cambio respecto a {baseline_gap} h (%)")
@@ -1108,28 +1094,16 @@ def _save_gap_degradation_plots(
             ncol=1,
         )
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Sensibilidad al tamaño del hueco: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(overall)
             + f" Cada modelo se compara consigo mismo en {baseline_gap} h.\n"
             "Cómo leer: una curva baja y plana indica poca degradación; 50% significa un error 1.5 veces mayor.",
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 0.86, 0.90))
         image_path = output_dir / f"gap_degradation_{metric.lower()}.png"
-        fig.savefig(image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight")
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1190,7 +1164,7 @@ def _save_tail_risk_plots(
         ax.set_xlabel(_metric_display_name(metric, scaled_errors=scaled_errors))
         ax.set_ylabel("Modelo")
         if metric in {"MASE", "RMSSE"}:
-            ax.axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
+            ax.axvline(1.0, color=MUTED_TEXT, linewidth=1.1, linestyle="--")
         ax.legend(
             loc="center left",
             bbox_to_anchor=(1.01, 0.5),
@@ -1198,28 +1172,16 @@ def _save_tail_risk_plots(
             fontsize=8,
         )
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Riesgo de errores extremos: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(metric_frame)
             + " El peor 10% se calcula entre estaciones dentro de cada hueco.\n"
             "Cómo leer: más a la izquierda es mejor; un segmento corto indica poca penalización en estaciones difíciles.",
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 0.86, 0.90))
         image_path = output_dir / f"tail_risk_{metric.lower()}.png"
-        fig.savefig(image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight")
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1299,28 +1261,16 @@ def _save_error_correlation_plots(
         colorbar.set_label("Correlación de Spearman", color=TEXT_COLOR)
         colorbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8)
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Similitud de los patrones entre estaciones: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(overall)
             + " Se correlacionan estaciones dentro de cada hueco y después se promedian los huecos.\n"
             "Cómo leer: +1 indica perfiles similares entre estaciones; 0 o valores negativos sugieren complementariedad, no mayor precisión.",
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         image_path = output_dir / f"error_correlation_{metric.lower()}.png"
-        fig.savefig(image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight")
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1477,16 +1427,9 @@ def _save_model_performance_by_gap_plots(
             colorbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8)
 
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Rendimiento por tamaño de hueco: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(overall)
             + " La métrica conserva su escala; rango y top 3 comparan dentro de cada estación-hueco.\n"
             + (
@@ -1494,17 +1437,10 @@ def _save_model_performance_by_gap_plots(
                 if higher_is_better
                 else "Cómo leer: error y rango bajos son mejores; un porcentaje top 3 alto indica consistencia."
             ),
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         image_path = output_dir / f"model_performance_by_gap_{metric.lower()}.png"
-        fig.savefig(
-            image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight"
-        )
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
@@ -1566,7 +1502,7 @@ def _save_overall_model_performance_plots(
         )
         axes[0].set_ylabel("Modelo")
         if metric in {"MASE", "RMSSE"}:
-            axes[0].axvline(1.0, color="#6d6258", linewidth=1.1, linestyle="--")
+            axes[0].axvline(1.0, color=MUTED_TEXT, linewidth=1.1, linestyle="--")
         for position, value in zip(positions, means, strict=True):
             axes[0].annotate(
                 _format_metric_value(value),
@@ -1632,16 +1568,9 @@ def _save_overall_model_performance_plots(
             )
 
         display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
-        fig.suptitle(
+        add_plot_header(
+            fig,
             f"Rendimiento global de los modelos: {display_metric}",
-            y=0.992,
-            fontsize=14,
-            fontweight="bold",
-            color=TEXT_COLOR,
-        )
-        fig.text(
-            0.5,
-            0.953,
             _summary_support_text(metric_frame)
             + " Las barras resumen la métrica media, el rango y la frecuencia ganador / top 3.\n"
             + (
@@ -1649,51 +1578,40 @@ def _save_overall_model_performance_plots(
                 if metric_higher_is_better(metric)
                 else "Cómo leer: error y rango bajos, y consistencia alta, son mejores."
             ),
-            ha="center",
-            va="top",
-            fontsize=8.5,
-            color="#6d6258",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         image_path = output_dir / f"overall_model_performance_{metric.lower()}.png"
-        fig.savefig(
-            image_path, dpi=180, facecolor=FIGURE_FACE, bbox_inches="tight"
-        )
-        plt.close(fig)
+        save_figure(fig, image_path)
         paths[metric] = image_path
     return paths
 
 
-def _save_metric_gap_plot(
+def _metric_gap_plot_inputs(
     results_mc_df: pd.DataFrame,
-    *,
-    output_dir: Path,
-) -> Path | None:
-    """Plot equal-station metric means as annotated model-by-gap heatmaps.
-
-    Persists both the aggregated table (`metrics_by_gap.csv`) and the figure
-    (`metrics_by_gap.png`). Returns the image path, or None if there is nothing
-    to plot.
-    """
+) -> tuple[pd.DataFrame, list[str], list[int], list[str], bool] | None:
+    """Prepare the shared data and ordering for metric-by-gap heatmaps."""
     if results_mc_df.empty:
         return None
     if not {"Modelo", "Gap_Size"}.issubset(results_mc_df.columns):
         return None
 
-    metrics = [
-        m for m in ("MAE", "RMSE", "MASE", "RMSSE", "R2") if m in results_mc_df.columns
-    ]
+    preferred_metrics = ("MASE", "RMSSE", "R2")
+    metrics = [m for m in preferred_metrics if m in results_mc_df.columns]
+    # Keep the renderer useful for reduced test/legacy result files that do
+    # not contain any of the three primary scorecard metrics.
+    if not metrics:
+        metrics = [
+            m
+            for m in ("MAE", "RMSE")
+            if m in results_mc_df.columns
+        ]
     if not metrics:
         return None
 
     agg_df = _aggregate_metrics_by_gap(results_mc_df, metrics)
     if agg_df.empty:
         return None
-    agg_df = agg_df.sort_values(["Modelo", "Gap_Size"]).reset_index(drop=True)
-    agg_df.to_csv(output_dir / "metrics_by_gap.csv", index=False)
-
     gap_sizes = sorted(int(g) for g in agg_df["Gap_Size"].unique())
-    models = sorted(str(m) for m in agg_df["Modelo"].unique())
     order_metric = "MASE" if "MASE" in metrics else metrics[0]
     model_order = (
         agg_df.groupby("Modelo")[f"{order_metric}_Mean"]
@@ -1703,101 +1621,307 @@ def _save_metric_gap_plot(
         .tolist()
     )
     scaled_errors = "Scale_Std" in results_mc_df.columns
+    return agg_df, metrics, gap_sizes, model_order, scaled_errors
+
+
+def _draw_metric_value_heatmap(
+    ax: "plt.Axes",
+    agg_df: pd.DataFrame,
+    metric: str,
+    *,
+    gap_sizes: list[int],
+    model_order: list[str],
+    value_suffix: str,
+    display_title: str,
+    colorbar_label: str,
+    cmap_name: str,
+) -> bool:
+    """Draw one annotated model-by-gap statistic heatmap."""
+    matrix = (
+        agg_df.pivot(
+            index="Modelo",
+            columns="Gap_Size",
+            values=f"{metric}_{value_suffix}",
+        )
+        .reindex(index=model_order, columns=gap_sizes)
+    )
+    values = matrix.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return False
+
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad("#ded8cf")
+    image = ax.imshow(
+        np.ma.masked_invalid(values),
+        aspect="auto",
+        cmap=cmap,
+    )
+    for row_index, model in enumerate(model_order):
+        for col_index, gap in enumerate(gap_sizes):
+            value = values[row_index, col_index]
+            if not np.isfinite(value):
+                label = "--"
+            else:
+                support_row = agg_df[
+                    (agg_df["Modelo"] == model) & (agg_df["Gap_Size"] == gap)
+                ]
+                low_support = (
+                    not support_row.empty
+                    and float(support_row.iloc[0]["Support_Mean"]) < 0.999
+                )
+                label = (
+                    f"{_format_metric_value(float(value))}"
+                    f"{'*' if low_support else ''}"
+                )
+            normalized = image.norm(value) if np.isfinite(value) else 0.0
+            ax.text(
+                col_index,
+                row_index,
+                label,
+                ha="center",
+                va="center",
+                fontsize=8.5,
+                color="white" if normalized > 0.62 else TEXT_COLOR,
+            )
+
+    _style_metric_axis(ax)
+    ax.grid(False)
+    ax.set_title(display_title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Tamaño del hueco (h)")
+    ax.set_ylabel("Modelo")
+    ax.set_xticks(range(len(gap_sizes)))
+    ax.set_xticklabels([str(gap) for gap in gap_sizes])
+    ax.set_yticks(range(len(model_order)))
+    ax.set_yticklabels(model_order, fontsize=8.5)
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.05, pad=0.035)
+    colorbar.set_label(colorbar_label, color=TEXT_COLOR, fontsize=9)
+    colorbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8)
+    return True
+
+
+def _draw_metric_gap_heatmap(
+    ax: "plt.Axes",
+    agg_df: pd.DataFrame,
+    metric: str,
+    *,
+    gap_sizes: list[int],
+    model_order: list[str],
+    scaled_errors: bool,
+) -> bool:
+    """Draw one annotated model-by-gap mean heatmap."""
+    display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
+    return _draw_metric_value_heatmap(
+        ax,
+        agg_df,
+        metric,
+        gap_sizes=gap_sizes,
+        model_order=model_order,
+        value_suffix="Mean",
+        display_title=display_metric,
+        colorbar_label=display_metric,
+        cmap_name="YlGnBu" if metric_higher_is_better(metric) else "YlOrRd",
+    )
+
+
+def _save_metric_gap_uncertainty_plots(
+    agg_df: pd.DataFrame,
+    metrics: list[str],
+    gap_sizes: list[int],
+    model_order: list[str],
+    *,
+    output_dir: Path,
+    scaled_errors: bool,
+) -> None:
+    """Save station variability and 95% mean-confidence summaries."""
+    uncertainty_rows: list[dict[str, Any]] = []
+    for _, row in agg_df.iterrows():
+        for metric in metrics:
+            uncertainty_rows.append(
+                {
+                    "Metric": metric,
+                    "Modelo": str(row["Modelo"]),
+                    "Gap_Size": int(row["Gap_Size"]),
+                    "Mean": row[f"{metric}_Mean"],
+                    "SD": row[f"{metric}_SD"],
+                    "CI95_Low": row[f"{metric}_CI95_Low"],
+                    "CI95_High": row[f"{metric}_CI95_High"],
+                    "CI95_Half_Width": row[f"{metric}_CI95_Half_Width"],
+                    "N_Stations": row[f"{metric}_N_Stations"],
+                    "Support_Mean": row["Support_Mean"],
+                }
+            )
+    uncertainty_table = pd.DataFrame(uncertainty_rows)
+    uncertainty_table_path = output_dir / "metrics_by_gap_uncertainty.csv"
+    uncertainty_table.to_csv(uncertainty_table_path, index=False)
+
+    specifications = (
+        (
+            "SD",
+            "Variabilidad entre estaciones por tamaño de hueco",
+            "Cada celda muestra la desviación estándar de los valores medios por estación. "
+            "Valores menores indican un comportamiento más homogéneo.",
+            "Desviación estándar",
+        ),
+        (
+            "CI95_Half_Width",
+            "Incertidumbre de la media por tamaño de hueco",
+            "Cada celda muestra la semiamplitud del intervalo de confianza t del 95% para la media. "
+            "Los límites completos se encuentran en metrics_by_gap_uncertainty.csv.",
+            "Semiamplitud del IC 95%",
+        ),
+    )
+    for value_suffix, title, subtitle, colorbar_label in specifications:
+        image_path = output_dir / (
+            "metrics_by_gap_sd.png"
+            if value_suffix == "SD"
+            else "metrics_by_gap_ci95.png"
+        )
+        image_path.unlink(missing_ok=True)
+        fig, axes = plt.subplots(
+            1,
+            len(metrics),
+            figsize=(4.8 * len(metrics), max(6.0, 0.43 * len(model_order) + 2.2)),
+            facecolor=FIGURE_FACE,
+            squeeze=False,
+        )
+        axes_row = axes[0]
+        has_data = False
+        for ax, metric in zip(axes_row, metrics):
+            display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
+            drawn = _draw_metric_value_heatmap(
+                ax,
+                agg_df,
+                metric,
+                gap_sizes=gap_sizes,
+                model_order=model_order,
+                value_suffix=value_suffix,
+                display_title=f"{display_metric} | {value_suffix}",
+                colorbar_label=colorbar_label,
+                cmap_name="YlOrRd",
+            )
+            has_data = has_data or drawn
+            if not drawn:
+                ax.set_visible(False)
+        if not has_data:
+            plt.close(fig)
+            continue
+        add_plot_header(fig, title, subtitle)
+        fig.tight_layout(rect=(0, 0, 1, 0.89))
+        save_figure(fig, image_path)
+
+
+def _save_metric_gap_plots(
+    results_mc_df: pd.DataFrame,
+    *,
+    output_dir: Path,
+) -> tuple[Path | None, dict[str, Path]]:
+    """Save the combined heatmap and one readable heatmap per metric."""
+    for filename in (
+        "metrics_by_gap_sd.png",
+        "metrics_by_gap_ci95.png",
+        "metrics_by_gap_uncertainty.csv",
+    ):
+        (output_dir / filename).unlink(missing_ok=True)
+    prepared = _metric_gap_plot_inputs(results_mc_df)
+    if prepared is None:
+        return None, {}
+    agg_df, metrics, gap_sizes, model_order, scaled_errors = prepared
+    agg_df = agg_df.sort_values(["Modelo", "Gap_Size"]).reset_index(drop=True)
+    agg_df.to_csv(output_dir / "metrics_by_gap.csv", index=False)
+    _save_metric_gap_uncertainty_plots(
+        agg_df,
+        metrics,
+        gap_sizes,
+        model_order,
+        output_dir=output_dir,
+        scaled_errors=scaled_errors,
+    )
+
+    for metric in ("MAE", "RMSE", "MASE", "RMSSE", "R2"):
+        (output_dir / f"metrics_by_gap_{metric.lower()}.png").unlink(
+            missing_ok=True
+        )
 
     fig, axes = plt.subplots(
         1,
         len(metrics),
-        figsize=(4.8 * len(metrics), max(6.0, 0.43 * len(models) + 2.2)),
+        figsize=(4.8 * len(metrics), max(6.0, 0.43 * len(model_order) + 2.2)),
         facecolor=FIGURE_FACE,
         squeeze=False,
     )
     axes_row = axes[0]
 
     for ax, metric in zip(axes_row, metrics):
-        matrix = (
-            agg_df.pivot(index="Modelo", columns="Gap_Size", values=f"{metric}_Mean")
-            .reindex(index=model_order, columns=gap_sizes)
-        )
-        values = matrix.to_numpy(dtype=float)
-        finite = values[np.isfinite(values)]
-        if len(finite) == 0:
+        if not _draw_metric_gap_heatmap(
+            ax,
+            agg_df,
+            metric,
+            gap_sizes=gap_sizes,
+            model_order=model_order,
+            scaled_errors=scaled_errors,
+        ):
             ax.set_visible(False)
-            continue
-        cmap = plt.get_cmap(
-            "YlGnBu" if metric_higher_is_better(metric) else "YlOrRd"
-        ).copy()
-        cmap.set_bad("#ded8cf")
-        image = ax.imshow(
-            np.ma.masked_invalid(values),
-            aspect="auto",
-            cmap=cmap,
-        )
-        for row_index, model in enumerate(model_order):
-            for col_index, gap in enumerate(gap_sizes):
-                value = values[row_index, col_index]
-                if not np.isfinite(value):
-                    label = "--"
-                else:
-                    support_row = agg_df[
-                        (agg_df["Modelo"] == model) & (agg_df["Gap_Size"] == gap)
-                    ]
-                    low_support = (
-                        not support_row.empty
-                        and float(support_row.iloc[0]["Support_Mean"]) < 0.999
-                    )
-                    label = (
-                        f"{_format_metric_value(float(value))}"
-                        f"{'*' if low_support else ''}"
-                    )
-                normalized = image.norm(value) if np.isfinite(value) else 0.0
-                ax.text(
-                    col_index,
-                    row_index,
-                    label,
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    color="white" if normalized > 0.62 else TEXT_COLOR,
-                )
-        _style_metric_axis(ax)
-        ax.grid(False)
-        ax.set_title(
-            _metric_display_name(metric, scaled_errors=scaled_errors),
-            fontsize=12,
-            fontweight="bold",
-        )
-        ax.set_xlabel("Tamaño del hueco (h)")
-        ax.set_xticks(range(len(gap_sizes)))
-        ax.set_xticklabels([str(g) for g in gap_sizes])
-        ax.set_yticks(range(len(model_order)))
-        ax.set_yticklabels(model_order, fontsize=8)
-        colorbar = fig.colorbar(image, ax=ax, fraction=0.04, pad=0.025)
 
-    fig.suptitle(
+    add_plot_header(
+        fig,
         "Rendimiento medio por tamaño de hueco",
-        x=0.5,
-        y=0.985,
-        fontsize=14,
-        fontweight="bold",
-        color=TEXT_COLOR,
-    )
-    fig.text(
-        0.5,
-        0.948,
         "Cada celda promedia primero las semillas dentro de cada estación y después las estaciones por igual. "
         "* indica soporte incompleto.\n"
-        "Cómo leer: MAE/RMSE/MASE/RMSSE menores son mejores; R² mayor es mejor. Compare dentro de una misma métrica y hueco.",
-        ha="center",
-        va="top",
-        fontsize=8.5,
-        color="#6d6258",
+        "Cómo leer: MASE/RMSSE menores son mejores; R² mayor es mejor. Compare dentro de una misma métrica y hueco.",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.89))
 
-    image_path = output_dir / "metrics_by_gap.png"
-    fig.savefig(image_path, dpi=150, facecolor=FIGURE_FACE)
-    plt.close(fig)
-    return image_path
+    combined_path = output_dir / "metrics_by_gap.png"
+    save_figure(fig, combined_path)
+
+    metric_paths: dict[str, Path] = {}
+    for metric in metrics:
+        fig, ax = plt.subplots(
+            figsize=(8.6, max(6.2, 0.43 * len(model_order) + 2.5)),
+            facecolor=FIGURE_FACE,
+        )
+        if not _draw_metric_gap_heatmap(
+            ax,
+            agg_df,
+            metric,
+            gap_sizes=gap_sizes,
+            model_order=model_order,
+            scaled_errors=scaled_errors,
+        ):
+            plt.close(fig)
+            continue
+        display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
+        add_plot_header(
+            fig,
+            f"Rendimiento medio por tamaño de hueco: {display_metric}",
+            "Cada celda promedia primero las semillas dentro de cada estación y después las estaciones por igual. "
+            "* indica soporte incompleto.\n"
+            + (
+                "Cómo leer: valores menores son mejores. Compare los modelos dentro de cada tamaño de hueco."
+                if not metric_higher_is_better(metric)
+                else "Cómo leer: valores mayores son mejores. Compare los modelos dentro de cada tamaño de hueco."
+            ),
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.89))
+        image_path = output_dir / f"metrics_by_gap_{metric.lower()}.png"
+        save_figure(fig, image_path)
+        metric_paths[metric] = image_path
+
+    return combined_path, metric_paths
+
+
+def _save_metric_gap_plot(
+    results_mc_df: pd.DataFrame,
+    *,
+    output_dir: Path,
+) -> Path | None:
+    """Compatibility wrapper returning the combined metric heatmap path."""
+    combined_path, _ = _save_metric_gap_plots(
+        results_mc_df,
+        output_dir=output_dir,
+    )
+    return combined_path
 
 
 def _save_montecarlo_diagnostic_plots(
@@ -2055,6 +2179,164 @@ def load_plot_store(path: Path) -> dict[int, dict[str, Any]]:
     return plot_store
 
 
+def _draw_station_mean_boxplot(
+    ax: "plt.Axes",
+    model_values: dict[str, np.ndarray],
+    *,
+    model_order: list[str] | None = None,
+) -> list[str]:
+    """Draw the station-level MASE distributions used by gap summaries."""
+    model_scores = {
+        model_name: float(values.mean())
+        for model_name, values in model_values.items()
+    }
+    if model_order is None:
+        ranked_models = sorted(
+            model_scores,
+            key=lambda name: (model_scores[name], name),
+        )
+    else:
+        ranked_models = [
+            model_name for model_name in model_order if model_name in model_values
+        ]
+        ranked_models.extend(
+            sorted(
+                set(model_values).difference(ranked_models),
+                key=lambda name: (model_scores[name], name),
+            )
+        )
+
+    colors = _model_color_map(ranked_models)
+    positions = np.arange(len(ranked_models))
+    for position, model_name in zip(positions, ranked_models, strict=True):
+        box = ax.boxplot(
+            model_values[model_name],
+            positions=[position],
+            widths=0.62,
+            orientation="horizontal",
+            patch_artist=True,
+            showmeans=True,
+            meanline=False,
+            boxprops={"facecolor": colors[model_name], "alpha": 0.72},
+            medianprops={"color": TEXT_COLOR, "linewidth": 1.5},
+            meanprops={
+                "marker": "D",
+                "markerfacecolor": "#f3b43f",
+                "markeredgecolor": TEXT_COLOR,
+                "markersize": 5,
+            },
+            whiskerprops={"color": colors[model_name], "linewidth": 1.2},
+            capprops={"color": colors[model_name], "linewidth": 1.2},
+            flierprops={
+                "marker": ".",
+                "markerfacecolor": colors[model_name],
+                "markeredgecolor": colors[model_name],
+                "alpha": 0.45,
+                "markersize": 4,
+            },
+        )
+        for artist in box["boxes"]:
+            artist.set_edgecolor(colors[model_name])
+        ax.annotate(
+            f"media={model_scores[model_name]:.2f}",
+            (model_scores[model_name], position),
+            xytext=(5, 0),
+            textcoords="offset points",
+            va="center",
+            fontsize=7.5,
+            color=TEXT_COLOR,
+        )
+
+    ax.axvline(1.0, color="#d6453c", linestyle="--", linewidth=1.1, alpha=0.7)
+    ax.set_xlabel("MASE medio por estacion")
+    ax.set_ylabel("Modelo")
+    ax.set_yticks(positions)
+    ax.set_yticklabels(ranked_models, fontsize=8)
+    ax.invert_yaxis()
+    ax.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.55)
+    ax.grid(False, axis="y")
+    ax.margins(x=0.14)
+    return ranked_models
+
+
+def _save_station_mean_grid(
+    station_values_by_gap: dict[int, dict[str, np.ndarray]],
+    *,
+    output_dir: Path,
+) -> Path | None:
+    """Save a 2x2 comparison of station-level MASE distributions."""
+    grid_path = output_dir / "plots" / "media_estaciones_grid.png"
+    requested_gaps = (1, 2, 5, 10)
+    available_values = {
+        gap: station_values_by_gap[gap]
+        for gap in requested_gaps
+        if gap in station_values_by_gap
+    }
+    if not available_values:
+        grid_path.unlink(missing_ok=True)
+        return None
+
+    combined_values: dict[str, list[float]] = {}
+    for model_values in available_values.values():
+        for model_name, values in model_values.items():
+            combined_values.setdefault(model_name, []).extend(values.tolist())
+    global_order = sorted(
+        combined_values,
+        key=lambda name: (float(np.mean(combined_values[name])), name),
+    )
+    finite_values = np.concatenate(
+        [
+            values
+            for model_values in available_values.values()
+            for values in model_values.values()
+        ]
+    )
+    x_max = max(1.15, float(np.nanmax(finite_values)) * 1.12)
+
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(16.0, 13.5),
+        facecolor=FIGURE_FACE,
+        sharex=True,
+    )
+    axes_flat = axes.ravel()
+    for ax, gap in zip(axes_flat, requested_gaps, strict=True):
+        _style_metric_axis(ax)
+        model_values = station_values_by_gap.get(gap)
+        if not model_values:
+            ax.set_axis_off()
+            ax.text(
+                0.5,
+                0.5,
+                f"Sin datos para huecos de {gap} h",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color=MUTED_TEXT,
+            )
+            continue
+        _draw_station_mean_boxplot(
+            ax,
+            model_values,
+            model_order=global_order,
+        )
+        ax.set_title(f"Huecos de {gap} h", fontsize=11.5, fontweight="bold")
+        ax.set_xlim(0.0, x_max)
+
+    add_plot_header(
+        fig,
+        "MASE medio entre estaciones | Comparación por tamaño de hueco",
+        "Cada panel resume el MASE medio de cada estación tras promediar sus semillas. "
+        "El diamante indica la media y la línea roja marca MASE = 1.\n"
+        "Cómo leer: cajas más a la izquierda indican menor error; una caja más corta "
+        "indica mayor homogeneidad entre estaciones.",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    save_figure(fig, grid_path)
+    return grid_path
+
+
 def _save_plot_images(
     plot_store: dict[int, dict[str, Any]],
     *,
@@ -2275,26 +2557,21 @@ def _save_plot_images(
                 ha="right",
                 va="bottom",
                 fontsize=7.5,
-                color="#6d6258",
+                color=MUTED_TEXT,
             )
             error_ax.margins(x=0.14)
 
-            fig.suptitle(
+            add_plot_header(
+                fig,
                 f"Imputacion de {series_name} | Huecos de {int(gap_size)} h",
-                x=0.07, y=0.98, ha="left", fontsize=15, fontweight="bold", color=TEXT_COLOR,
-            )
-            fig.text(
-                0.07, 0.91,
                 f"{gap_count} huecos, {len(gap_real)} puntos ocultados. "
                 "Arriba se muestra una semilla representativa; abajo se resumen todas las semillas.\n"
                 "Como leer: cajas mas a la izquierda y estrechas indican menor MASE y mayor estabilidad entre semillas.",
-                ha="left", fontsize=9, color="#6d6258",
             )
             fig.subplots_adjust(left=0.07, right=0.96, bottom=0.09, top=0.82)
 
             image_path = gap_dir / f"{_sanitize_filename(str(series_name))}.png"
-            fig.savefig(image_path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-            plt.close(fig)
+            save_figure(fig, image_path)
 
             rows.append(
                 {
@@ -2313,8 +2590,9 @@ def _save_plot_images(
         and {"Modelo", "Serie", "Gap_Size", "MASE"}.issubset(results_mc_df.columns)
     ):
         _, station_means = _station_seed_metric_tables(results_mc_df, ["MASE"])
+        station_values_by_gap: dict[int, dict[str, np.ndarray]] = {}
         for gap_size, gap_rows in station_means.groupby("Gap_Size", sort=True):
-            model_values = {}
+            model_values: dict[str, np.ndarray] = {}
             for model_name, model_rows in gap_rows.groupby("Modelo", sort=False):
                 values = model_rows["MASE"].to_numpy(dtype=float)
                 values = values[np.isfinite(values)]
@@ -2323,92 +2601,27 @@ def _save_plot_images(
             if not model_values:
                 continue
 
-            model_scores = {
-                model_name: float(values.mean())
-                for model_name, values in model_values.items()
-            }
-            ranked_models = sorted(model_scores, key=lambda name: (model_scores[name], name))
-            colors = _model_color_map(ranked_models)
-            positions = np.arange(len(ranked_models))
+            gap_size = int(gap_size)
+            station_values_by_gap[gap_size] = model_values
 
             fig, ax = plt.subplots(figsize=(13.2, 7.8), facecolor=FIGURE_FACE)
             _style_metric_axis(ax)
-            for position, model_name in zip(positions, ranked_models, strict=True):
-                box = ax.boxplot(
-                    model_values[model_name],
-                    positions=[position],
-                    widths=0.62,
-                    orientation="horizontal",
-                    patch_artist=True,
-                    showmeans=True,
-                    meanline=False,
-                    boxprops={"facecolor": colors[model_name], "alpha": 0.72},
-                    medianprops={"color": TEXT_COLOR, "linewidth": 1.5},
-                    meanprops={
-                        "marker": "D",
-                        "markerfacecolor": "#f3b43f",
-                        "markeredgecolor": TEXT_COLOR,
-                        "markersize": 5,
-                    },
-                    whiskerprops={"color": colors[model_name], "linewidth": 1.2},
-                    capprops={"color": colors[model_name], "linewidth": 1.2},
-                    flierprops={
-                        "marker": ".",
-                        "markerfacecolor": colors[model_name],
-                        "markeredgecolor": colors[model_name],
-                        "alpha": 0.45,
-                        "markersize": 4,
-                    },
-                )
-                for artist in box["boxes"]:
-                    artist.set_edgecolor(colors[model_name])
-                ax.annotate(
-                    f"media={model_scores[model_name]:.2f}",
-                    (model_scores[model_name], position),
-                    xytext=(5, 0),
-                    textcoords="offset points",
-                    va="center",
-                    fontsize=7.5,
-                    color=TEXT_COLOR,
-                )
-
-            ax.axvline(1.0, color="#d6453c", linestyle="--", linewidth=1.1, alpha=0.7)
-            ax.set_xlabel("MASE medio por estacion")
-            ax.set_ylabel("Modelo")
-            ax.set_yticks(positions)
-            ax.set_yticklabels(ranked_models, fontsize=8)
-            ax.invert_yaxis()
-            ax.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.55)
-            ax.grid(False, axis="y")
-            ax.margins(x=0.14)
-            fig.suptitle(
-                f"MASE medio entre estaciones | Huecos de {int(gap_size)} h",
-                x=0.07,
-                y=0.98,
-                ha="left",
-                fontsize=15,
-                fontweight="bold",
-                color=TEXT_COLOR,
-            )
-            fig.text(
-                0.07,
-                0.91,
+            ranked_models = _draw_station_mean_boxplot(ax, model_values)
+            add_plot_header(
+                fig,
+                f"MASE medio entre estaciones | Huecos de {gap_size} h",
                 "Cada observacion es el MASE medio de una estacion tras promediar sus semillas.\n"
                 "El diamante indica la media de todas las estaciones; la linea roja marca MASE = 1.",
-                ha="left",
-                fontsize=9,
-                color="#6d6258",
             )
             fig.subplots_adjust(left=0.18, right=0.96, bottom=0.1, top=0.82)
 
-            gap_dir = plots_dir / f"gap_{int(gap_size)}"
+            gap_dir = plots_dir / f"gap_{gap_size}"
             gap_dir.mkdir(parents=True, exist_ok=True)
             image_path = gap_dir / "media_estaciones.png"
-            fig.savefig(image_path, dpi=180, bbox_inches="tight", facecolor=FIGURE_FACE)
-            plt.close(fig)
+            save_figure(fig, image_path)
             rows.append(
                 {
-                    "gap_size": int(gap_size),
+                    "gap_size": gap_size,
                     "series_name": "Media de estaciones",
                     "seed": None,
                     "gap_count": None,
@@ -2417,6 +2630,9 @@ def _save_plot_images(
                     "image_path": str(image_path.relative_to(output_dir)),
                 }
             )
+        _save_station_mean_grid(station_values_by_gap, output_dir=output_dir)
+    else:
+        (output_dir / "plots" / "media_estaciones_grid.png").unlink(missing_ok=True)
 
     manifest_df = pd.DataFrame(
         rows,
@@ -2446,13 +2662,36 @@ def render_run_figures(
         results_mc_df = pd.read_csv(output_dir / "results_mc.csv")
     if plot_store is None:
         plot_store = load_plot_store(output_dir / "plot_store.csv.gz")
+    metric_gap_plot_path, metric_gap_plot_paths = _save_metric_gap_plots(
+        results_mc_df,
+        output_dir=output_dir,
+    )
+    plot_manifest_df = _save_plot_images(
+        plot_store,
+        output_dir=output_dir,
+        results_mc_df=results_mc_df,
+    )
+    station_mean_grid_path = output_dir / "plots" / "media_estaciones_grid.png"
+    if not station_mean_grid_path.exists():
+        station_mean_grid_path = None
+    metric_gap_uncertainty_plot_paths = {
+        name: output_dir / filename
+        for name, filename in {
+            "SD": "metrics_by_gap_sd.png",
+            "CI95": "metrics_by_gap_ci95.png",
+        }.items()
+        if (output_dir / filename).exists()
+    }
+    metric_gap_uncertainty_table_path = output_dir / "metrics_by_gap_uncertainty.csv"
+    if not metric_gap_uncertainty_table_path.exists():
+        metric_gap_uncertainty_table_path = None
     existing_artifacts = {
-        "metric_gap_plot_path": _save_metric_gap_plot(
-            results_mc_df, output_dir=output_dir
-        ),
-        "plot_manifest_df": _save_plot_images(
-            plot_store, output_dir=output_dir, results_mc_df=results_mc_df
-        ),
+        "metric_gap_plot_path": metric_gap_plot_path,
+        "metric_gap_plot_paths": metric_gap_plot_paths,
+        "metric_gap_uncertainty_plot_paths": metric_gap_uncertainty_plot_paths,
+        "metric_gap_uncertainty_table_path": metric_gap_uncertainty_table_path,
+        "plot_manifest_df": plot_manifest_df,
+        "station_mean_grid_path": station_mean_grid_path,
     }
     diagnostic_artifacts = _save_montecarlo_diagnostic_plots(
         results_mc_df,
@@ -2473,6 +2712,20 @@ def main(argv: list[str] | None = None) -> None:
     metric_path = artifacts["metric_gap_plot_path"]
     if metric_path is not None:
         print(f"[info] Figura guardada en {metric_path}")
+    for metric, path in artifacts.get("metric_gap_plot_paths", {}).items():
+        print(f"[info] Figura separada ({metric}) guardada en {path}")
+    if artifacts.get("station_mean_grid_path") is not None:
+        print(
+            f"[info] Grid de medias por estacion guardado en "
+            f"{artifacts['station_mean_grid_path']}"
+        )
+    for name, path in artifacts.get("metric_gap_uncertainty_plot_paths", {}).items():
+        print(f"[info] Figura de incertidumbre ({name}) guardada en {path}")
+    if artifacts.get("metric_gap_uncertainty_table_path") is not None:
+        print(
+            f"[info] Tabla de incertidumbre guardada en "
+            f"{artifacts['metric_gap_uncertainty_table_path']}"
+        )
     for key in (
         "model_performance_by_gap_plot_paths",
         "overall_model_performance_plot_paths",

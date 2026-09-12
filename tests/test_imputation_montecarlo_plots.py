@@ -34,6 +34,9 @@ def test_aggregate_metrics_by_gap_weights_stations_equally() -> None:
     result = _aggregate_metrics_by_gap(frame, ["MAE"])
 
     assert result.loc[0, "MAE_Mean"] == pytest.approx(2.0)
+    assert result.loc[0, "MAE_SD"] == pytest.approx(np.sqrt(2.0))
+    assert result.loc[0, "MAE_CI95_Low"] < result.loc[0, "MAE_Mean"]
+    assert result.loc[0, "MAE_CI95_High"] > result.loc[0, "MAE_Mean"]
     assert result.loc[0, "MAE_N_Stations"] == 2
 
 
@@ -203,7 +206,7 @@ def test_r2_rankings_and_pairwise_wins_maximize_metric() -> None:
 
 def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> None:
     rows: list[dict[str, object]] = []
-    for gap in (1, 2, 6, 24):
+    for gap in (1, 2, 5, 10):
         for station_index, station in enumerate(("A", "B", "C"), start=1):
             for seed in (10, 20):
                 for model, offset in (("LinearInterp", 0.5), ("ModelX", 0.0)):
@@ -246,6 +249,26 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
     )
 
     assert artifacts["metric_gap_plot_path"] == tmp_path / "metrics_by_gap.png"
+    assert set(artifacts["metric_gap_plot_paths"]) == {
+        "MASE",
+        "RMSSE",
+        "R2",
+    }
+    assert all(path.exists() for path in artifacts["metric_gap_plot_paths"].values())
+    assert set(artifacts["metric_gap_uncertainty_plot_paths"]) == {"SD", "CI95"}
+    assert all(
+        path.exists() for path in artifacts["metric_gap_uncertainty_plot_paths"].values()
+    )
+    assert artifacts["metric_gap_uncertainty_table_path"] == (
+        tmp_path / "metrics_by_gap_uncertainty.csv"
+    )
+    uncertainty_table = pd.read_csv(tmp_path / "metrics_by_gap_uncertainty.csv")
+    assert set(uncertainty_table["Metric"]) == {"MASE", "RMSSE", "R2"}
+    assert uncertainty_table["N_Stations"].eq(3).all()
+    assert artifacts["station_mean_grid_path"] == (
+        tmp_path / "plots" / "media_estaciones_grid.png"
+    )
+    assert artifacts["station_mean_grid_path"].exists()
     for key in (
         "model_performance_by_gap_plot_paths",
         "overall_model_performance_plot_paths",
@@ -278,10 +301,10 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
     gap_table = pd.read_csv(tmp_path / "model_performance_by_gap.csv")
     assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
     assert gap_table["N_Stations"].eq(3).all()
-    for gap in (1, 2, 6, 24):
+    for gap in (1, 2, 5, 10):
         assert (tmp_path / "plots" / f"gap_{gap}" / "media_estaciones.png").exists()
     aggregate_rows = artifacts["plot_manifest_df"].query(
         "series_name == 'Media de estaciones'"
     )
-    assert set(aggregate_rows["gap_size"]) == {1, 2, 6, 24}
+    assert set(aggregate_rows["gap_size"]) == {1, 2, 5, 10}
     assert all(not (tmp_path / filename).exists() for filename in obsolete_plots)
