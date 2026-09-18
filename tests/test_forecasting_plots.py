@@ -27,11 +27,11 @@ from airquality.visualizations.forecasting import (
     save_train_time_plot,
     save_train_time_vs_error_plot,
     selection_counts,
+    training_time_summary,
 )
 
 ARMS = [
     "raw",
-    "raw+frozen",
     "unlabeled+impute",
     "unlabeled+noimpute",
     "inject-vote+impute",
@@ -48,7 +48,7 @@ def _results_df(n_series: int = 3, models: tuple[str, ...] = ("NLinear", "TiDE")
             base = 1.0 + rng.uniform(0, 0.5)
             for arm in ARMS:
                 family = arm.split("+", 1)[0]
-                is_raw_view = arm in {"raw", "raw+frozen"}
+                is_raw_view = arm == "raw"
                 rows.append(
                     {
                         "series": f"ST{s}",
@@ -111,17 +111,16 @@ def test_improvement_table_is_relative_to_raw():
     table = improvement_table(df, "relrmse", "NLinear")
 
     assert "raw" not in table.columns
-    assert "raw+frozen" in table.columns
     assert table.loc["ST0", "unlabeled+impute"] == pytest.approx(20.0)  # 20% better
 
 
 def test_improvement_table_keeps_all_nan_arm():
     df = _results_df(n_series=1, models=("NLinear",))
-    df.loc[df["arm"] == "raw+frozen", "relrmse"] = np.nan
+    df.loc[df["arm"] == "inject-vote+noimpute", "relrmse"] = np.nan
 
     table = improvement_table(df, "relrmse", "NLinear")
 
-    assert table["raw+frozen"].isna().all()
+    assert table["inject-vote+noimpute"].isna().all()
 
 
 def test_selection_counts_orders_and_counts():
@@ -145,10 +144,33 @@ def test_imputation_pairs_requires_both_variants():
 def test_family_colors_fixed_and_extended():
     colors = family_colors(ARMS + ["inject-soft+impute", "custom+impute"])
     assert colors["raw"] == "#6d6258"
-    assert colors["raw+frozen"] == "#2a7f76"
     assert colors["unlabeled"] == "#3d7ab5"
     assert colors["inject-soft"] == "#5b8c5a"
     assert colors["custom"] not in ("", None)
+
+
+def test_training_time_summary_balances_branches_and_zeroes_foundation():
+    frame = pd.DataFrame(
+        [
+            {"model": "A", "model_mode": "trained", "arm": "raw", "series": "S0", "train_seconds": 2.0, "mase": 1.0},
+            {"model": "A", "model_mode": "trained", "arm": "raw", "series": "S1", "train_seconds": 4.0, "mase": 0.8},
+            {"model": "A", "model_mode": "trained", "arm": "cleaned", "series": "S0", "train_seconds": 10.0, "mase": 0.5},
+            {"model": "A", "model_mode": "trained", "arm": "cleaned", "series": "S1", "train_seconds": 20.0, "mase": 0.7},
+            {"model": "B", "model_mode": "local", "arm": "raw", "series": "S0", "train_seconds": 1.0, "mase": 2.0},
+            {"model": "Foundation", "model_mode": "foundation", "arm": "raw", "series": "S0", "train_seconds": 100.0, "mase": 0.1},
+        ]
+    )
+
+    summary = training_time_summary(frame, metric="mase").set_index("model")
+
+    assert set(summary.index) == {"A", "B", "Foundation"}
+    assert summary.loc["A", "n_branches"] == 2
+    assert summary.loc["A", "n_runs"] == 4
+    assert summary.loc["A", "train_seconds_mean"] == pytest.approx(9.0)
+    assert summary.loc["A", "train_seconds_median"] == pytest.approx(9.0)
+    assert summary.loc["A", "mase_mean"] == pytest.approx(0.75)
+    assert summary.loc["Foundation", "train_seconds_median"] == pytest.approx(0.0)
+    assert summary.loc["Foundation", "mase_mean"] == pytest.approx(0.1)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +293,10 @@ def test_render_run_figures_from_csvs(tmp_path):
     ).to_csv(tmp_path / "foundation_preprocessing_summary.csv", index=False)
 
     saved = render_run_figures(tmp_path)
+    training_summary = pd.read_csv(tmp_path / "training_summary.csv")
+    assert {"train_seconds_median", "train_seconds_mean", "mase_mean"} <= set(
+        training_summary.columns
+    )
 
     names = {path.name for path in saved}
     assert names == {

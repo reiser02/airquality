@@ -11,7 +11,6 @@ from airquality.visualizations.forecasting_statistics import render_statistical_
 def _results() -> pd.DataFrame:
     arms = {
         "raw": 1.0,
-        "raw+frozen": 1.1,
         "clean-a": 0.7,
         "clean-b": 1.2,
     }
@@ -84,7 +83,6 @@ def test_report_renders_branch_scores_pairwise_plots_and_tables(tmp_path) -> Non
     write_statistical_analysis(
         tmp_path,
         n_permutations=199,
-        n_bootstrap=199,
         seed=7,
     )
 
@@ -102,6 +100,6 @@ def test_report_renders_branch_scores_pairwise_plots_and_tables(tmp_path) -> Non
     assert set(summary["branch"]) == {"raw", "clean-a", "clean-b"}
     report = (tmp_path / "statistical_report.md").read_text(encoding="utf-8")
     assert "Ramas: scores usados en los contrastes" in report
-    assert "Ramas: comparaciones post-hoc MASE" in report
+    assert "Ramas: comparaciones frente a raw" in report
     assert "Ramas mejores que raw con respaldo confirmatorio" in report
     assert "| clean-a" in report

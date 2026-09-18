@@ -12,10 +12,10 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest, rankdata, wilcoxon
+from scipy.stats import rankdata, wilcoxon
 from statsmodels.stats.multitest import multipletests
 
-from airquality.forecasting.pipeline import RAW_ARM, RAW_FROZEN_ARM
+from airquality.forecasting.pipeline import RAW_ARM
 
 
 METRICS = ("mase", "rmsse")
@@ -54,10 +54,8 @@ OMNIBUS_COLUMNS = (
 PAIRWISE_COLUMNS = (
     "analysis", "scope", "metric", "family", "confirmatory", "left", "right",
     "n_stations", "mean_difference", "median_difference", "error_ratio",
-    "improvement_pct", "ci_ratio_low", "ci_ratio_high", "ci_difference_low",
-    "ci_difference_high", "rank_biserial", "wins", "ties", "losses",
-    "wilcoxon_statistic", "p_value", "sign_p_value", "p_holm", "sign_p_holm",
-    "p_joint", "alpha", "n_bootstrap", "omnibus_significant",
+    "improvement_pct", "rank_biserial", "wins", "ties", "losses",
+    "wilcoxon_statistic", "p_value", "p_holm", "alpha", "omnibus_significant",
     "typical_station_outcome", "seed",
 )
 EXCLUSION_COLUMNS = ("analysis", "scope", "metric", "series", "reason", "seed")
@@ -101,21 +99,21 @@ def _validate_results(results: pd.DataFrame) -> None:
         raise ValueError("model_mode contiene valores desconocidos")
     if (results.groupby("model")["model_mode"].nunique() != 1).any():
         raise ValueError("Cada modelo debe tener un unico model_mode")
-    source_arms = {RAW_ARM, RAW_FROZEN_ARM}
+    source_arms = {RAW_ARM}
     if not source_arms.issubset(set(results["arm"])):
-        raise ValueError("results.csv debe contener los brazos raw y raw+frozen")
+        raise ValueError("results.csv debe contener el brazo raw")
     model_arms = results.groupby("model")["arm"].agg(set)
     mode_by_model = results.groupby("model")["model_mode"].first()
     nonfoundation = mode_by_model[mode_by_model != "foundation"].index
     if len(nonfoundation):
         expected_arms = model_arms.loc[nonfoundation[0]]
         if not source_arms.issubset(expected_arms):
-            raise ValueError("Los modelos no-foundation deben incluir raw y raw+frozen")
+            raise ValueError("Los modelos no-foundation deben incluir raw")
         if any(model_arms.loc[model] != expected_arms for model in nonfoundation):
             raise ValueError("Los modelos no-foundation no comparten los mismos brazos")
     foundation = mode_by_model[mode_by_model == "foundation"].index
     if any(model_arms.loc[model] != source_arms for model in foundation):
-        raise ValueError("Los modelos foundation deben usar solo raw y raw+frozen")
+        raise ValueError("Los modelos foundation deben usar solo raw")
     if any(results[column].nunique(dropna=False) != 1 for column in PROTOCOL_COLUMNS):
         raise ValueError("Los resultados no comparten el mismo protocolo temporal")
     protocol: dict[str, int] = {}
@@ -197,7 +195,7 @@ def _validate_manifest(results: pd.DataFrame, manifest: dict) -> None:
         for arm in (
             arms
             if bool(model["uses_training_arms"])
-            else [source for source in arms if source in (RAW_ARM, RAW_FROZEN_ARM)]
+            else [source for source in arms if source == RAW_ARM]
         )
     }
     actual = set(
@@ -327,8 +325,8 @@ def build_model_station_scores(
         frame = results.loc[results["model_mode"] != "foundation"].copy()
         arms = list(dict.fromkeys(frame["arm"].astype(str)))
     elif scope == "common_source_arms":
-        frame = results.loc[results["arm"].isin((RAW_ARM, RAW_FROZEN_ARM))].copy()
-        arms = [arm for arm in (RAW_ARM, RAW_FROZEN_ARM) if arm in set(frame["arm"])]
+        frame = results.loc[results["arm"] == RAW_ARM].copy()
+        arms = [RAW_ARM] if RAW_ARM in set(frame["arm"]) else []
     else:
         raise ValueError(f"Scope de modelos no soportado: {scope}")
     models = list(dict.fromkeys(frame["model"].astype(str)))
@@ -356,7 +354,6 @@ def build_branch_station_scores(
         raise ValueError(f"Metrica no soportada: {metric}")
     frame = results.loc[
         (results["model_mode"] != "foundation")
-        & (results["arm"] != RAW_FROZEN_ARM)
     ].copy()
     arms = list(dict.fromkeys(frame["arm"].astype(str)))
     models = list(dict.fromkeys(frame["model"].astype(str)))
@@ -451,41 +448,6 @@ def _omnibus(
     )
 
 
-def _bootstrap_intervals(
-    left: np.ndarray,
-    right: np.ndarray,
-    *,
-    alpha: float,
-    n_bootstrap: int,
-    rng: np.random.Generator,
-) -> tuple[float, float, float, float]:
-    indices = rng.integers(0, len(left), size=(n_bootstrap, len(left)))
-    sampled_left = left[indices]
-    sampled_right = right[indices]
-    quantiles = (alpha / 2.0, 1.0 - alpha / 2.0)
-    left_means = sampled_left.mean(axis=1)
-    right_means = sampled_right.mean(axis=1)
-    ratios = np.full(n_bootstrap, np.nan)
-    positive_denominator = right_means > 0.0
-    ratios[positive_denominator] = (
-        left_means[positive_denominator] / right_means[positive_denominator]
-    )
-    ratios[(right_means == 0.0) & (left_means > 0.0)] = float("inf")
-    ratios = ratios[~np.isnan(ratios)]
-    if np.any((left == 0.0) & (right == 0.0)) or not len(ratios):
-        ratio_low = ratio_high = float("nan")
-    else:
-        ratio_low, ratio_high = (
-            float(value)
-            for value in np.quantile(ratios, quantiles, method="inverted_cdf")
-        )
-    median_differences = np.median(sampled_left - sampled_right, axis=1)
-    difference_low, difference_high = (
-        float(value) for value in np.quantile(median_differences, quantiles)
-    )
-    return ratio_low, ratio_high, difference_low, difference_high
-
-
 def _pairwise(
     wide: pd.DataFrame,
     pairs: Iterable[tuple[str, str]],
@@ -497,8 +459,7 @@ def _pairwise(
     confirmatory: bool,
     alpha: float,
     omnibus_significant: bool,
-    n_bootstrap: int,
-    rng: np.random.Generator,
+    require_omnibus: bool = True,
 ) -> pd.DataFrame:
     rows: list[dict] = []
     for left, right in pairs:
@@ -510,11 +471,6 @@ def _pairwise(
         zeros = differences == 0.0
         wins = int(np.sum(differences < -1e-12))
         losses = int(np.sum(differences > 1e-12))
-        sign_p = (
-            float(binomtest(wins, wins + losses, 0.5).pvalue)
-            if wins + losses
-            else 1.0
-        )
         mean_difference = float(np.mean(differences))
         right_mean = float(np.mean(right_values))
         left_mean = float(np.mean(left_values))
@@ -522,13 +478,6 @@ def _pairwise(
             left_mean / right_mean
             if right_mean > 0.0
             else (float("inf") if left_mean > 0.0 else float("nan"))
-        )
-        ci_low, ci_high, difference_low, difference_high = _bootstrap_intervals(
-            left_values,
-            right_values,
-            alpha=alpha,
-            n_bootstrap=n_bootstrap,
-            rng=rng,
         )
         nonzero = differences != 0.0
         if nonzero.any():
@@ -551,51 +500,33 @@ def _pairwise(
                 "median_difference": float(np.median(differences)),
                 "error_ratio": ratio,
                 "improvement_pct": 100.0 * (1.0 - ratio),
-                "ci_ratio_low": ci_low,
-                "ci_ratio_high": ci_high,
-                "ci_difference_low": difference_low,
-                "ci_difference_high": difference_high,
                 "rank_biserial": rank_biserial,
                 "wins": wins,
                 "ties": int(np.sum(zeros)),
                 "losses": losses,
                 "wilcoxon_statistic": statistic,
                 "p_value": p_value,
-                "sign_p_value": sign_p,
                 "alpha": alpha,
-                "n_bootstrap": n_bootstrap,
             }
         )
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
     frame["p_holm"] = multipletests(frame["p_value"], alpha=alpha, method="holm")[1]
-    frame["sign_p_holm"] = multipletests(
-        frame["sign_p_value"], alpha=alpha, method="holm"
-    )[1]
-    joint_p_values = frame[["p_value", "sign_p_value"]].max(axis=1)
-    frame["p_joint"] = multipletests(
-        joint_p_values, alpha=alpha, method="holm"
-    )[1]
     frame["omnibus_significant"] = omnibus_significant
     frame["typical_station_outcome"] = "inconclusive"
-    # This conclusion concerns the paired station-level rank location. Mean
-    # differences and error ratios remain descriptive and may point elsewhere.
-    significant = (
-        omnibus_significant
-        & (frame["p_joint"] < alpha)
-    )
+    significant = frame["p_holm"] < alpha
+    if require_omnibus:
+        significant &= omnibus_significant
     left_better = (
         significant
         & (frame["rank_biserial"] < 0.0)
         & (frame["median_difference"] < 0.0)
-        & (frame["ci_difference_high"] < 0.0)
     )
     right_better = (
         significant
         & (frame["rank_biserial"] > 0.0)
         & (frame["median_difference"] > 0.0)
-        & (frame["ci_difference_low"] > 0.0)
     )
     frame.loc[left_better, "typical_station_outcome"] = "left_lower_typical_error"
     frame.loc[right_better, "typical_station_outcome"] = "right_lower_typical_error"
@@ -610,7 +541,6 @@ def _analyze_scores(
     metric: str,
     alpha: float,
     n_permutations: int,
-    n_bootstrap: int,
     rng: np.random.Generator,
     branch: bool = False,
     confirmatory: bool = False,
@@ -689,7 +619,7 @@ def _analyze_scores(
             }
         ]
     )
-    if p_value >= alpha:
+    if p_value >= alpha and not branch:
         return omnibus, pd.DataFrame()
     common = {
         "analysis": analysis,
@@ -697,26 +627,30 @@ def _analyze_scores(
         "metric": metric,
         "alpha": alpha,
         "omnibus_significant": p_value < alpha,
-        "n_bootstrap": n_bootstrap,
-        "rng": rng,
     }
-    all_pairs = _pairwise(
+    if branch:
+        if RAW_ARM not in treatment_order:
+            return omnibus, pd.DataFrame()
+        pairs = (
+            (treatment, RAW_ARM)
+            for treatment in treatment_order
+            if treatment != RAW_ARM
+        )
+        return omnibus, _pairwise(
+            wide,
+            pairs,
+            family="vs_raw",
+            confirmatory=confirmatory,
+            require_omnibus=False,
+            **common,
+        )
+    return omnibus, _pairwise(
         wide,
         combinations(treatment_order, 2),
         family="all_pairs",
-        confirmatory=confirmatory and not branch,
-        **common,
-    )
-    if not branch or RAW_ARM not in treatment_order:
-        return omnibus, all_pairs
-    vs_raw = _pairwise(
-        wide,
-        ((treatment, RAW_ARM) for treatment in treatment_order if treatment != RAW_ARM),
-        family="vs_raw",
         confirmatory=confirmatory,
         **common,
     )
-    return omnibus, pd.concat([all_pairs, vs_raw], ignore_index=True)
 
 
 def analyze_forecasting_results(
@@ -724,20 +658,18 @@ def analyze_forecasting_results(
     *,
     alpha: float = 0.05,
     n_permutations: int = 99_999,
-    n_bootstrap: int = 10_000,
     seed: int = 13,
 ) -> dict[str, pd.DataFrame]:
     """Build balanced station panels and run paired model/branch comparisons."""
     _validate_results(results)
     if not 0.0 < alpha < 1.0:
         raise ValueError("alpha debe estar entre cero y uno")
-    if any(
-        isinstance(value, bool) or not isinstance(value, Integral) or value < 1
-        for value in (n_permutations, n_bootstrap)
+    if (
+        isinstance(n_permutations, bool)
+        or not isinstance(n_permutations, Integral)
+        or n_permutations < 1
     ):
-        raise ValueError(
-            "Las repeticiones de permutacion y bootstrap deben ser enteros positivos"
-        )
+        raise ValueError("Las repeticiones de permutacion deben ser enteros positivos")
     rng = np.random.default_rng(seed)
     model_scores: list[pd.DataFrame] = []
     model_omnibus: list[pd.DataFrame] = []
@@ -759,7 +691,6 @@ def analyze_forecasting_results(
                 metric=metric,
                 alpha=alpha,
                 n_permutations=n_permutations,
-                n_bootstrap=n_bootstrap,
                 rng=rng,
                 confirmatory=metric == "mase" and scope == "all_branches",
             )
@@ -775,7 +706,6 @@ def analyze_forecasting_results(
             metric=metric,
             alpha=alpha,
             n_permutations=n_permutations,
-            n_bootstrap=n_bootstrap,
             rng=rng,
             branch=True,
             confirmatory=metric == "mase",
@@ -842,14 +772,12 @@ def main() -> None:
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--permutations", type=int, default=99_999)
-    parser.add_argument("--bootstrap", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=13)
     args = parser.parse_args()
     paths = write_statistical_analysis(
         args.run_dir,
         alpha=args.alpha,
         n_permutations=args.permutations,
-        n_bootstrap=args.bootstrap,
         seed=args.seed,
     )
     for path in paths.values():

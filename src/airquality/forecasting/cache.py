@@ -49,7 +49,7 @@ import pandas as pd
 #: TSB-AD Sub_PCA, full-window Hampel, and timestamp-aware Prophet. v14: CARLA
 #: training stride is an explicit forecasting configuration. v15: centered
 #: Hampel uses an odd effective window for even nominal hourly spans. v16:
-#: common holdout support ignores abstentions and raw+frozen is a source arm. v17:
+#: common holdout support ignores abstentions. v17:
 #: inject-vote uses ranked pointwise backfill with its configured quorum. v18:
 #: forecasting metrics use MASE/RMSSE plus raw-relative MAE/RMSE. v19: scaled
 #: metrics use the primary raw history available before each forecast origin. v20:
@@ -61,7 +61,7 @@ import pandas as pd
 #: window scores are aligned to window ends instead of averaged over timestamps.
 #: v25: injected-ranking VUS excludes non-finite detector support.
 #: v26: detectors failing every injected selection segment are excluded.
-CACHE_VERSION = 26
+CACHE_VERSION = 27
 
 
 def series_fingerprint(series: pd.Series) -> str:

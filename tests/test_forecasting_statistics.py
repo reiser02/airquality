@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
-import airquality.forecasting.statistics as statistics
 import numpy as np
 import pandas as pd
 import pytest
 
 from airquality.forecasting.pipeline import RESULT_COLUMNS
 from airquality.forecasting.statistics import (
-    _bootstrap_intervals,
     _friedman_statistic,
     _pairwise,
     analyze_forecasting_results,
@@ -21,19 +18,19 @@ from airquality.forecasting.statistics import (
 from scipy.stats import friedmanchisquare, rankdata
 
 
-ARMS = ("raw", "raw+frozen", "clean-a", "clean-b")
+ARMS = ("raw", "clean-a", "clean-b")
 MODELS = ("M1", "M2", "M3")
 
 
 def _results(n_stations: int = 12) -> pd.DataFrame:
-    arm_factor = {"raw": 1.0, "raw+frozen": 1.1, "clean-a": 0.75, "clean-b": 1.05}
+    arm_factor = {"raw": 1.0, "clean-a": 0.75, "clean-b": 1.05}
     model_factor = {"M1": 0.8, "M2": 1.0, "M3": 1.25, "Foundation": 0.9}
     rows = []
     for station_index in range(n_stations):
         station = f"S{station_index:02d}"
         station_factor = 1.0 + station_index / 50.0
         for model in (*MODELS, "Foundation"):
-            arms = ("raw", "raw+frozen") if model == "Foundation" else ARMS
+            arms = ("raw",) if model == "Foundation" else ARMS
             for arm in arms:
                 mase = station_factor * model_factor[model] * arm_factor[arm]
                 rows.append(
@@ -116,10 +113,9 @@ def test_station_scores_use_complete_balanced_panels() -> None:
     assert set(model_scores["treatment"]) == set(MODELS)
     assert set(common_scores["treatment"]) == {*MODELS, "Foundation"}
     assert set(branch_scores["treatment"]) == {"raw", "clean-a", "clean-b"}
-    assert "raw+frozen" not in set(branch_scores["treatment"])
 
     m1 = model_scores.query("series == 'S00' and treatment == 'M1'").iloc[0]
-    expected = np.mean([0.8, 0.88, 0.6, 0.84])
+    expected = np.mean([0.8, 0.6, 0.84])
     assert m1["score"] == pytest.approx(expected)
     assert m1["mean_error"] == pytest.approx(expected)
 
@@ -161,12 +157,12 @@ def test_results_must_be_unique_and_share_the_temporal_protocol() -> None:
     results = _results()
     duplicate = pd.concat([results, results.iloc[[0]]], ignore_index=True)
     with pytest.raises(ValueError, match="duplicad"):
-        analyze_forecasting_results(duplicate, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(duplicate, n_permutations=99)
 
     mismatched = results.copy()
     mismatched.loc[0, "test_target_start"] = "2026-02-01 00:00:00"
     with pytest.raises(ValueError, match="temporal"):
-        analyze_forecasting_results(mismatched, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(mismatched, n_permutations=99)
 
     mismatched = results.copy()
     station = mismatched["series"] == "S00"
@@ -176,12 +172,12 @@ def test_results_must_be_unique_and_share_the_temporal_protocol() -> None:
     mismatched.loc[station, "n_test_predictions"] = 192
     mismatched.loc[station, "n_unique_targets"] = 102
     with pytest.raises(ValueError, match="protocolo temporal"):
-        analyze_forecasting_results(mismatched, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(mismatched, n_permutations=99)
 
     invalid_context = results.copy()
     invalid_context.loc[station, "test_context_start"] = "fecha-invalida"
     with pytest.raises(ValueError, match="contexto temporal"):
-        analyze_forecasting_results(invalid_context, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(invalid_context, n_permutations=99)
 
 
 def test_results_must_match_the_pipeline_model_arm_design() -> None:
@@ -190,30 +186,30 @@ def test_results_must_match_the_pipeline_model_arm_design() -> None:
     invalid_mode = _results()
     invalid_mode.loc[invalid_mode["model"] == "M3", "model_mode"] = "fundation"
     with pytest.raises(ValueError, match="model_mode"):
-        analyze_forecasting_results(invalid_mode, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(invalid_mode, n_permutations=99)
 
-    missing_source = _results().query("arm != 'raw+frozen'")
+    missing_source = _results().query("arm != 'raw'")
     with pytest.raises(ValueError, match="raw"):
-        analyze_forecasting_results(missing_source, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(missing_source, n_permutations=99)
 
     foundation_only_sources = _results().query(
-        "model == 'Foundation' or arm not in ['raw', 'raw+frozen']"
+        "model == 'Foundation' or arm != 'raw'"
     )
     with pytest.raises(ValueError, match="no-foundation"):
         analyze_forecasting_results(
-            foundation_only_sources, n_permutations=99, n_bootstrap=99
+            foundation_only_sources, n_permutations=99
         )
 
     inconsistent_arms = _results().query(
         "not (model == 'M3' and arm == 'clean-b')"
     )
     with pytest.raises(ValueError, match="brazos"):
-        analyze_forecasting_results(inconsistent_arms, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(inconsistent_arms, n_permutations=99)
 
     failed = _results()
     failed.loc[0, ["status", "failure_reason"]] = ["failed", "forecast_error"]
     with pytest.raises(ValueError, match="reintentarse"):
-        analyze_forecasting_results(failed, n_permutations=99, n_bootstrap=99)
+        analyze_forecasting_results(failed, n_permutations=99)
 
 
 def test_inconsistent_backtest_counts_exclude_the_station() -> None:
@@ -272,69 +268,14 @@ def test_rank_biserial_uses_the_same_pratt_ranks_as_wilcoxon() -> None:
         confirmatory=True,
         alpha=0.05,
         omnibus_significant=True,
-        n_bootstrap=99,
-        rng=np.random.default_rng(1),
     ).iloc[0]
 
     assert pair["rank_biserial"] == pytest.approx(-7 / 65)
 
 
-def test_partial_zero_denominator_keeps_a_ratio_interval() -> None:
-    low, high, _, _ = _bootstrap_intervals(
-        np.ones(4),
-        np.array([0.0, 2.0, 2.0, 2.0]),
-        alpha=0.05,
-        n_bootstrap=999,
-        rng=np.random.default_rng(2),
-    )
-
-    assert np.isfinite(low)
-    assert np.isfinite(high)
-
-    low, high, _, _ = _bootstrap_intervals(
-        np.array([0.0, 1.0]),
-        np.array([0.0, 2.0]),
-        alpha=0.05,
-        n_bootstrap=99,
-        rng=np.random.default_rng(2),
-    )
-    assert np.isnan(low)
-    assert np.isnan(high)
-
-
-def test_joint_p_values_are_formed_before_holm(monkeypatch) -> None:
-    wilcoxon_results = iter(((1.0, 0.03), (1.0, 0.015)))
-    sign_results = iter((0.01, 0.04))
-    monkeypatch.setattr(statistics, "_wilcoxon", lambda _: next(wilcoxon_results))
-    monkeypatch.setattr(
-        statistics,
-        "binomtest",
-        lambda *_args, **_kwargs: SimpleNamespace(pvalue=next(sign_results)),
-    )
-    wide = pd.DataFrame(
-        {"A": [1.0, 1.0], "B": [2.0, 2.0], "C": [3.0, 3.0]}
-    )
-
-    pairs = _pairwise(
-        wide,
-        [("A", "B"), ("A", "C")],
-        analysis="model",
-        scope="test",
-        metric="mase",
-        family="all_pairs",
-        confirmatory=True,
-        alpha=0.05,
-        omnibus_significant=True,
-        n_bootstrap=9,
-        rng=np.random.default_rng(3),
-    )
-
-    assert pairs["p_joint"].tolist() == pytest.approx([0.06, 0.06])
-
-
 def test_analysis_finds_known_model_and_branch_improvements() -> None:
     artifacts = analyze_forecasting_results(
-        _results(), n_permutations=1999, n_bootstrap=999, seed=7
+        _results(), n_permutations=1999, seed=7
     )
 
     assert set(artifacts["model_omnibus"]["metric"]) == {"mase", "rmsse"}
@@ -349,7 +290,7 @@ def test_analysis_finds_known_model_and_branch_improvements() -> None:
         "M3",
     )
     assert model_pair["p_holm"] < 0.05
-    assert model_pair["p_joint"] < 0.05
+    assert model_pair["p_holm"] < 0.05
     assert model_pair["typical_station_outcome"] == "left_lower_typical_error"
     assert model_pair["error_ratio"] < 1.0
     assert model_pair["wins"] == 12
@@ -364,6 +305,8 @@ def test_analysis_finds_known_model_and_branch_improvements() -> None:
     assert raw_pair["p_holm"] < 0.05
     assert raw_pair["typical_station_outcome"] == "left_lower_typical_error"
     assert raw_pair["improvement_pct"] > 0.0
+    assert set(artifacts["branch_pairwise"]["family"]) == {"vs_raw"}
+    assert set(artifacts["branch_pairwise"]["right"]) == {"raw"}
 
 
 def test_wilcoxon_outcome_follows_rank_location_not_the_mean() -> None:
@@ -376,7 +319,7 @@ def test_wilcoxon_outcome_follows_rank_location_not_the_mean() -> None:
     results.loc[(results["series"] == last) & (results["model"] == "M2"), ["mase", "rmsse"]] = 1.0
 
     artifacts = analyze_forecasting_results(
-        results, n_permutations=99, n_bootstrap=999, seed=11
+        results, n_permutations=99, seed=11
     )
 
     pair = _pair(
@@ -399,7 +342,7 @@ def test_perfect_right_treatment_can_be_declared_better() -> None:
     results.loc[results["model"] == "M2", ["mase", "rmsse"]] = 0.0
 
     artifacts = analyze_forecasting_results(
-        results, n_permutations=99, n_bootstrap=999, seed=17
+        results, n_permutations=99, seed=17
     )
 
     pair = _pair(
@@ -410,23 +353,23 @@ def test_perfect_right_treatment_can_be_declared_better() -> None:
         "M2",
     )
     assert pair["error_ratio"] == float("inf")
-    assert pair["ci_ratio_low"] == float("inf")
-    assert pair["ci_difference_low"] > 0.0
     assert pair["typical_station_outcome"] == "right_lower_typical_error"
 
 
-def test_no_difference_skips_posthoc_comparisons() -> None:
+def test_no_difference_skips_model_posthoc_but_keeps_raw_control_family() -> None:
     results = _results()
     results[["mase", "rmsse"]] = 1.0
 
     artifacts = analyze_forecasting_results(
-        results, n_permutations=99, n_bootstrap=99, seed=3
+        results, n_permutations=99, seed=3
     )
 
     assert (artifacts["model_omnibus"]["p_value"] == 1.0).all()
     assert (artifacts["branch_omnibus"]["p_value"] == 1.0).all()
     assert artifacts["model_pairwise"].empty
-    assert artifacts["branch_pairwise"].empty
+    assert not artifacts["branch_pairwise"].empty
+    assert set(artifacts["branch_pairwise"]["family"]) == {"vs_raw"}
+    assert (artifacts["branch_pairwise"]["p_holm"] == 1.0).all()
 
 
 def test_write_statistical_analysis_persists_the_seven_tables(tmp_path) -> None:
@@ -436,7 +379,7 @@ def test_write_statistical_analysis_persists_the_seven_tables(tmp_path) -> None:
     _write_manifest(tmp_path, results)
 
     paths = write_statistical_analysis(
-        tmp_path, n_permutations=99, n_bootstrap=99, seed=5
+        tmp_path, n_permutations=99, seed=5
     )
 
     assert set(paths) == {
@@ -460,7 +403,7 @@ def test_foundation_only_results_keep_empty_artifact_schemas(tmp_path) -> None:
     _write_manifest(tmp_path, results)
 
     paths = write_statistical_analysis(
-        tmp_path, n_permutations=99, n_bootstrap=99, seed=5
+        tmp_path, n_permutations=99, seed=5
     )
 
     assert pd.read_csv(paths["branch_station_scores"]).empty
@@ -478,25 +421,25 @@ def test_statistical_writer_requires_a_complete_matching_manifest(tmp_path) -> N
     results = _results()
     results.to_csv(tmp_path / "results.csv", index=False)
     with pytest.raises(FileNotFoundError, match="manifest.json"):
-        write_statistical_analysis(tmp_path, n_permutations=9, n_bootstrap=9)
+        write_statistical_analysis(tmp_path, n_permutations=9)
 
     _write_manifest(tmp_path, results)
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     manifest["status"] = "incomplete"
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="incompleto"):
-        write_statistical_analysis(tmp_path, n_permutations=9, n_bootstrap=9)
+        write_statistical_analysis(tmp_path, n_permutations=9)
 
     manifest["status"] = "complete"
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     results.iloc[:-1].to_csv(tmp_path / "results.csv", index=False)
     with pytest.raises(ValueError, match="filas esperadas"):
-        write_statistical_analysis(tmp_path, n_permutations=9, n_bootstrap=9)
+        write_statistical_analysis(tmp_path, n_permutations=9)
 
 
 def test_one_station_reports_insufficient_evidence() -> None:
     artifacts = analyze_forecasting_results(
-        _results(n_stations=1), n_permutations=99, n_bootstrap=99
+        _results(n_stations=1), n_permutations=99
     )
 
     assert set(artifacts["model_omnibus"]["test"]) == {"insufficient_stations"}
@@ -510,19 +453,19 @@ def test_zero_valid_stations_are_reported_and_repetitions_must_be_integers() -> 
     results[["mase", "rmsse"]] = np.nan
 
     artifacts = analyze_forecasting_results(
-        results, n_permutations=99, n_bootstrap=99
+        results, n_permutations=99
     )
 
     assert set(artifacts["model_omnibus"]["test"]) == {"insufficient_stations"}
     assert set(artifacts["branch_omnibus"]["test"]) == {"insufficient_stations"}
     assert (artifacts["model_omnibus"]["n_stations"] == 0).all()
     with pytest.raises(ValueError, match="enteros"):
-        analyze_forecasting_results(results, n_permutations=1.5, n_bootstrap=99)
+        analyze_forecasting_results(results, n_permutations=1.5)
 
 
 def test_empty_pipeline_run_reports_insufficient_stations() -> None:
     artifacts = analyze_forecasting_results(
-        _results().iloc[:0], n_permutations=99, n_bootstrap=99
+        _results().iloc[:0], n_permutations=99
     )
 
     assert len(artifacts["model_omnibus"]) == 4

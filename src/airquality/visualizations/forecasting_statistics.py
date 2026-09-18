@@ -212,8 +212,7 @@ def _build_relative_branch_scores(results: pd.DataFrame) -> pd.DataFrame:
             ]
         )
     subset = results[
-        (results["model_mode"].astype(str) != "foundation")
-        & (results["arm"].astype(str) != "raw+frozen")
+        results["model_mode"].astype(str) != "foundation"
     ].copy()
     rows: list[dict[str, object]] = []
     for metric in ("relmae", "relrmse"):
@@ -282,10 +281,15 @@ def save_omnibus_plot(output_path: Path, omnibus: pd.DataFrame) -> bool:
     data = data[np.isfinite(data["p_value"]) & (data["p_value"] > 0.0)].copy()
     if data.empty:
         return False
+    scope_labels = {
+        "all_branches": "todas las ramas",
+        "common_raw_targets": "ramas",
+        "common_source_arms": "raw",
+    }
     data["label"] = (
         data["analysis"].str.title()
         + " / "
-        + data["scope"].str.replace("_", " ")
+        + data["scope"].map(scope_labels).fillna(data["scope"].str.replace("_", " "))
         + " / "
         + data["metric"].str.upper()
     )
@@ -339,13 +343,13 @@ def save_pairwise_forest_plot(
     family: str = "all_pairs",
     treatment_label: str = "modelos",
 ) -> bool:
-    """Plot pairwise median-difference intervals for one treatment panel."""
+    """Plot paired median differences for one treatment panel."""
     data = pairwise[(pairwise["scope"] == scope) & (pairwise["metric"] == metric)].copy()
     if "family" in data:
         data = data[data["family"] == family].copy()
     if data.empty:
         return False
-    for column in ("median_difference", "ci_difference_low", "ci_difference_high", "p_joint"):
+    for column in ("median_difference", "p_holm"):
         data[column] = pd.to_numeric(data[column], errors="coerce")
     data = data[np.isfinite(data["median_difference"])].copy()
     if data.empty:
@@ -359,8 +363,7 @@ def save_pairwise_forest_plot(
     add_plot_header(
         figure,
         f"Comparaciones pareadas de {treatment_label} — {_metric_label(metric)}",
-        "Diferencia de mediana = izquierda − derecha; valores negativos favorecen al tratamiento de la izquierda. "
-        "Los intervalos son bootstrap por estación y el color requiere p_joint < 0,05.",
+        "Diferencia de mediana = izquierda − derecha; valores negativos favorecen al tratamiento de la izquierda.",
     )
     style_axis(axis)
     axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
@@ -368,31 +371,20 @@ def save_pairwise_forest_plot(
     y = np.arange(len(data))
     for position, (_, row) in enumerate(data.iterrows()):
         center = float(row["median_difference"])
-        low = float(row["ci_difference_low"])
-        high = float(row["ci_difference_high"])
-        if not np.isfinite(low):
-            low = center
-        if not np.isfinite(high):
-            high = center
         color = OUTCOME_COLORS.get(str(row["typical_station_outcome"]), OUTCOME_COLORS["inconclusive"])
-        axis.errorbar(
+        axis.scatter(
             center,
             position,
-            xerr=[[max(0.0, center - low)], [max(0.0, high - center)]],
-            fmt="o",
             color=color,
-            markerfacecolor=color,
-            markeredgecolor="white",
-            markeredgewidth=0.7,
-            markersize=5.5,
-            capsize=2.5,
-            linewidth=1.2,
+            edgecolors="white",
+            linewidths=0.7,
+            s=48,
             zorder=3,
         )
         axis.text(
             1.01,
             position,
-            f"p={_fmt_p(row['p_joint'])}",
+            f"p Holm={_fmt_p(row['p_holm'])}",
             transform=axis.get_yaxis_transform(),
             va="center",
             fontsize=8,
@@ -448,7 +440,7 @@ def save_empty_pairwise_plot(
     add_plot_header(
         figure,
         f"Comparaciones pareadas de ramas — {_metric_label(metric)}",
-        "Las comparaciones post-hoc solo se ejecutan después de un omnibus significativo.",
+        "Sin comparaciones pareadas disponibles.",
     )
     style_axis(axis)
     axis.axis("off")
@@ -550,9 +542,7 @@ def save_station_score_plot(
     add_plot_header(
         figure,
         "Distribución de errores por estación",
-        "Cada punto es una estación; la caja resume su score y el rombo marca la media. "
-        "Arriba: modelos promediados en todas las ramas; foundation usa su error raw en cada rama. "
-        "Abajo: ramas comparadas frente a raw mediante RelMAE y RelRMSE (raw = 1).",
+        "Cada punto es una estación; la caja resume su distribución y el rombo marca la media. Menor error = mejor.",
     )
     jobs = (
         (
@@ -604,8 +594,7 @@ def save_branch_statistical_score_plot(
     add_plot_header(
         figure,
         "Scores de ramas usados en los contrastes",
-        "Cada punto es una estación después de promediar los modelos no-foundation. "
-        "Menor error es mejor; raw+frozen queda fuera porque no comparte targets.",
+        "Cada punto es una estación. Menor error es mejor.",
     )
     jobs = (
         (axes[0], "mase", "Ramas / MASE confirmatorio"),
@@ -644,15 +633,15 @@ def _primary_pairwise_table(pairwise: pd.DataFrame, alpha: float) -> pd.DataFram
     ].copy()
     if data.empty:
         return data
-    data["p_joint"] = pd.to_numeric(data["p_joint"], errors="coerce")
-    return data[data["p_joint"] < alpha].sort_values("p_joint")
+    data["p_holm"] = pd.to_numeric(data["p_holm"], errors="coerce")
+    return data[data["p_holm"] < alpha].sort_values("p_holm")
 
 
 def _branch_pairwise_table(
     pairwise: pd.DataFrame,
     *,
     metric: str = "mase",
-    family: str = "all_pairs",
+    family: str = "vs_raw",
 ) -> pd.DataFrame:
     """Return one non-duplicated family of branch post-hoc comparisons."""
     data = pairwise[
@@ -662,8 +651,8 @@ def _branch_pairwise_table(
     ].copy()
     if data.empty:
         return data
-    data["p_joint"] = pd.to_numeric(data["p_joint"], errors="coerce")
-    return data.sort_values(["p_joint", "improvement_pct"], ascending=[True, False])
+    data["p_holm"] = pd.to_numeric(data["p_holm"], errors="coerce")
+    return data.sort_values(["p_holm", "improvement_pct"], ascending=[True, False])
 
 
 def _format_branch_pairwise_table(pairwise: pd.DataFrame) -> pd.DataFrame:
@@ -682,18 +671,11 @@ def _format_branch_pairwise_table(pairwise: pd.DataFrame) -> pd.DataFrame:
     table["Mejora izquierda"] = table["improvement_pct"].map(
         lambda value: f"{float(value):+.1f}%"
     )
-    table["IC diferencia mediana"] = table.apply(
-        lambda row: (
-            f"[{_fmt_number(row['ci_difference_low'])}; "
-            f"{_fmt_number(row['ci_difference_high'])}]"
-        ),
-        axis=1,
-    )
     table["Victorias-empates-derrotas"] = table.apply(
         lambda row: f"{int(row['wins'])}-{int(row['ties'])}-{int(row['losses'])}",
         axis=1,
     )
-    table["p conjunta Holm"] = table["p_joint"].map(_fmt_p)
+    table["p Holm"] = table["p_holm"].map(_fmt_p)
     return table
 
 
@@ -739,16 +721,11 @@ def _branch_pairwise_export_table(pairwise: pd.DataFrame) -> pd.DataFrame:
         "n_stations",
         "improvement_pct",
         "median_difference",
-        "ci_difference_low",
-        "ci_difference_high",
         "wins",
         "ties",
         "losses",
         "p_value",
-        "sign_p_value",
         "p_holm",
-        "sign_p_holm",
-        "p_joint",
         "typical_station_outcome",
     ]
     if pairwise.empty:
@@ -764,7 +741,7 @@ def _branch_pairwise_export_table(pairwise: pd.DataFrame) -> pd.DataFrame:
         data["typical_station_outcome"] == "right_lower_typical_error", "winner"
     ] = data["right"]
     return data.rename(columns={"winner": "winner"}).loc[:, columns].sort_values(
-        ["metric", "family", "p_joint"], na_position="last"
+        ["metric", "family", "p_holm"], na_position="last"
     )
 
 
@@ -833,14 +810,14 @@ def write_branch_tables(
             ],
         ),
         "",
-        "## Comparaciones post-hoc",
+        "## Comparaciones frente a raw",
         "",
     ]
     for metric in ("mase", "rmsse"):
         lines.extend([f"### {_metric_label(metric)}", ""])
         metric_pairs = pairwise_table[pairwise_table["metric"] == metric]
         if metric_pairs.empty:
-            lines.append("No se generaron post-hoc porque el omnibus no fue significativo.")
+            lines.append("No se generaron comparaciones porque el omnibus no fue significativo.")
         else:
             lines.append(
                 _markdown_table(
@@ -854,13 +831,12 @@ def write_branch_tables(
                         "Comparación",
                         "Ganadora",
                         "Mejora izquierda",
-                        "IC diferencia mediana",
                         "Victorias-empates-derrotas",
-                        "p conjunta Holm",
+                        "p Holm",
                     ],
                 )
             )
-        lines.extend(["", "La columna `Ganadora` solo se rellena con una conclusión direccional estadísticamente respaldada.", ""])
+        lines.extend(["", "La columna `Ganadora` solo se rellena cuando el contraste Wilcoxon pareado corregido por Holm respalda la dirección.", ""])
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
     return [score_path, pairwise_path, markdown_path]
 
@@ -929,7 +905,6 @@ def write_statistical_report(run_dir: Path) -> Path:
     branch_absolute_summary = branch_mase_summary.merge(
         branch_rmsse_summary, on="treatment", how="outer"
     ).sort_values("mase_mean")
-    branch_all_pairs = _branch_pairwise_table(branch_pairwise)
     branch_vs_raw = _branch_pairwise_table(branch_pairwise, family="vs_raw")
     branch_mase = branch_omnibus[
         (branch_omnibus["scope"] == "common_raw_targets") & (branch_omnibus["metric"] == "mase")
@@ -967,7 +942,7 @@ def write_statistical_report(run_dir: Path) -> Path:
     if np.isfinite(branch_p) and branch_p >= alpha:
         lines.append(
             f"**Sobre las ramas:** no hay evidencia suficiente de diferencias globales entre estrategias de limpieza/imputación "
-            f"(`p = {_fmt_p(branch_p)}`); por ello no se calcularon post-hoc de ramas."
+            f"(`p = {_fmt_p(branch_p)}`). Las comparaciones predefinidas frente a `raw` se reportan por separado con Holm."
         )
     elif np.isfinite(branch_p):
         lines.append(
@@ -1033,16 +1008,16 @@ def write_statistical_report(run_dir: Path) -> Path:
                 ["Modelo", "Media", "Mediana", "SD", "N estaciones"],
             ),
             "",
-            "Este panel usa únicamente `raw` y `raw+frozen`, los dos brazos disponibles para todos los modelos, "
+            "Este panel usa únicamente `raw`, la vista fuente disponible para todos los modelos, "
             "por lo que incorpora también los foundation sin repetir artificialmente su score en ramas donde no se ejecutaron. "
-            "Es una comparación de sensibilidad de vistas source, no sustituye al contraste confirmatorio de todos los brazos de entrenamiento.",
+            "Es una comparación de sensibilidad de la fuente común, no sustituye al contraste confirmatorio de todos los brazos de entrenamiento.",
             "",
             "### Comparaciones pareadas significativas",
             "",
         ]
     )
     if primary_pairs.empty:
-        lines.append("No hay comparaciones pareadas con `p_joint < 0,05`.")
+        lines.append("No hay comparaciones pareadas con `p_holm < 0,05`.")
     else:
         pair_table = primary_pairs.copy()
         pair_table["Comparacion"] = (
@@ -1051,12 +1026,8 @@ def write_statistical_report(run_dir: Path) -> Path:
         pair_table["Mejora_media"] = pair_table["improvement_pct"].map(
             lambda value: f"{float(value):+.1f}%"
         )
-        pair_table["IC diferencia mediana"] = pair_table.apply(
-            lambda row: f"[{_fmt_number(row['ci_difference_low'])}; {_fmt_number(row['ci_difference_high'])}]",
-            axis=1,
-        )
         pair_table["Resultado"] = pair_table["typical_station_outcome"].map(_outcome_label)
-        pair_table["p_joint"] = pair_table["p_joint"].map(_fmt_p)
+        pair_table["p_holm"] = pair_table["p_holm"].map(_fmt_p)
         pair_table["Victorias-empates-derrotas"] = pair_table.apply(
             lambda row: f"{int(row['wins'])}-{int(row['ties'])}-{int(row['losses'])}", axis=1
         )
@@ -1067,15 +1038,14 @@ def write_statistical_report(run_dir: Path) -> Path:
                         "Comparacion": "Comparación",
                         "Mejora_media": "Mejora media",
                         "Resultado": "Lectura",
-                        "p_joint": "p conjunta Holm",
+                        "p_holm": "p Holm",
                     }
                 ),
                 [
                     "Comparación",
                     "Mejora media",
-                    "IC diferencia mediana",
                     "Victorias-empates-derrotas",
-                    "p conjunta Holm",
+                    "p Holm",
                     "Lectura",
                 ],
             )
@@ -1084,8 +1054,7 @@ def write_statistical_report(run_dir: Path) -> Path:
         [
             "",
             "La mejora media es `100 × (1 − error_izquierda / error_derecha)`: positiva favorece a la izquierda. "
-            "La columna `p conjunta Holm` combina el Wilcoxon y el sign test de cada pareja antes de corregir la multiplicidad. "
-            "La lectura direccional solo se declara cuando también coinciden la mediana, el efecto de rangos y el intervalo bootstrap.",
+            "La columna `p Holm` es el p-valor de Wilcoxon signed-rank corregido dentro de la familia de comparaciones.",
             "",
             "### Ramas: scores usados en los contrastes",
             "",
@@ -1102,39 +1071,14 @@ def write_statistical_report(run_dir: Path) -> Path:
             "",
             "La primera fila tiene el menor MASE medio descriptivo. Solo puede considerarse ganadora estadística cuando los post-hoc siguientes producen una conclusión direccional.",
             "",
-            "### Ramas: comparaciones post-hoc MASE",
-            "",
-        ]
-    )
-    if branch_all_pairs.empty:
-        lines.append(
-            "No se generaron comparaciones pareadas: el omnibus no fue significativo o no había tratamientos suficientes."
-        )
-    else:
-        lines.append(
-            _markdown_table(
-                _format_branch_pairwise_table(branch_all_pairs),
-                [
-                    "Comparación",
-                    "Ganadora",
-                    "Mejora izquierda",
-                    "IC diferencia mediana",
-                    "Victorias-empates-derrotas",
-                    "p conjunta Holm",
-                ],
-            )
-        )
-    lines.extend(
-        [
-            "",
-            "Estas comparaciones cubren todos los pares de ramas. `Ganadora` solo se rellena cuando el omnibus y `p_joint` son significativos y también coinciden la mediana, el efecto de rangos y el intervalo bootstrap; en otro caso figura como inconclusa.",
-            "",
-            "### Ramas: comparaciones confirmatorias frente a raw",
+            "### Ramas: comparaciones frente a raw",
             "",
         ]
     )
     if branch_vs_raw.empty:
-        lines.append("No se generaron comparaciones confirmatorias frente a `raw`.")
+        lines.append(
+            "No se generaron comparaciones frente a raw: el omnibus no fue significativo o no había tratamientos suficientes."
+        )
     else:
         lines.append(
             _markdown_table(
@@ -1143,16 +1087,15 @@ def write_statistical_report(run_dir: Path) -> Path:
                     "Comparación",
                     "Ganadora",
                     "Mejora izquierda",
-                    "IC diferencia mediana",
                     "Victorias-empates-derrotas",
-                    "p conjunta Holm",
+                    "p Holm",
                 ],
             )
         )
     lines.extend(
         [
             "",
-            "Las comparaciones frente a `raw` son la familia confirmatoria predefinida para MASE; las comparaciones entre cualquier par de ramas son post-hoc exploratorias.",
+            "Las comparaciones frente a `raw` son la única familia inferencial de ramas. `Ganadora` solo se rellena cuando el Wilcoxon pareado corregido por Holm respalda la dirección.",
             "",
             "### Ramas: rendimiento relativo frente a raw",
             "",
@@ -1175,7 +1118,7 @@ def write_statistical_report(run_dir: Path) -> Path:
             "",
             _markdown_table(
                 model_omnibus.assign(
-                    panel=lambda frame: frame["scope"].map({"all_branches": "todos los brazos", "common_source_arms": "solo raw y raw+frozen"}),
+                    panel=lambda frame: frame["scope"].map({"all_branches": "todos los brazos", "common_source_arms": "solo raw"}),
                     metric=lambda frame: frame["metric"].str.upper(),
                     p=lambda frame: frame["p_value"].map(_fmt_p),
                     conclusion=lambda frame: frame["significant"].astype(str).map({"True": "significativo", "False": "no significativo"}),
@@ -1196,26 +1139,26 @@ def write_statistical_report(run_dir: Path) -> Path:
             "",
             "## Qué significa cada salida",
             "",
-            "- `model_station_scores.csv`: score MASE/RMSSE de cada modelo en cada estación, después de promediar los brazos incluidos en el panel; `rank` es el rango dentro de la estación. El scope `common_source_arms` incluye foundation y solo promedia `raw`/`raw+frozen`.",
+            "- `model_station_scores.csv`: score MASE/RMSSE de cada modelo en cada estación, después de promediar los brazos incluidos en el panel; `rank` es el rango dentro de la estación. El scope `common_source_arms` incluye foundation y usa solo `raw`.",
             "- En `statistical_station_scores.png`, el panel superior usa `all_branches`: los foundation reciben su error `raw` en cada rama antes de promediar, por lo que aparecen junto al resto de modelos.",
             "- `model_omnibus.csv`: prueba global de igualdad entre modelos. Con dos tratamientos sería Wilcoxon; aquí es Friedman con p-valor por permutación.",
-            "- `model_pairwise.csv`: comparaciones post-hoc entre pares de modelos. Incluye diferencias, ratio de errores, mejora, intervalos bootstrap, victorias/empates/derrotas y p-valores corregidos.",
+            "- `model_pairwise.csv`: comparaciones post-hoc entre pares de modelos. Incluye diferencias, ratio de errores, mejora, victorias/empates/derrotas y p-valores de Wilcoxon corregidos.",
             "- `branch_station_scores.csv`: scores absolutos MASE/RMSSE de cada rama por estación, promediados sobre los modelos entrenados/locales.",
             "- La figura y la tabla de ramas del informe usan `RelMAE` y `RelRMSE`: el denominador es el `raw` del mismo modelo y estación.",
-            "- `branch_omnibus.csv`: prueba global de igualdad entre ramas. `raw+frozen` queda fuera porque usa targets propios; los modelos foundation tampoco forman parte de este panel.",
+            "- `branch_omnibus.csv`: prueba global de igualdad entre ramas. Los modelos foundation no forman parte de este panel porque no tienen brazos de entrenamiento.",
             "- `branch_pairwise.csv`: post-hoc de ramas; queda vacío cuando el omnibus no es significativo.",
             "- `statistical_exclusions.csv`: estaciones excluidas por celdas ausentes, no finitas o backtests incompletos. En este run no hay exclusiones.",
             "",
-            "Columnas especialmente importantes: `p_value` es el contraste global; `p_joint` es el p-valor pareado conjunto corregido por Holm; `error_ratio` menor que 1 favorece a la izquierda; `rank_biserial` negativo favorece a la izquierda; `typical_station_outcome` es una conclusión direccional conservadora.",
+            "Columnas especialmente importantes: `p_value` es el contraste global; `p_holm` es el p-valor de Wilcoxon corregido por Holm; `error_ratio` menor que 1 favorece a la izquierda; `rank_biserial` negativo favorece a la izquierda; `typical_station_outcome` es una conclusión direccional.",
             "",
             "## Figuras",
             "",
             "- [Contrastes omnibus](statistical_omnibus.png): p-valores globales en escala `-log10(p)`.",
             "- [Scores por estación](statistical_station_scores.png): arriba, modelos promediados en todas las ramas, con foundation = error `raw`; abajo, estrategias de limpieza/imputación sobre el mismo test raw.",
-            "- [Comparaciones pareadas de modelos](statistical_model_pairwise_mase.png): diferencia de medianas e intervalos bootstrap; la línea vertical es igualdad.",
+            "- [Comparaciones pareadas de modelos](statistical_model_pairwise_mase.png): diferencias de medianas; la línea vertical es igualdad.",
             "- [Scores estadísticos de ramas](statistical_branch_scores.png): MASE y RMSSE absolutos por estación, exactamente los scores que entran en los contrastes.",
-            "- [Comparaciones pareadas de ramas en MASE](statistical_branch_pairwise_mase.png): post-hoc entre todas las ramas cuando el omnibus MASE es significativo.",
-            "- [Comparaciones pareadas de ramas en RMSSE](statistical_branch_pairwise_rmsse.png): análisis de sensibilidad cuando el omnibus RMSSE es significativo.",
+            "- [Comparaciones pareadas de ramas en MASE](statistical_branch_pairwise_mase.png): comparaciones de cada rama frente a `raw` cuando el omnibus MASE es significativo.",
+            "- [Comparaciones pareadas de ramas en RMSSE](statistical_branch_pairwise_rmsse.png): análisis de sensibilidad frente a `raw` cuando el omnibus RMSSE es significativo.",
             "- [Tablas estadísticas de ramas](statistical_branch_tables.md): resumen legible de scores, omnibus y post-hoc.",
             "- [Resumen de scores de ramas](statistical_branch_scores_summary.csv) y [comparaciones pareadas](statistical_branch_pairwise.csv): versiones tabulares para análisis posterior.",
             "",
@@ -1225,13 +1168,13 @@ def write_statistical_report(run_dir: Path) -> Path:
             "- El análisis usa métricas agregadas por estación; estos CSV no permiten reconstruir un contraste Diebold-Mariano por origen o por lead.",
             "- La selección del holdout y de las máscaras es retrospectiva/transductiva: inspecciona la serie completa. Las conclusiones describen este benchmark offline, no un protocolo online causal.",
             "- Un p-valor no significativo no demuestra equivalencia práctica. Falta definir un margen de relevancia de dominio para poder hacer una afirmación de equivalencia.",
-            f"- Hay {len(manifest.get('selected_stations', []))} estaciones y {len(exclusions)} filas de exclusión; los intervalos pueden ser sensibles a estaciones extremas.",
+            f"- Hay {len(manifest.get('selected_stations', []))} estaciones y {len(exclusions)} filas de exclusión.",
             "",
             "## Archivos de entrada y parámetros",
             "",
             f"- `manifest.json`: estado `{manifest.get('status', 'NA')}`, filas esperadas `{manifest.get('expected_result_rows', 'NA')}`, fallos `{len(manifest.get('failures', []))}`.",
             f"- Configuración relevante: contaminante `{config.get('pollutant', 'NA')}`, semilla `{config.get('seed', 'NA')}`, umbral MAD `{config.get('threshold_k', 'NA')}`.",
-            f"- Los contrastes usaron `{int(model_omnibus['n_permutations'].dropna().iloc[0]) if not model_omnibus.empty and model_omnibus['n_permutations'].notna().any() else 'NA'}` permutaciones y `{int(pairwise['n_bootstrap'].dropna().iloc[0]) if not pairwise.empty and pairwise['n_bootstrap'].notna().any() else 'NA'}` réplicas bootstrap.",
+            f"- Los contrastes omnibus con más de dos tratamientos usaron `{int(model_omnibus['n_permutations'].dropna().iloc[0]) if not model_omnibus.empty and model_omnibus['n_permutations'].notna().any() else 'NA'}` permutaciones.",
         ]
     )
     if model_summary.empty:

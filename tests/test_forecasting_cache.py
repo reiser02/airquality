@@ -133,15 +133,12 @@ def test_effective_config_and_key_exclude_runtime_device(tmp_path):
 # Pipeline resume: second run recomputes nothing
 # --------------------------------------------------------------------------- #
 def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
-    frozen_delta = {"value": 0.0}
     gap_rules = {"value": "1-5=interp"}
 
     def fake_loader(**kwargs):
         s = _seasonal_series(n=900, name="ST0", seed=0)
         s.iloc[200] = 130.0
         s.iloc[300:330] = np.nan
-        if kwargs.get("preserve_frozen"):
-            s.iloc[100] += frozen_delta["value"]
         return [s.to_frame()]
 
     csv_map = {
@@ -191,7 +188,7 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cp.SeriesDetectionContext, "real_scores", counting_scores)
 
     first = cp.run_benchmark_from_config()
-    assert calls["backtest"] == 3  # three arms x one forecast protocol
+    assert calls["backtest"] == 2  # raw + one strategy arm
     assert calls["detect"] > 0
 
     calls["backtest"] = 0
@@ -206,15 +203,6 @@ def test_run_benchmark_resumes_from_cache(tmp_path, monkeypatch):
     pd.testing.assert_frame_equal(first["results_df"], second["results_df"])
     pd.testing.assert_frame_equal(first["detection_df"], second["detection_df"])
     pd.testing.assert_frame_equal(first["selection_df"], second["selection_df"])
-
-    calls["backtest"] = 0
-    frozen_delta["value"] = 1.0
-    monkeypatch.setattr(cp, "_build_output_dir", lambda: tmp_path / "run3")
-    (tmp_path / "run3").mkdir()
-    cp.run_benchmark_from_config()
-
-    assert calls["backtest"] == 1  # only raw+frozen, one forecast protocol
-    assert calls["detect"] == 0
 
     calls["backtest"] = 0
     calls["detect"] = 0

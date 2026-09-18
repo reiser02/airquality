@@ -4,8 +4,8 @@ This subpackage consumes the anomaly and imputation subsystems (kept as pure
 benchmarks) to build, per series, one training arm per (detection strategy,
 imputation) combination — plus the ``raw`` baseline — and compare their
 multi-step forecasting error over a shared observed test. A separate paired
-synthetic-context experiment measures preprocessing recovery for frozen
-foundation models.
+synthetic-context experiment measures preprocessing recovery for foundation
+models.
 """
 
 from importlib import import_module

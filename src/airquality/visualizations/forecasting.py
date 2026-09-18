@@ -17,16 +17,19 @@ matching ``raw`` arm (see ``airquality.forecasting.pipeline.METRIC_COLS``).
   mask per strategy, plus each strategy's detection-rate distribution.
 - ``imputation_effect_{rmsse,mase,relmae,relrmse}.png`` — paired scatter (impute vs noimpute)
   per strategy; points below the diagonal mean imputation helped.
-- ``train_time.png`` / ``inference_time.png`` — per-arm training / holdout
-  inference time across series (dots) with the mean labeled, one panel per
-  forecast model (uses the ``train_seconds`` / ``inference_seconds`` columns).
-- ``{train,inference}_time_vs_{rmsse,mase,relmae,relrmse}.png`` — cost/accuracy scatter: mean
-  training / inference time vs mean error per (arm, model), so the bottom-left
-  region is fast and precise.
+- ``train_time.png`` — model-level training cost across all branches (median and
+  mean, using ``train_seconds``); foundation models use 0 s and
+  ``training_summary.csv`` contains the numeric summary.
+- ``inference_time.png`` — per-arm holdout inference time across series (dots)
+  with the mean labeled, one panel per forecast model.
+- ``train_time_vs_{rmsse,mase,relmae,relrmse}.png`` — one model-level training
+  cost/accuracy point across all branches.
+- ``inference_time_vs_{rmsse,mase,relmae,relrmse}.png`` — cost/accuracy scatter
+  per (arm, model), so the bottom-left region is fast and precise.
 - ``foundation_preprocessing_recovery_{mase,rmsse}.png`` — paired error recovered
   after preprocessing synthetic context anomalies, by model, strategy and type.
 - ``executive_branch_summary_{relmae,relrmse}.png`` — station-balanced branch
-  improvement vs ``raw`` with bootstrap intervals and practical win/tie/loss rates.
+  improvement vs ``raw`` with interquartile bands and practical win/tie/loss rates.
 - ``raw_model_ranking_{mase,rmsse}.png`` — all models ranked on the common ``raw``
   view; foundation training cost is treated as zero.
 - ``executive_model_arm_{mase,rmsse}.png`` — compact model×arm mean-error matrix.
@@ -67,7 +70,7 @@ from airquality.visualizations.anomaly import (
     style_axis,
 )
 from airquality.forecasting.foundation_preprocessing import FOUNDATION_METRICS
-from airquality.forecasting.pipeline import METRIC_COLS, RAW_ARM, RAW_FROZEN_ARM
+from airquality.forecasting.pipeline import METRIC_COLS, RAW_ARM
 
 MUTED_TEXT = "#6d6258"
 
@@ -75,7 +78,6 @@ MUTED_TEXT = "#6d6258"
 #: the cream surface). ``raw`` is neutral on purpose — it is the reference.
 ARM_FAMILY_COLORS = {
     RAW_ARM: "#6d6258",
-    RAW_FROZEN_ARM: "#2a7f76",
     "unlabeled": "#3d7ab5",
     "inject-best": "#cf6f1e",
     "inject-vote": "#9b59b6",
@@ -100,7 +102,6 @@ MODEL_MODE_COLORS = {
 }
 MODEL_MODE_MARKERS = {"trained": "o", "local": "s", "foundation": "*"}
 PRACTICAL_EQUIVALENCE_PCT = 1.0
-BOOTSTRAP_SAMPLES = 10_000
 
 #: Display names for the benchmark metrics.
 METRIC_LABELS = {
@@ -140,8 +141,6 @@ def _add_header(figure: plt.Figure, title: str, subtitle: str) -> float:
 
 def _family(arm: str) -> str:
     """Strategy family of one arm name (``unlabeled+impute`` → ``unlabeled``)."""
-    if arm == RAW_FROZEN_ARM:
-        return arm
     return arm.split("+", 1)[0]
 
 
@@ -212,6 +211,11 @@ def _finite(values: pd.Series) -> np.ndarray:
     return array[np.isfinite(array)]
 
 
+def _format_seconds(value: float) -> str:
+    """Format short and long timings without hiding sub-second differences."""
+    return f"{value:.2f}s" if abs(value) < 1.0 else f"{value:.1f}s"
+
+
 def _successful_results(results_df: pd.DataFrame) -> pd.DataFrame:
     """Return successful rows while remaining compatible with small plot fixtures."""
     if "status" not in results_df.columns:
@@ -226,12 +230,86 @@ def _foundation_mask(results_df: pd.DataFrame) -> pd.Series:
     return results_df["model_mode"].astype(str).eq("foundation")
 
 
+def training_time_summary(
+    results_df: pd.DataFrame,
+    metric: str | None = None,
+) -> pd.DataFrame:
+    """Summarize fit time by model, balancing the configured branches.
+
+    Each branch contributes one equally weighted summary per model. This avoids
+    a branch with more station rows dominating the model-level cost estimate.
+    Foundation models are included with zero training cost because they are
+    zero-shot.
+    When ``metric`` is supplied, its branch-balanced means and medians are added
+    for cost-versus-accuracy plots.
+    """
+    summary_columns = [
+        "model",
+        "n_branches",
+        "n_runs",
+        "train_seconds_mean",
+        "train_seconds_median",
+        "train_seconds_p90",
+    ]
+    if metric is not None:
+        summary_columns.extend([f"{metric}_mean", f"{metric}_median"])
+
+    required = {"model", "train_seconds"}
+    if metric is not None:
+        required.add(metric)
+    if not required <= set(results_df.columns):
+        return pd.DataFrame(columns=summary_columns)
+
+    frame = _successful_results(results_df).copy()
+    if frame.empty:
+        return pd.DataFrame(columns=summary_columns)
+    if "model_mode" not in frame.columns:
+        frame["model_mode"] = "trained"
+    if "arm" not in frame.columns:
+        frame["arm"] = "all"
+
+    frame["train_seconds"] = pd.to_numeric(frame["train_seconds"], errors="coerce")
+    frame.loc[_foundation_mask(frame), "train_seconds"] = 0.0
+    numeric_columns = ["train_seconds"]
+    if metric is not None:
+        numeric_columns.append(metric)
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=numeric_columns)
+    if frame.empty:
+        return pd.DataFrame(columns=summary_columns)
+
+    branch_columns = ["model", "arm"]
+    branch_aggregations = {
+        "n_runs": ("train_seconds", "size"),
+        "train_seconds_mean": ("train_seconds", "mean"),
+        "train_seconds_median": ("train_seconds", "median"),
+        "train_seconds_p90": ("train_seconds", lambda values: values.quantile(0.9)),
+    }
+    if metric is not None:
+        branch_aggregations[f"{metric}_mean"] = (metric, "mean")
+        branch_aggregations[f"{metric}_median"] = (metric, "median")
+
+    by_branch = frame.groupby(branch_columns, sort=False).agg(**branch_aggregations).reset_index()
+    model_aggregations = {
+        "n_branches": ("arm", "nunique"),
+        "n_runs": ("n_runs", "sum"),
+        "train_seconds_mean": ("train_seconds_mean", "mean"),
+        "train_seconds_median": ("train_seconds_median", "median"),
+        "train_seconds_p90": ("train_seconds_p90", "mean"),
+    }
+    if metric is not None:
+        model_aggregations[f"{metric}_mean"] = (f"{metric}_mean", "mean")
+        model_aggregations[f"{metric}_median"] = (f"{metric}_median", "median")
+
+    summary = by_branch.groupby("model", sort=False).agg(**model_aggregations).reset_index()
+    return summary.reindex(columns=summary_columns)
+
+
 def _common_nonfoundation_results(results_df: pd.DataFrame) -> pd.DataFrame:
     """Rows whose arms share the primary raw targets and can be compared directly."""
     frame = _successful_results(results_df)
-    return frame.loc[
-        ~_foundation_mask(frame) & frame["arm"].astype(str).ne(RAW_FROZEN_ARM)
-    ].copy()
+    return frame.loc[~_foundation_mask(frame)].copy()
 
 
 def _station_arm_scores(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -260,21 +338,13 @@ def _station_arm_scores(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return panel.groupby(level="series", sort=False).mean()
 
 
-def _bootstrap_mean_interval(
-    values: np.ndarray,
-    *,
-    seed: int = 13,
-    samples: int = BOOTSTRAP_SAMPLES,
-) -> tuple[float, float]:
-    """Deterministic percentile interval for a station-level arithmetic mean."""
+def _quartile_interval(values: np.ndarray) -> tuple[float, float]:
+    """Return the interquartile spread for a station-level distribution."""
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if values.size == 0:
         return float("nan"), float("nan")
-    rng = np.random.default_rng(seed)
-    indices = rng.integers(0, len(values), size=(samples, len(values)))
-    means = values[indices].mean(axis=1)
-    low, high = np.quantile(means, (0.025, 0.975))
+    low, high = np.quantile(values, (0.25, 0.75))
     return float(low), float(high)
 
 
@@ -308,7 +378,7 @@ def save_executive_branch_summary_plot(
         improvement = 100.0 * (raw[valid] - values[valid]) / raw[valid]
         if improvement.size == 0:
             continue
-        low, high = _bootstrap_mean_interval(improvement, seed=13 + index)
+        low, high = _quartile_interval(improvement)
         rows.append(
             {
                 "arm": arm,
@@ -344,8 +414,8 @@ def save_executive_branch_summary_plot(
     top = _add_header(
         figure,
         f"Resumen ejecutivo de ramas — {metric_name}",
-        f"{metric_definition}. Cada estación pesa lo mismo después de promediar los modelos no-foundation; positivo = mejora frente a raw.\n"
-        f"IC 95% bootstrap por estación; empate práctico = ±{PRACTICAL_EQUIVALENCE_PCT:g}%.",
+        f"{metric_definition}. Positivo = mejora frente a raw.\n"
+        f"Banda = intervalo intercuartílico por estación; empate práctico = ±{PRACTICAL_EQUIVALENCE_PCT:g}%.",
     )
     y = np.arange(len(summary))
 
@@ -445,7 +515,7 @@ def save_raw_model_ranking_plot(
     summaries = []
     for index, (model, group) in enumerate(frame.groupby("model", sort=False)):
         values = group[metric].to_numpy(dtype=float)
-        low, high = _bootstrap_mean_interval(values, seed=101 + index)
+        low, high = _quartile_interval(values)
         mode = str(group["model_mode"].iloc[0])
         measured_train = float(pd.to_numeric(group["train_seconds"], errors="coerce").mean())
         inference = float(pd.to_numeric(group["inference_seconds"], errors="coerce").mean())
@@ -468,8 +538,7 @@ def save_raw_model_ranking_plot(
     top = _add_header(
         figure,
         f"Ranking de modelos usando solo raw — {_metric_label(metric)}",
-        "Puntos pequeños = estaciones; punto grande = media e IC 95% bootstrap. Menor = mejor.\n"
-        "Foundation: entrenamiento efectivo 0 s (carga del modelo excluida); la inferencia sí es tiempo medido.",
+        "Puntos pequeños = estaciones; punto grande = media y banda intercuartílica. Menor = mejor.",
     )
     rng = np.random.default_rng(13)
     for position, row in enumerate(summary):
@@ -542,18 +611,16 @@ def save_executive_model_arm_plot(
     results_df: pd.DataFrame,
     metric: str = "mase",
 ) -> bool:
-    """Render a compact absolute-error matrix and annotate foundation equivalence."""
+    """Render a compact absolute-error matrix."""
     frame = _successful_results(results_df)
     if frame.empty or metric not in frame.columns:
         return False
-    frame = frame.loc[frame["arm"].astype(str).ne(RAW_FROZEN_ARM)].copy()
     frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
     if "model_mode" not in frame:
         frame["model_mode"] = "trained"
     arms = list(dict.fromkeys(frame["arm"].astype(str)))
     if RAW_ARM not in arms:
         return False
-    modes = frame.groupby("model", sort=False)["model_mode"].first().astype(str)
     means = frame.pivot_table(
         index="model", columns="arm", values=metric, aggfunc="mean", sort=False
     ).reindex(columns=arms)
@@ -572,34 +639,10 @@ def save_executive_model_arm_plot(
     top = _add_header(
         figure,
         f"Mapa compacto modelo × rama — {_metric_label(metric)}",
-        "Media sobre estaciones; menor = mejor. Solo ramas con targets raw comunes.\n"
-        "Foundation se evalúa una vez en raw: las ramas de limpieza del histórico son equivalentes porque no hay entrenamiento.",
+        "Media sobre estaciones; menor = mejor.",
     )
     image = axis.imshow(values, aspect="auto", cmap="RdYlBu_r", vmin=float(finite.min()), vmax=float(finite.max()))
     for row, model in enumerate(means.index):
-        mode = modes.get(model, "trained")
-        if mode == "foundation" and len(arms) > 1:
-            axis.add_patch(
-                plt.Rectangle(
-                    (0.5, row - 0.5),
-                    len(arms) - 1,
-                    1.0,
-                    facecolor="#e7ded1",
-                    edgecolor=FIGURE_FACE,
-                    linewidth=2.0,
-                    zorder=2,
-                )
-            )
-            axis.text(
-                (len(arms)) / 2.0,
-                row,
-                "= raw (equivalencia; no entrena)",
-                ha="center",
-                va="center",
-                fontsize=8,
-                color=MUTED_TEXT,
-                zorder=3,
-            )
         for col in range(len(arms)):
             value = values[row, col]
             if not np.isfinite(value):
@@ -654,8 +697,8 @@ def save_executive_imputation_plot(
             continue
         noimpute = values["noimpute"].to_numpy(dtype=float)
         impute = values["impute"].to_numpy(dtype=float)
-        no_low, no_high = _bootstrap_mean_interval(noimpute, seed=201 + index)
-        im_low, im_high = _bootstrap_mean_interval(impute, seed=301 + index)
+        no_low, no_high = _quartile_interval(noimpute)
+        im_low, im_high = _quartile_interval(impute)
         valid = noimpute != 0.0
         gain = 100.0 * (noimpute[valid] - impute[valid]) / noimpute[valid]
         rows.append(
@@ -678,7 +721,6 @@ def save_executive_imputation_plot(
     top = _add_header(
         figure,
         f"Efecto agregado de la imputación — {_metric_label(metric)}",
-        "Cada extremo promedia primero modelos dentro de cada estación; barras = IC 95% bootstrap.\n"
         "La flecha apunta de sin imputación a con imputación; hacia la izquierda significa que imputar mejora.",
     )
     for position, row in enumerate(rows):
@@ -752,8 +794,7 @@ def save_executive_cost_accuracy_plot(
         frame["model_mode"] = "trained"
     foundation = _foundation_mask(frame)
     frame = frame.loc[
-        frame["arm"].astype(str).ne(RAW_FROZEN_ARM)
-        & (~foundation | frame["arm"].astype(str).eq(RAW_ARM))
+        ~foundation | frame["arm"].astype(str).eq(RAW_ARM)
     ].copy()
     for column in (metric, "train_seconds", "inference_seconds"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -777,9 +818,7 @@ def save_executive_cost_accuracy_plot(
     top = _add_header(
         figure,
         f"Coste del predictor frente a precisión — {_metric_label(metric)}",
-        "Cada punto = media por (modelo, rama) sobre estaciones; abajo-izquierda = mejor. Contorno = frontera de Pareto.\n"
-        "Foundation tiene entrenamiento efectivo 0 s; no se incluyen los tiempos de detección/imputación ni la carga del modelo.\n"
-        "Cada foundation aparece una sola vez: su punto raw representa las ramas que solo modificarían el entrenamiento.",
+        "Abajo-izquierda = mejor. Contorno = frontera de Pareto.",
     )
     foundation_order = {
         model: position
@@ -976,20 +1015,71 @@ def save_arm_error_plot(output_path: Path, results_df: pd.DataFrame, metric: str
 
 
 def save_train_time_plot(output_path: Path, results_df: pd.DataFrame) -> bool:
-    """Dot plot of training time (s) per arm (points = series, tick = mean), per model."""
-    return _save_arm_dot_plot(
-        output_path,
-        results_df,
-        "train_seconds",
-        title="Tiempo de entrenamiento por brazo",
-        subtitle=(
-            "Puntos = series; barra vertical = media del brazo (menor = mas rapido).\n"
-            "Relleno = con imputacion (o vista raw); hueco = sin imputacion."
-        ),
-        xlabel="tiempo de entrenamiento (s)",
-        value_fmt="{:.1f}s",
-        reference=False,
+    """Plot one model-level training-time summary across all benchmark arms."""
+    summary = training_time_summary(results_df)
+    if summary.empty:
+        return False
+
+    summary = summary.sort_values("train_seconds_median", ascending=True).reset_index(drop=True)
+    positions = np.arange(len(summary))
+    medians = summary["train_seconds_median"].to_numpy(dtype=float)
+    means = summary["train_seconds_mean"].to_numpy(dtype=float)
+
+    figure, axis = plt.subplots(
+        figsize=(10.0, max(4.0, 2.8 + 0.42 * len(summary))),
+        facecolor=FIGURE_FACE,
     )
+    top = _add_header(
+        figure,
+        "Coste de entrenamiento por modelo",
+        "Circulo = mediana; marca vertical = media.",
+    )
+    style_axis(axis)
+    axis.grid(True, axis="x", color=GRID_COLOR, linestyle="--", alpha=0.65)
+    axis.grid(False, axis="y")
+    axis.scatter(
+        medians,
+        positions,
+        s=88,
+        color="#3d7ab5",
+        edgecolor="white",
+        linewidths=0.8,
+        label="mediana",
+        zorder=3,
+    )
+    axis.scatter(
+        means,
+        positions,
+        marker="|",
+        s=520,
+        color="#27313a",
+        linewidths=2.2,
+        label="media",
+        zorder=4,
+    )
+    for position, median, n_runs in zip(
+        positions, medians, summary["n_runs"], strict=True
+    ):
+        axis.annotate(
+            f"{_format_seconds(median)} (n={int(n_runs)})",
+            (median, position),
+            textcoords="offset points",
+            xytext=(7, 0),
+            va="center",
+            fontsize=8,
+            color=TEXT_COLOR,
+        )
+    axis.set_yticks(positions, summary["model"])
+    axis.invert_yaxis()
+    axis.set_xlabel("tiempo de entrenamiento (s)")
+    if np.all(np.r_[medians, means] >= 0):
+        axis.set_xscale("symlog", linthresh=1.0)
+        axis.set_xlim(left=0)
+    axis.legend(loc="upper right", fontsize=8)
+    figure.tight_layout(rect=(0, 0, 1, top))
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
 
 
 def save_inference_time_plot(output_path: Path, results_df: pd.DataFrame) -> bool:
@@ -1049,8 +1139,8 @@ def _save_time_vs_error_plot(
     top = _add_header(
         figure,
         title,
-        f"Media por (brazo, modelo): X = {xlabel}, Y = error (abajo-izq = mejor).\n"
-        "Color = estrategia, marcador = modelo, relleno/hueco = con/sin imputacion.",
+        f"X = {xlabel}; Y = error (abajo-izq = mejor).\n"
+        "Color = estrategia; marcador = modelo; relleno/hueco = con/sin imputacion.",
     )
     style_axis(axis)
     axis.grid(True, axis="both", color=GRID_COLOR, linestyle="--", alpha=0.5)
@@ -1092,12 +1182,94 @@ def _save_time_vs_error_plot(
 def save_train_time_vs_error_plot(
     output_path: Path, results_df: pd.DataFrame, metric: str = "rmsse"
 ) -> bool:
-    """Cost/accuracy scatter: mean training time (x) vs mean ``metric`` (y) per arm×model."""
-    return _save_time_vs_error_plot(
-        output_path, results_df, "train_seconds", metric,
-        title=f"Coste vs precision (entrenamiento) — {_metric_label(metric)}",
-        xlabel="tiempo de entrenamiento (s)",
+    """Plot one model-level training-cost/accuracy point per model."""
+    summary = training_time_summary(results_df, metric=metric)
+    if summary.empty:
+        return False
+
+    plot_summary = summary.sort_values(f"{metric}_mean", ascending=False).reset_index(drop=True)
+    figure, axis = plt.subplots(figsize=(11.0, 7.2), facecolor=FIGURE_FACE)
+    top = _add_header(
+        figure,
+        f"Coste frente a precision — {_metric_label(metric)}",
+        "Un punto por modelo; X = mediana del tiempo de entrenamiento, Y = media del error.",
     )
+    style_axis(axis)
+    axis.grid(True, axis="both", color=GRID_COLOR, linestyle="--", alpha=0.55)
+
+    medians = plot_summary["train_seconds_median"].to_numpy(dtype=float)
+    metric_values = plot_summary[f"{metric}_mean"].to_numpy(dtype=float)
+    axis.scatter(
+        medians,
+        metric_values,
+        s=92,
+        color="#3d7ab5",
+        edgecolor="white",
+        linewidths=0.8,
+        zorder=3,
+    )
+
+    time_max = float(np.nanmax(medians))
+    axis.set_xscale("symlog", linthresh=1.0)
+    axis.set_xlim(-1.0, max(1.0, time_max * 1.35))
+    time_ticks = [0.0, 1.0, 10.0, 100.0]
+    time_ticks = [tick for tick in time_ticks if tick <= max(1.0, time_max * 1.35)]
+    axis.set_xticks(time_ticks)
+    axis.set_xticklabels(["0" if tick == 0 else f"{tick:g}s" for tick in time_ticks])
+    axis.set_xlabel("mediana del tiempo de entrenamiento (s)")
+    axis.set_ylabel(f"{_metric_label(metric)} medio")
+
+    figure.subplots_adjust(left=0.10, right=0.97, bottom=0.12, top=top)
+    # Repel labels only when necessary, keeping them close to their points.
+    figure.canvas.draw()
+    axis_bbox = axis.get_window_extent()
+    point_pixels = axis.transData.transform(np.column_stack((medians, metric_values)))
+    order = np.argsort(point_pixels[:, 1])[::-1]
+    min_gap = min(18.0, (axis_bbox.height - 24.0) / max(1, len(plot_summary) - 1))
+    label_y_pixels = np.array([point_pixels[index, 1] for index in order], dtype=float)
+    for index in range(1, len(label_y_pixels)):
+        label_y_pixels[index] = min(
+            label_y_pixels[index], label_y_pixels[index - 1] - min_gap
+        )
+    if label_y_pixels[-1] < axis_bbox.y0 + 12.0:
+        label_y_pixels += axis_bbox.y0 + 12.0 - label_y_pixels[-1]
+    if label_y_pixels[0] > axis_bbox.y1 - 12.0:
+        label_y_pixels -= label_y_pixels[0] - (axis_bbox.y1 - 12.0)
+
+    offsets = [(8.0, 0.0)] * len(plot_summary)
+    for rank, index in enumerate(order):
+        point_y = point_pixels[index, 1]
+        offsets[index] = (8.0, (label_y_pixels[rank] - point_y) * 72.0 / figure.dpi)
+    annotations = []
+    for median, value, model, offset in zip(
+        medians, metric_values, plot_summary["model"], offsets, strict=True
+    ):
+        annotations.append(
+            axis.annotate(
+                str(model),
+                (median, value),
+                xytext=offset,
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                fontsize=8,
+                color=TEXT_COLOR,
+                annotation_clip=False,
+                arrowprops={
+                    "arrowstyle": "-",
+                    "color": MUTED_TEXT,
+                    "linewidth": 0.7,
+                    "alpha": 0.75,
+                    "shrinkA": 5,
+                    "shrinkB": 2,
+                },
+            )
+        )
+
+    figure.canvas.draw()
+    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    plt.close(figure)
+    return True
 
 
 def save_inference_time_vs_error_plot(
@@ -1397,7 +1569,7 @@ def save_foundation_preprocessing_plot(
     style_axis(axis)
     top = _add_header(
         figure,
-        f"Recuperacion del dano sintetico — {_metric_label(metric)}",
+        f"Recuperacion del daño sintetico — {_metric_label(metric)}",
         "Positivo: el preprocesamiento reduce el error frente al contexto corrompido.",
     )
     colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
@@ -1526,6 +1698,10 @@ def render_run_figures(run_dir: Path) -> list[Path]:
         raise ValueError(
             "El run usa el esquema antiguo con regímenes; vuelve a ejecutar el benchmark"
         )
+
+    training_time_summary(results_df, metric="mase").to_csv(
+        run_dir / "training_summary.csv", index=False
+    )
 
     saved: list[Path] = []
     jobs = [

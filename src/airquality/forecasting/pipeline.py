@@ -3,12 +3,11 @@
 Measures whether anomaly detection (and the subsequent imputation) improves
 multi-step forecasting. For every configured series the pipeline builds one
 training *arm* per (detection strategy, imputation) combination — plus the
-``raw`` and ``raw+frozen`` source baselines — and backtests the same forecasting
+``raw`` source baseline — and backtests the same forecasting
 models on each arm over the **same timestamps** using the configured horizon and
  rolling stride:
 
 - ``raw``: the hourly-mean series as loaded (gaps + anomalies kept).
-- ``raw+frozen``: the parallel hourly series without either frozen-value filter.
 - ``<strategy>+impute``: anomalies flagged by the strategy are removed and the
   resulting gaps imputed (:mod:`airquality.forecasting.fill`).
 - ``<strategy>+noimpute``: anomalies removed, gaps left as NaN (the backtest
@@ -28,7 +27,7 @@ chosen after masking the union of anomaly flags; strategy abstentions are
 reported but do not remove support. Every arm uses the selected timestamps on
 its own source series. Removal and imputation still touch only training.
 
-Foundation models run on the two raw-source views in that common time window. A
+Foundation models run on the raw source in that common time window. A
 separate paired experiment injects one synthetic anomaly type into copies of
 clean test contexts and compares ``clean_reference``, ``corrupted`` and
 ``inject-vote``; the same gap-size imputation policy is applied only after a NaN
@@ -130,8 +129,6 @@ from airquality.forecasting.progress import (
 from airquality.paths import create_run_dir
 
 RAW_ARM = "raw"
-RAW_FROZEN_ARM = "raw+frozen"
-RAW_SOURCE_ARMS = (RAW_ARM, RAW_FROZEN_ARM)
 DEFAULT_STRATEGIES = ("unlabeled", "inject-best", "inject-vote", "inject-soft")
 IMPUTATION_CHOICES = ("both", "impute", "none")
 BACKTEST_MAX_ATTEMPTS = 2
@@ -180,7 +177,6 @@ def _load_raw_hourly_series(
     pollutant: str,
     raw_base_dir: str,
     freq: str,
-    preserve_frozen: bool = False,
 ) -> list[pd.DataFrame]:
     """Load raw 5-minute stations and apply the shared hourly preprocess."""
     if freq != "h":
@@ -191,8 +187,8 @@ def _load_raw_hourly_series(
         (hourly,), _ = preprocess(
             [raw],
             pollutant,
-            exclude_frozen=not preserve_frozen,
-            remove_repeated=not preserve_frozen,
+            exclude_frozen=True,
+            remove_repeated=True,
         )
         series = ensure_datetime_series(
             hourly.iloc[:, 0].rename(station), freq=freq, name=station
@@ -399,7 +395,7 @@ def _shutdown_gpu_resources(*, cancel_futures: bool) -> None:
 
 
 def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
-    """Expand strategy specs; the two raw-source arms are always first.
+    """Expand strategy specs; the raw-source arm is always first.
 
     ``imputation`` picks the variants built per strategy: ``impute`` (detect →
     remove → impute), ``none`` (detect → remove, gaps stay NaN) or ``both``.
@@ -410,7 +406,6 @@ def build_arms(strategies: Sequence[str], imputation: str) -> list[ForecastArm]:
         )
     arms = [
         ForecastArm(RAW_ARM, None, False),
-        ForecastArm(RAW_FROZEN_ARM, None, False),
     ]
     for spec in dict.fromkeys(strategies):  # dedupe, keep order
         if imputation in ("both", "impute"):
@@ -743,7 +738,6 @@ def _run_benchmark_from_config(
         )
     vote_top_k = cfg_get_int("forecasting", "vote_top_k", DEFAULT_VOTE_TOP_K)
     vote_min_votes = cfg_get_int("forecasting", "vote_min_votes", DEFAULT_VOTE_MIN_VOTES)
-    preserve_frozen = cfg_get_bool("forecasting", "preserve_frozen", False)
     use_cache = cfg_get_bool("forecasting", "use_cache", True)
     cache_dir = cfg_get_str("forecasting", "cache_dir", "reports/forecasting/cache")
     heartbeat_seconds = cfg_get_int("forecasting", "heartbeat_seconds", 60)
@@ -751,10 +745,7 @@ def _run_benchmark_from_config(
         raise ValueError("heartbeat_seconds debe ser positivo")
     cache = BenchmarkCache((_repo_root() / cache_dir) if use_cache else None)
     PROGRESS_LOGGER.info(
-        "[preprocess] preserve_frozen=%s exclude_frozen=%s remove_repeated=%s",
-        preserve_frozen,
-        not preserve_frozen,
-        not preserve_frozen,
+        "[preprocess] exclude_frozen=%s remove_repeated=%s", True, True
     )
     foundation_test_enabled = foundation_test_requested and bool(
         foundation_model_configs
@@ -762,7 +753,7 @@ def _run_benchmark_from_config(
 
     arms = build_arms(strategy_specs, imputation)
     if all(not config.uses_training_arms for config in forecast_model_configs.values()):
-        arms = arms[: len(RAW_SOURCE_ARMS)]
+        arms = arms[:1]
     active_strategy_specs = [arm.strategy for arm in arms if arm.strategy]
     strategies = [
         build_detection_strategy(
@@ -792,20 +783,10 @@ def _run_benchmark_from_config(
         pollutant=pollutant,
         raw_base_dir=raw_base_dir,
         freq=freq,
-        preserve_frozen=preserve_frozen,
     )
     if not series_dfs:
         raise RuntimeError("No se cargaron series para el benchmark.")
-    frozen_series_dfs = _load_raw_hourly_series(
-        pollutant=pollutant,
-        raw_base_dir=raw_base_dir,
-        freq=freq,
-        preserve_frozen=True,
-    )
     primary_series_by_name = _series_by_name(series_dfs)
-    frozen_series_by_name = _series_by_name(frozen_series_dfs)
-    if set(frozen_series_by_name) != set(primary_series_by_name):
-        raise RuntimeError("Las vistas raw y raw+frozen no contienen las mismas estaciones")
 
     # Resolve "all" against the registry NOW so cache keys list concrete names
     # (registry availability, e.g. optional TSPulse, then invalidates entries).
@@ -859,7 +840,6 @@ def _run_benchmark_from_config(
             "min_selection_points": min_selection_points,
             "vote_top_k": vote_top_k,
             "vote_min_votes": vote_min_votes,
-            "preserve_frozen": preserve_frozen,
         }
     )
     foundation_test_config = effective_config(
@@ -899,7 +879,7 @@ def _run_benchmark_from_config(
     backtests_per_station = sum(
         len(arms)
         if config.uses_training_arms
-        else sum(arm.name in RAW_SOURCE_ARMS for arm in arms)
+        else sum(arm.name == RAW_ARM for arm in arms)
         for config in forecast_model_configs.values()
     )
     PROGRESS_LOGGER.info(
@@ -949,9 +929,6 @@ def _run_benchmark_from_config(
         station_started = time.perf_counter()
         series = df.iloc[:, 0]
         name = str(series.name)
-        frozen_series = frozen_series_by_name[name]
-        if not frozen_series.index.equals(series.index):
-            raise RuntimeError(f"{name}: raw y raw+frozen no comparten la misma rejilla")
         progress.update(
             stage="detection",
             detail=f"station={station_index}/{len(series_dfs)} name={name}",
@@ -1105,13 +1082,9 @@ def _run_benchmark_from_config(
 
         test_target_start = window["test_target_start"]
         test_series = series.loc[window["test_index"]]
-        frozen_test_series = frozen_series.loc[window["test_index"]]
         train_raw = series.loc[series.index < test_target_start]
-        train_frozen = frozen_series.loc[frozen_series.index < test_target_start]
         if test_series.isna().any() or common_mask.loc[window["test_index"]].any():
             raise RuntimeError(f"{name}: el test comun no es valido")
-        if frozen_test_series.isna().any():
-            raise RuntimeError(f"{name}: raw+frozen no cubre el test comun")
         selection_rows.append(
             {
                 **selection_common,
@@ -1142,7 +1115,6 @@ def _run_benchmark_from_config(
         # This reservoir is sliced before each origin for every arm's scaled metrics.
         raw_reference = series.loc[: window["test_target_end"]]
         train_fp = series_fingerprint(train_raw)
-        frozen_train_fp = series_fingerprint(train_frozen)
         support_fp = series_fingerprint(support)
 
         # Arm training series are built lazily: fully-cached arms skip anomaly
@@ -1151,9 +1123,7 @@ def _run_benchmark_from_config(
 
         def train_for(arm: ForecastArm) -> pd.Series:
             if arm.name not in train_by_arm:
-                if arm.name == RAW_FROZEN_ARM:
-                    base = train_frozen
-                elif arm.strategy is None:
+                if arm.strategy is None:
                     base = train_raw
                 else:
                     base = remove_anomalies(train_raw, detections[arm.strategy])
@@ -1168,9 +1138,6 @@ def _run_benchmark_from_config(
                     else base
                 )
             return train_by_arm[arm.name]
-
-        def test_for(arm: ForecastArm) -> pd.Series:
-            return frozen_test_series if arm.name == RAW_FROZEN_ARM else test_series
 
         series_backtest_rows: dict[int, dict[str, Any]] = {}
         pending_gpu: dict[
@@ -1284,16 +1251,14 @@ def _run_benchmark_from_config(
             arm_strategy_key = (
                 asdict(strategy_by_spec[arm.strategy]) if arm.strategy else None
             )
-            arm_test_series = test_for(arm)
-            arm_train_fp = (
-                frozen_train_fp if arm.name == RAW_FROZEN_ARM else train_fp
-            )
+            arm_test_series = test_series
+            arm_train_fp = train_fp
             arm_test_fp = series_fingerprint(arm_test_series)
             for model_name in forecast_models:
                 forecast_model_config = forecast_model_configs[model_name]
                 if (
                     not forecast_model_config.uses_training_arms
-                    and arm.name not in RAW_SOURCE_ARMS
+                    and arm.name != RAW_ARM
                 ):
                     continue
                 ordinal = backtest_ordinal
