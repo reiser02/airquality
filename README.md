@@ -275,7 +275,16 @@ uv run python -m airquality.visualizations.block_support \
 ```
 
 Omit the directory to render the newest run. The figures use `raw` as the
-reference and exclusively `inject-vote` for detection and imputation. They cover
+reference and use `inject-vote` by default for detection and imputation. Select
+another strategy explicitly, for example:
+
+```bash
+uv run python -m airquality.visualizations.block_support \
+  reports/data_blocks/forecast_support_O3_YYYYMMDD_HHMMSS \
+  --strategy inject-soft
+```
+
+They cover
 aggregate observed/imputed support, stage-specific retention, retained hours and
 usable blocks by series, block-length distributions and survival, recovered-gap
 composition, detection coverage and imputation age.
@@ -353,6 +362,27 @@ Regenerate every figure from those saved CSVs without rerunning any model:
 uv run python -m airquality.visualizations.montecarlo \
     reports/benchmark/montecarlo_YYYYMMDD_HHMMSS
 ```
+
+Comparar dos ejecuciones ya terminadas y generar cada figura con la primera
+ejecucion a la izquierda y la segunda a la derecha:
+
+```bash
+uv run python -m airquality.visualizations.montecarlo \
+    reports/benchmark/montecarlo_LEFT \
+    reports/benchmark/montecarlo_RIGHT
+```
+
+La salida se guarda en un directorio hermano llamado
+`comparison_<left>_vs_<right>`; se puede cambiar con `--output-dir`. Se
+emparejan las figuras PNG del nivel principal con una unica cabecera y
+descripcion compartida; las etiquetas de los paneles identifican la metrica y
+el contaminante (por ejemplo, `R2 NO2` y `R2 O3`). Tambien se incluye
+`plots/media_estaciones_grid.png`, que resume los gaps de 1, 2, 5 y 10 horas.
+Las figuras individuales de las estaciones dentro de `plots/gap_*` no se
+duplican. Las leyendas o barras de escala identicas solo aparecen en el panel
+izquierdo; se conservan ambas cuando la escala es distinta. El archivo
+`comparison_manifest.csv` registra las figuras generadas y si estaban
+disponibles en cada ejecucion.
 
 Generate reproducible CSV and LaTeX tables with the best models, mean, median,
 station-level standard deviation, rank, and global performance profile:
