@@ -661,6 +661,7 @@ def test_run_imputation_benchmark_parallel_max_workers_one_combines_outputs(
     results_df, ranking_df, plot_store = run_imputation_benchmark_parallel(
         repo_root=tmp_path,
         max_workers=1,
+        size_k=5,
     )
 
     assert list(results_df["Modelo"]) == ["TiDE", "TCN"]
@@ -943,6 +944,7 @@ def test_parallel_benchmark_rejects_missing_darts_artifact_before_dataset(
             repo_root=tmp_path,
             model_names=["TiDE"],
             strict_artifacts=True,
+            size_k=5,
         )
 
 
@@ -962,6 +964,7 @@ def test_parallel_benchmark_rejects_missing_torch_checkpoint(
             repo_root=tmp_path,
             model_names=["TiDE"],
             strict_artifacts=True,
+            size_k=5,
         )
 
 
