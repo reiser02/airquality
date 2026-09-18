@@ -4,6 +4,12 @@ Run again without executing any model::
 
     uv run python -m airquality.visualizations.montecarlo \
         reports/benchmark/montecarlo_<stamp>
+
+Compare two completed runs without executing any model::
+
+    uv run python -m airquality.visualizations.montecarlo \
+        reports/benchmark/montecarlo_<left> \
+        reports/benchmark/montecarlo_<right>
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import re
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 import numpy as np
 import pandas as pd
 from scipy.stats import t as student_t
@@ -38,6 +45,7 @@ PLOT_STORE_COLUMNS = (
     "timestamp",
     "value",
 )
+PLOT_METRICS = ("MASE", "RMSSE", "R2")
 OBSOLETE_SUMMARY_PLOT_PATTERNS = (
     "metric_forest_*.png",
     "station_distribution_*.png",
@@ -48,6 +56,22 @@ OBSOLETE_SUMMARY_PLOT_PATTERNS = (
     "metrics_across_stations.png",
     "global_rank_frequency_*.png",
     "global_performance_profile_*.png",
+    "metrics_by_gap_mae.png",
+    "metrics_by_gap_rmse.png",
+    "model_performance_by_gap_mae.png",
+    "model_performance_by_gap_rmse.png",
+    "overall_model_performance_mae.png",
+    "overall_model_performance_rmse.png",
+    "global_station_error_mae.png",
+    "global_station_error_rmse.png",
+    "pairwise_win_rate_mae.png",
+    "pairwise_win_rate_rmse.png",
+    "gap_degradation_mae.png",
+    "gap_degradation_rmse.png",
+    "tail_risk_mae.png",
+    "tail_risk_rmse.png",
+    "error_correlation_mae.png",
+    "error_correlation_rmse.png",
 )
 
 # Distinct line colours drawn from the same presentation.py hex family.
@@ -158,6 +182,12 @@ def _aggregate_metrics_by_gap(
             )
             row[f"{metric}_P95"] = (
                 float(values.quantile(0.95)) if n_stations else float("nan")
+            )
+            row[f"{metric}_Min"] = (
+                float(values.min()) if n_stations else float("nan")
+            )
+            row[f"{metric}_Max"] = (
+                float(values.max()) if n_stations else float("nan")
             )
             row[f"{metric}_N_Stations"] = n_stations
         if "Support_Fraction" in group.columns:
@@ -1595,16 +1625,7 @@ def _metric_gap_plot_inputs(
     if not {"Modelo", "Gap_Size"}.issubset(results_mc_df.columns):
         return None
 
-    preferred_metrics = ("MASE", "RMSSE", "R2")
-    metrics = [m for m in preferred_metrics if m in results_mc_df.columns]
-    # Keep the renderer useful for reduced test/legacy result files that do
-    # not contain any of the three primary scorecard metrics.
-    if not metrics:
-        metrics = [
-            m
-            for m in ("MAE", "RMSE")
-            if m in results_mc_df.columns
-        ]
+    metrics = [m for m in PLOT_METRICS if m in results_mc_df.columns]
     if not metrics:
         return None
 
@@ -1724,6 +1745,187 @@ def _draw_metric_gap_heatmap(
     )
 
 
+def _draw_metric_mean_uncertainty_heatmap(
+    ax: "plt.Axes",
+    agg_df: pd.DataFrame,
+    metric: str,
+    *,
+    gap_sizes: list[int],
+    model_order: list[str],
+    scaled_errors: bool,
+    uncertainty_suffix: str,
+    uncertainty_label: str,
+) -> bool:
+    """Draw a mean heatmap annotated with an uncertainty half-width."""
+    mean_matrix = (
+        agg_df.pivot(index="Modelo", columns="Gap_Size", values=f"{metric}_Mean")
+        .reindex(index=model_order, columns=gap_sizes)
+    )
+    half_width_matrix = (
+        agg_df.pivot(
+            index="Modelo",
+            columns="Gap_Size",
+            values=f"{metric}_{uncertainty_suffix}",
+        )
+        .reindex(index=model_order, columns=gap_sizes)
+    )
+    mean_values = mean_matrix.to_numpy(dtype=float)
+    half_width_values = half_width_matrix.to_numpy(dtype=float)
+    finite = mean_values[np.isfinite(mean_values)]
+    if len(finite) == 0:
+        return False
+
+    cmap = plt.get_cmap(
+        "YlGnBu" if metric_higher_is_better(metric) else "YlOrRd"
+    ).copy()
+    cmap.set_bad("#ded8cf")
+    image = ax.imshow(
+        np.ma.masked_invalid(mean_values),
+        aspect="auto",
+        cmap=cmap,
+    )
+    for row_index, model in enumerate(model_order):
+        for col_index, gap in enumerate(gap_sizes):
+            mean_value = mean_values[row_index, col_index]
+            half_width = half_width_values[row_index, col_index]
+            if not np.isfinite(mean_value):
+                label = "--"
+            elif np.isfinite(half_width):
+                label = f"{mean_value:.2f}\n±{half_width:.2f}"
+            else:
+                label = f"{mean_value:.2f}\n±--"
+            if np.isfinite(mean_value):
+                support_row = agg_df[
+                    (agg_df["Modelo"] == model) & (agg_df["Gap_Size"] == gap)
+                ]
+                low_support = (
+                    not support_row.empty
+                    and float(support_row.iloc[0]["Support_Mean"]) < 0.999
+                )
+                if low_support:
+                    label += "*"
+            normalized = image.norm(mean_value) if np.isfinite(mean_value) else 0.0
+            ax.text(
+                col_index,
+                row_index,
+                label,
+                ha="center",
+                va="center",
+                fontsize=8.0,
+                color="white" if normalized > 0.62 else TEXT_COLOR,
+            )
+
+    _style_metric_axis(ax)
+    ax.grid(False)
+    display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
+    ax.set_title(
+        f"{display_metric}: media ± {uncertainty_label}",
+        fontsize=12,
+        fontweight="bold",
+    )
+    ax.set_xlabel("Tamaño del hueco (h)")
+    ax.set_ylabel("Modelo")
+    ax.set_xticks(range(len(gap_sizes)))
+    ax.set_xticklabels([str(gap) for gap in gap_sizes])
+    ax.set_yticks(range(len(model_order)))
+    ax.set_yticklabels(model_order, fontsize=8.5)
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.05, pad=0.035)
+    colorbar.set_label(display_metric, color=TEXT_COLOR, fontsize=9)
+    colorbar.ax.tick_params(colors=TEXT_COLOR, labelsize=8)
+    return True
+
+
+def _draw_metric_mean_ci_heatmap(
+    ax: "plt.Axes",
+    agg_df: pd.DataFrame,
+    metric: str,
+    *,
+    gap_sizes: list[int],
+    model_order: list[str],
+    scaled_errors: bool,
+) -> bool:
+    """Draw a mean heatmap annotated with the 95% CI half-width."""
+    return _draw_metric_mean_uncertainty_heatmap(
+        ax,
+        agg_df,
+        metric,
+        gap_sizes=gap_sizes,
+        model_order=model_order,
+        scaled_errors=scaled_errors,
+        uncertainty_suffix="CI95_Half_Width",
+        uncertainty_label="IC 95%",
+    )
+
+
+def _draw_metric_mean_sd_heatmap(
+    ax: "plt.Axes",
+    agg_df: pd.DataFrame,
+    metric: str,
+    *,
+    gap_sizes: list[int],
+    model_order: list[str],
+    scaled_errors: bool,
+) -> bool:
+    """Draw a mean heatmap annotated with station-level standard deviation."""
+    return _draw_metric_mean_uncertainty_heatmap(
+        ax,
+        agg_df,
+        metric,
+        gap_sizes=gap_sizes,
+        model_order=model_order,
+        scaled_errors=scaled_errors,
+        uncertainty_suffix="SD",
+        uncertainty_label="SD",
+    )
+
+
+def _save_metric_mean_uncertainty_heatmap(
+    agg_df: pd.DataFrame,
+    metrics: list[str],
+    gap_sizes: list[int],
+    model_order: list[str],
+    *,
+    output_dir: Path,
+    scaled_errors: bool,
+    uncertainty_label: str,
+    filename: str,
+    title: str,
+    subtitle: str,
+    draw_function: Any,
+) -> Path | None:
+    """Save a combined mean-plus-uncertainty heatmap."""
+    image_path = output_dir / filename
+    image_path.unlink(missing_ok=True)
+    fig, axes = plt.subplots(
+        1,
+        len(metrics),
+        figsize=(4.8 * len(metrics), max(6.0, 0.43 * len(model_order) + 2.2)),
+        facecolor=FIGURE_FACE,
+        squeeze=False,
+    )
+    axes_row = axes[0]
+    has_data = False
+    for ax, metric in zip(axes_row, metrics):
+        drawn = draw_function(
+            ax,
+            agg_df,
+            metric,
+            gap_sizes=gap_sizes,
+            model_order=model_order,
+            scaled_errors=scaled_errors,
+        )
+        has_data = has_data or drawn
+        if not drawn:
+            ax.set_visible(False)
+    if not has_data:
+        plt.close(fig)
+        return None
+    add_plot_header(fig, title, subtitle)
+    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    save_figure(fig, image_path)
+    return image_path
+
+
 def _save_metric_gap_uncertainty_plots(
     agg_df: pd.DataFrame,
     metrics: list[str],
@@ -1744,6 +1946,10 @@ def _save_metric_gap_uncertainty_plots(
                     "Gap_Size": int(row["Gap_Size"]),
                     "Mean": row[f"{metric}_Mean"],
                     "SD": row[f"{metric}_SD"],
+                    "P05": row[f"{metric}_P05"],
+                    "P95": row[f"{metric}_P95"],
+                    "Min": row[f"{metric}_Min"],
+                    "Max": row[f"{metric}_Max"],
                     "CI95_Low": row[f"{metric}_CI95_Low"],
                     "CI95_High": row[f"{metric}_CI95_High"],
                     "CI95_Half_Width": row[f"{metric}_CI95_Half_Width"],
@@ -1754,6 +1960,102 @@ def _save_metric_gap_uncertainty_plots(
     uncertainty_table = pd.DataFrame(uncertainty_rows)
     uncertainty_table_path = output_dir / "metrics_by_gap_uncertainty.csv"
     uncertainty_table.to_csv(uncertainty_table_path, index=False)
+
+    _save_metric_mean_uncertainty_heatmap(
+        agg_df,
+        metrics,
+        gap_sizes,
+        model_order,
+        output_dir=output_dir,
+        scaled_errors=scaled_errors,
+        uncertainty_label="SD",
+        filename="metrics_by_gap_mean_sd.png",
+        title="Rendimiento medio y variabilidad por tamaño de hueco",
+        subtitle="Cada celda muestra la media ± la SD entre estaciones. "
+        "El color representa únicamente la media.",
+        draw_function=_draw_metric_mean_sd_heatmap,
+    )
+    _save_metric_mean_uncertainty_heatmap(
+        agg_df,
+        metrics,
+        gap_sizes,
+        model_order,
+        output_dir=output_dir,
+        scaled_errors=scaled_errors,
+        uncertainty_label="IC 95%",
+        filename="metrics_by_gap_mean_ci95.png",
+        title="Rendimiento medio con intervalo de confianza por tamaño de hueco",
+        subtitle="Cada celda muestra la media ± la semiamplitud del IC t del 95%. "
+        "El color representa únicamente la media; los límites completos están en metrics_by_gap_uncertainty.csv.",
+        draw_function=_draw_metric_mean_ci_heatmap,
+    )
+
+    risk_rows: list[dict[str, Any]] = []
+    for _, row in agg_df.iterrows():
+        for metric in metrics:
+            higher_is_better = metric_higher_is_better(metric)
+            tail_statistic = "P05" if higher_is_better else "P95"
+            extreme_statistic = "Min" if higher_is_better else "Max"
+            risk_rows.append(
+                {
+                    "Metric": metric,
+                    "Modelo": str(row["Modelo"]),
+                    "Gap_Size": int(row["Gap_Size"]),
+                    "Mean": row[f"{metric}_Mean"],
+                    "SD": row[f"{metric}_SD"],
+                    "Tail_Statistic": tail_statistic,
+                    "Tail_Value": row[f"{metric}_{tail_statistic}"],
+                    "Extreme_Statistic": extreme_statistic,
+                    "Extreme_Value": row[f"{metric}_{extreme_statistic}"],
+                    "N_Stations": row[f"{metric}_N_Stations"],
+                    "Support_Mean": row["Support_Mean"],
+                }
+            )
+    pd.DataFrame(risk_rows).to_csv(
+        output_dir / "metrics_by_gap_risk.csv",
+        index=False,
+    )
+
+    risk_path = output_dir / "metrics_by_gap_risk.png"
+    risk_path.unlink(missing_ok=True)
+    fig, axes = plt.subplots(
+        1,
+        len(metrics),
+        figsize=(4.8 * len(metrics), max(6.0, 0.43 * len(model_order) + 2.2)),
+        facecolor=FIGURE_FACE,
+        squeeze=False,
+    )
+    axes_row = axes[0]
+    has_risk_data = False
+    for ax, metric in zip(axes_row, metrics):
+        higher_is_better = metric_higher_is_better(metric)
+        tail_statistic = "P05" if higher_is_better else "P95"
+        display_metric = _metric_display_name(metric, scaled_errors=scaled_errors)
+        drawn = _draw_metric_value_heatmap(
+            ax,
+            agg_df,
+            metric,
+            gap_sizes=gap_sizes,
+            model_order=model_order,
+            value_suffix=tail_statistic,
+            display_title=f"{display_metric} | {tail_statistic}",
+            colorbar_label=f"{tail_statistic} entre estaciones",
+            cmap_name="YlGnBu" if higher_is_better else "YlOrRd",
+        )
+        has_risk_data = has_risk_data or drawn
+        if not drawn:
+            ax.set_visible(False)
+    if has_risk_data:
+        add_plot_header(
+            fig,
+            "Riesgo entre estaciones por tamaño de hueco",
+            "MASE/RMSSE muestran P95 y R² muestra P05 porque los valores bajos son peores. "
+            "El máximo o mínimo está disponible en metrics_by_gap_risk.csv.",
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.89))
+        save_figure(fig, risk_path)
+    else:
+        plt.close(fig)
 
     specifications = (
         (
@@ -1818,8 +2120,12 @@ def _save_metric_gap_plots(
 ) -> tuple[Path | None, dict[str, Path]]:
     """Save the combined heatmap and one readable heatmap per metric."""
     for filename in (
+        "metrics_by_gap_mean_sd.png",
         "metrics_by_gap_sd.png",
         "metrics_by_gap_ci95.png",
+        "metrics_by_gap_mean_ci95.png",
+        "metrics_by_gap_risk.png",
+        "metrics_by_gap_risk.csv",
         "metrics_by_gap_uncertainty.csv",
     ):
         (output_dir / filename).unlink(missing_ok=True)
@@ -1838,7 +2144,7 @@ def _save_metric_gap_plots(
         scaled_errors=scaled_errors,
     )
 
-    for metric in ("MAE", "RMSE", "MASE", "RMSSE", "R2"):
+    for metric in ("MAE", "RMSE", *PLOT_METRICS):
         (output_dir / f"metrics_by_gap_{metric.lower()}.png").unlink(
             missing_ok=True
         )
@@ -1945,7 +2251,7 @@ def _save_montecarlo_diagnostic_plots(
     }
     metrics = [
         metric
-        for metric in ("MAE", "RMSE", "MASE", "RMSSE", "R2")
+        for metric in PLOT_METRICS
         if metric in results_mc_df.columns
     ]
     if not metrics or results_mc_df.empty:
@@ -2076,6 +2382,392 @@ def _sanitize_filename(text: str) -> str:
     """Reduce free-form series names to a safe filesystem identifier."""
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip())
     return sanitized.strip("._") or "series"
+
+
+def _comparison_plot_files(run_dir: Path) -> dict[Path, Path]:
+    """Return top-level run plots plus the station-mean grid.
+
+    The per-station files under ``plots/gap_*`` are deliberately not included:
+    the station-mean grid is the useful cross-run summary for those gaps and
+    avoids producing a second, very large set of nearly duplicate figures.
+    """
+    files = {
+        path.relative_to(run_dir): path
+        for path in run_dir.glob("*.png")
+        if path.is_file()
+    }
+    station_grid = run_dir / "plots" / "media_estaciones_grid.png"
+    if station_grid.is_file():
+        files[Path("plots") / station_grid.name] = station_grid
+    return dict(sorted(files.items(), key=lambda item: str(item[0])))
+
+
+def _default_comparison_output_dir(left_run_dir: Path, right_run_dir: Path) -> Path:
+    """Build a deterministic sibling directory for a two-run comparison."""
+    name = (
+        f"comparison_{_sanitize_filename(left_run_dir.name)}"
+        f"_vs_{_sanitize_filename(right_run_dir.name)}"
+    )
+    return left_run_dir.parent / name
+
+
+def _validate_comparison_output_dir(
+    output_dir: Path,
+    left_run_dir: Path,
+    right_run_dir: Path,
+) -> None:
+    """Keep generated comparison files outside both source runs."""
+    for run_dir in (left_run_dir, right_run_dir):
+        try:
+            output_dir.relative_to(run_dir)
+        except ValueError:
+            continue
+        raise ValueError(
+            f"La salida de comparacion debe estar fuera de la ejecucion: {run_dir}"
+        )
+
+
+def _load_comparison_image(path: Path | None) -> np.ndarray | None:
+    """Read a PNG for display and return ``None`` for a missing artifact."""
+    if path is None:
+        return None
+    try:
+        image = plt.imread(path)
+    except (OSError, ValueError):
+        return None
+    if image.ndim not in (2, 3) or image.shape[0] == 0 or image.shape[1] == 0:
+        return None
+    return image
+
+
+def _comparison_content_start(artifact: Path, image: np.ndarray) -> int:
+    """Locate the plot content after the source title and description."""
+    if artifact.parts == ("plots", "media_estaciones_grid.png"):
+        fraction = 0.115
+    elif artifact.name == "metrics_by_gap.png" or (
+        artifact.name.startswith("metrics_by_gap_")
+        and artifact.stem.rsplit("_", 1)[-1].lower()
+        in {"ci95", "mean_ci95", "mean_sd", "risk", "sd"}
+    ):
+        fraction = 0.14
+    elif artifact.name.startswith("metrics_by_gap_"):
+        fraction = 0.19
+    else:
+        fraction = 0.14
+    return max(1, min(image.shape[0] - 1, int(image.shape[0] * fraction)))
+
+
+def _comparison_header_end(image: np.ndarray) -> int:
+    """Keep only the source title and description for the shared header."""
+    return max(1, min(image.shape[0] - 1, int(image.shape[0] * 0.11)))
+
+
+def _comparison_rgb(image: np.ndarray) -> np.ndarray:
+    """Return the visible RGB channels as floating-point values."""
+    if image.ndim == 2:
+        return np.repeat(image[:, :, None], 3, axis=2)
+    rgb = image[:, :, :3]
+    return rgb / 255.0 if np.issubdtype(rgb.dtype, np.integer) else rgb
+
+
+def _first_ink_fraction(image: np.ndarray, *, background: str) -> float | None:
+    """Find the first column containing visible content over a flat background."""
+    rgb = _comparison_rgb(image)
+    background_rgb = np.asarray(to_rgb(background), dtype=float)
+    ink = np.max(np.abs(rgb - background_rgb), axis=2) > 0.035
+    columns = np.flatnonzero(ink.any(axis=0))
+    return float(columns[0] / image.shape[1]) if len(columns) else None
+
+
+def _plot_left_fraction(artifact: Path, image: np.ndarray) -> float:
+    """Estimate the left edge of the actual plot, ignoring y-axis labels."""
+    content_start = _comparison_content_start(artifact, image)
+    content = image[content_start:]
+    rgb = _comparison_rgb(content)
+    figure_rgb = np.asarray(to_rgb(FIGURE_FACE), dtype=float)
+    differs_from_figure = np.max(np.abs(rgb - figure_rgb), axis=2) > 0.035
+    counts = differs_from_figure.sum(axis=0)
+    minimum_count = max(5, int(content.shape[0] * 0.12))
+    columns = np.flatnonzero(counts >= minimum_count)
+    return float(columns[0] / image.shape[1]) if len(columns) else 0.05
+
+
+def _comparison_header_shift(
+    artifact: Path,
+    header_image: np.ndarray,
+    content_image: np.ndarray | None,
+) -> float:
+    """Align shared header text with the left edge of the left plot panel."""
+    header_ink = _first_ink_fraction(header_image, background=FIGURE_FACE)
+    if header_ink is None or content_image is None:
+        return 0.0
+    plot_left = _plot_left_fraction(artifact, content_image)
+    target = 0.01 + 0.5 * plot_left
+    # The shared header spans both panels, while its source margin belongs to
+    # one panel.  This small correction keeps its text over the left plot.
+    return header_ink - target + 0.01
+
+
+def _shift_header_image(image: np.ndarray, fraction: float) -> np.ndarray:
+    """Shift header pixels horizontally without changing their scale."""
+    if image.ndim == 2:
+        image = np.repeat(image[:, :, None], 3, axis=2)
+    shift = int(round(fraction * image.shape[1]))
+    if shift == 0:
+        return image
+    shifted = np.empty_like(image)
+    background = np.asarray(to_rgb(FIGURE_FACE), dtype=shifted.dtype)
+    if np.issubdtype(shifted.dtype, np.integer):
+        background *= 255
+    shifted[:, :, :3] = background
+    if shifted.shape[2] > 3:
+        shifted[:, :, 3] = 1.0
+    if shift > 0:
+        shifted[:, :-shift] = image[:, shift:]
+    else:
+        shifted[:, -shift:] = image[:, :shift]
+    return shifted
+
+
+def _duplicate_legend_regions(artifact: Path) -> tuple[tuple[float, float, float, float], ...]:
+    """Return source regions occupied by identical legends or colorbars."""
+    if artifact.name.startswith("gap_degradation_"):
+        return ((0.77, 0.20, 1.0, 0.82),)
+    if artifact.name.startswith("tail_risk_"):
+        return ((0.67, 0.22, 1.0, 0.78),)
+    if artifact.name.startswith("overall_model_performance_"):
+        return ((0.92, 0.82, 1.0, 0.99),)
+    if artifact.name.startswith("pairwise_win_rate_"):
+        return ((0.76, 0.20, 0.86, 0.90),)
+    if artifact.name.startswith("error_correlation_"):
+        return ((0.70, 0.20, 0.82, 0.90),)
+    return ()
+
+
+def _remove_duplicate_legends(image: np.ndarray, artifact: Path) -> np.ndarray:
+    """Mask only the second copy of known, identical legends or colorbars."""
+    regions = _duplicate_legend_regions(artifact)
+    if not regions or image.ndim == 2:
+        return image
+    clean = image.copy()
+    height, width = image.shape[:2]
+    background = np.asarray(to_rgb(FIGURE_FACE), dtype=clean.dtype)
+    if np.issubdtype(clean.dtype, np.integer):
+        background *= 255
+    for left, top, right, bottom in regions:
+        x0, x1 = int(left * width), int(right * width)
+        y0, y1 = int(top * height), int(bottom * height)
+        clean[y0:y1, x0:x1, :3] = background
+        if clean.shape[2] > 3:
+            clean[y0:y1, x0:x1, 3] = 1.0
+    return clean
+
+
+def _comparison_run_label(run_dir: Path) -> str:
+    """Use the pollutant code in a run name when it is available."""
+    match = re.search(r"(?<![A-Za-z0-9])(no2|o3)(?![A-Za-z0-9])", run_dir.name, re.I)
+    return match.group(1).upper() if match else run_dir.name
+
+
+def _comparison_panel_title(artifact: Path, run_dir: Path) -> str:
+    """Label a panel with its metric and pollutant instead of the run id."""
+    metric_match = re.search(r"_(mase|rmsse|r2)(?:_|\.png$)", artifact.name, re.I)
+    run_label = _comparison_run_label(run_dir)
+    return f"{metric_match.group(1).upper()} {run_label}" if metric_match else run_label
+
+
+def _save_comparison_image(
+    left_path: Path | None,
+    right_path: Path | None,
+    *,
+    left_run_dir: Path,
+    right_run_dir: Path,
+    artifact: Path,
+    output_path: Path,
+) -> Path:
+    """Save one figure with a shared header and two run panels."""
+    images = (
+        _load_comparison_image(left_path),
+        _load_comparison_image(right_path),
+    )
+    header_image = next((image for image in images if image is not None), None)
+    content_image = images[0] if images[0] is not None else images[1]
+    header_end = (
+        _comparison_header_end(header_image)
+        if header_image is not None
+        else None
+    )
+    figure_width = 18.0
+    header_units = (
+        figure_width * header_end / header_image.shape[1]
+        if header_image is not None and header_end is not None
+        else 1.2
+    )
+    figure = plt.figure(
+        figsize=(figure_width, max(9.0, header_units + 8.0)),
+        facecolor=FIGURE_FACE,
+    )
+    grid = figure.add_gridspec(
+        2,
+        2,
+        height_ratios=(header_units, 8.0),
+        hspace=0.08,
+        wspace=0.03,
+    )
+    header_axis = figure.add_subplot(grid[0, :])
+    header_axis.set_facecolor(FIGURE_FACE)
+    if header_image is not None and header_end is not None:
+        shared_header = header_image[:header_end]
+        header_shift = _comparison_header_shift(
+            artifact,
+            shared_header,
+            content_image,
+        )
+        header_axis.imshow(
+            _shift_header_image(shared_header, header_shift),
+            aspect="auto",
+        )
+    else:
+        header_axis.text(
+            0.5,
+            0.5,
+            "No hay cabecera disponible",
+            ha="center",
+            va="center",
+            color=MUTED_TEXT,
+            transform=header_axis.transAxes,
+        )
+    header_axis.set_axis_off()
+
+    for panel_index, (axis, image, run_dir, source_path) in enumerate(zip(
+        (figure.add_subplot(grid[1, 0]), figure.add_subplot(grid[1, 1])),
+        images,
+        (left_run_dir, right_run_dir),
+        (left_path, right_path),
+        strict=True,
+    )):
+        axis.set_facecolor(AXIS_FACE)
+        axis.set_title(
+            _comparison_panel_title(artifact, run_dir),
+            color=TEXT_COLOR,
+            fontsize=11,
+            fontweight="bold",
+            pad=8,
+        )
+        if image is None:
+            axis.text(
+                0.5,
+                0.5,
+                (
+                    "Figura no disponible"
+                    if source_path is None
+                    else "No se pudo leer la figura"
+                ),
+                ha="center",
+                va="center",
+                color=MUTED_TEXT,
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            continue
+        if panel_index == 1 and images[0] is not None:
+            image = _remove_duplicate_legends(image, artifact)
+        content_start = _comparison_content_start(artifact, image)
+        axis.imshow(image[content_start:], aspect="auto")
+        axis.set_axis_off()
+
+    figure.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
+    return save_figure(figure, output_path)
+
+
+def render_comparison_figures(
+    left_run_dir: Path,
+    right_run_dir: Path,
+    *,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Render all available PNG reports from two Monte Carlo run directories.
+
+    Top-level report images are paired by filename and share one title and
+    description taken from the first available source.  The special station-
+    mean grid at ``plots/media_estaciones_grid.png`` is paired as well, while
+    the individual station images under ``plots/gap_*`` are intentionally
+    omitted.  The source runs are never modified.
+    """
+    left_run_dir = Path(left_run_dir).expanduser().resolve()
+    right_run_dir = Path(right_run_dir).expanduser().resolve()
+    if not left_run_dir.is_dir():
+        raise FileNotFoundError(f"No existe el directorio izquierdo: {left_run_dir}")
+    if not right_run_dir.is_dir():
+        raise FileNotFoundError(f"No existe el directorio derecho: {right_run_dir}")
+    if left_run_dir == right_run_dir:
+        raise ValueError("Las dos ejecuciones deben ser directorios distintos")
+
+    output_dir = (
+        Path(output_dir).expanduser().resolve()
+        if output_dir is not None
+        else _default_comparison_output_dir(left_run_dir, right_run_dir).resolve()
+    )
+    _validate_comparison_output_dir(output_dir, left_run_dir, right_run_dir)
+
+    left_files = _comparison_plot_files(left_run_dir)
+    right_files = _comparison_plot_files(right_run_dir)
+    artifacts = sorted(set(left_files) | set(right_files), key=str)
+    if not artifacts:
+        raise FileNotFoundError(
+            "No se encontraron figuras PNG en ninguna de las dos ejecuciones"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    plot_paths: dict[str, Path] = {}
+    for artifact in artifacts:
+        left_path = left_files.get(artifact)
+        right_path = right_files.get(artifact)
+        output_path = output_dir / artifact
+        _save_comparison_image(
+            left_path,
+            right_path,
+            left_run_dir=left_run_dir,
+            right_run_dir=right_run_dir,
+            artifact=artifact,
+            output_path=output_path,
+        )
+        relative_output = str(output_path.relative_to(output_dir))
+        plot_paths[str(artifact)] = output_path
+        rows.append(
+            {
+                "artifact": str(artifact),
+                "left_source": str(left_path) if left_path is not None else "",
+                "right_source": str(right_path) if right_path is not None else "",
+                "left_exists": left_path is not None,
+                "right_exists": right_path is not None,
+                "output_path": relative_output,
+            }
+        )
+
+    manifest_df = pd.DataFrame(
+        rows,
+        columns=[
+            "artifact",
+            "left_source",
+            "right_source",
+            "left_exists",
+            "right_exists",
+            "output_path",
+        ],
+    )
+    manifest_path = output_dir / "comparison_manifest.csv"
+    manifest_df.to_csv(manifest_path, index=False)
+    return {
+        "output_dir": output_dir,
+        "comparison_plot_paths": plot_paths,
+        "plot_paths": plot_paths,
+        "manifest_df": manifest_df,
+        "manifest_path": manifest_path,
+        "left_run_dir": left_run_dir,
+        "right_run_dir": right_run_dir,
+    }
 
 
 def _to_pd_series(obj: Any) -> pd.Series:
@@ -2685,11 +3377,27 @@ def render_run_figures(
     metric_gap_uncertainty_table_path = output_dir / "metrics_by_gap_uncertainty.csv"
     if not metric_gap_uncertainty_table_path.exists():
         metric_gap_uncertainty_table_path = None
+    metric_gap_mean_ci95_path = output_dir / "metrics_by_gap_mean_ci95.png"
+    if not metric_gap_mean_ci95_path.exists():
+        metric_gap_mean_ci95_path = None
+    metric_gap_mean_sd_path = output_dir / "metrics_by_gap_mean_sd.png"
+    if not metric_gap_mean_sd_path.exists():
+        metric_gap_mean_sd_path = None
+    metric_gap_risk_path = output_dir / "metrics_by_gap_risk.png"
+    if not metric_gap_risk_path.exists():
+        metric_gap_risk_path = None
+    metric_gap_risk_table_path = output_dir / "metrics_by_gap_risk.csv"
+    if not metric_gap_risk_table_path.exists():
+        metric_gap_risk_table_path = None
     existing_artifacts = {
         "metric_gap_plot_path": metric_gap_plot_path,
         "metric_gap_plot_paths": metric_gap_plot_paths,
         "metric_gap_uncertainty_plot_paths": metric_gap_uncertainty_plot_paths,
         "metric_gap_uncertainty_table_path": metric_gap_uncertainty_table_path,
+        "metric_gap_mean_ci95_path": metric_gap_mean_ci95_path,
+        "metric_gap_mean_sd_path": metric_gap_mean_sd_path,
+        "metric_gap_risk_path": metric_gap_risk_path,
+        "metric_gap_risk_table_path": metric_gap_risk_table_path,
         "plot_manifest_df": plot_manifest_df,
         "station_mean_grid_path": station_mean_grid_path,
     }
@@ -2701,14 +3409,43 @@ def render_run_figures(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Regenerate figures from the CSV artifacts in an existing run directory."""
+    """Regenerate one run or compare the figures from two existing runs."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("run_dir", type=Path, help="Directorio reports/benchmark/montecarlo_*")
+    parser.add_argument(
+        "run_dirs",
+        type=Path,
+        nargs="+",
+        metavar="RUN_DIR",
+        help="Una ejecucion para regenerar o dos ejecuciones para comparar",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directorio de salida para la comparacion de dos ejecuciones",
+    )
     args = parser.parse_args(argv)
-    if not args.run_dir.is_dir():
-        raise SystemExit(f"No existe el directorio: {args.run_dir}")
+    if len(args.run_dirs) > 2:
+        parser.error("indica una o dos ejecuciones, no mas")
+    if len(args.run_dirs) == 2:
+        artifacts = render_comparison_figures(
+            args.run_dirs[0],
+            args.run_dirs[1],
+            output_dir=args.output_dir,
+        )
+        print(f"[info] Comparacion guardada en {artifacts['output_dir']}")
+        print(f"[info] Manifiesto: {artifacts['manifest_path']}")
+        print(
+            f"[info] Generadas {len(artifacts['manifest_df'])} figuras comparativas"
+        )
+        return
 
-    artifacts = render_run_figures(args.run_dir)
+    if args.output_dir is not None:
+        parser.error("--output-dir solo se puede usar al comparar dos ejecuciones")
+    run_dir = args.run_dirs[0]
+    if not run_dir.is_dir():
+        raise SystemExit(f"No existe el directorio: {run_dir}")
+
+    artifacts = render_run_figures(run_dir)
     metric_path = artifacts["metric_gap_plot_path"]
     if metric_path is not None:
         print(f"[info] Figura guardada en {metric_path}")
@@ -2726,6 +3463,17 @@ def main(argv: list[str] | None = None) -> None:
             f"[info] Tabla de incertidumbre guardada en "
             f"{artifacts['metric_gap_uncertainty_table_path']}"
         )
+    if artifacts.get("metric_gap_mean_ci95_path") is not None:
+        print(
+            f"[info] Figura de media e IC95 guardada en "
+            f"{artifacts['metric_gap_mean_ci95_path']}"
+        )
+    if artifacts.get("metric_gap_mean_sd_path") is not None:
+        print(f"[info] Figura de media y SD guardada en {artifacts['metric_gap_mean_sd_path']}")
+    if artifacts.get("metric_gap_risk_path") is not None:
+        print(f"[info] Figura de riesgo guardada en {artifacts['metric_gap_risk_path']}")
+    if artifacts.get("metric_gap_risk_table_path") is not None:
+        print(f"[info] Tabla de riesgo guardada en {artifacts['metric_gap_risk_table_path']}")
     for key in (
         "model_performance_by_gap_plot_paths",
         "overall_model_performance_plot_paths",
@@ -2740,7 +3488,7 @@ def main(argv: list[str] | None = None) -> None:
     for path in artifacts["diagnostic_table_paths"].values():
         print(f"[info] Tabla diagnostica guardada en {path}")
     manifest = artifacts["plot_manifest_df"]
-    print(f"[info] Regeneradas {len(manifest)} figuras en {args.run_dir / 'plots'}")
+    print(f"[info] Regeneradas {len(manifest)} figuras en {run_dir / 'plots'}")
 
 
 if __name__ == "__main__":

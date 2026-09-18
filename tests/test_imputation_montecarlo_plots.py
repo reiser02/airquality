@@ -5,9 +5,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib import pyplot as plt
 
 from airquality.visualizations.montecarlo import (
     _aggregate_metrics_by_gap,
+    _comparison_panel_title,
     _error_correlation_table,
     _gap_degradation_table,
     _global_performance_profile_table,
@@ -16,6 +18,7 @@ from airquality.visualizations.montecarlo import (
     _model_performance_tables,
     _pairwise_win_rate_table,
     _tail_risk_table,
+    render_comparison_figures,
     render_run_figures,
 )
 
@@ -262,9 +265,31 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
     assert artifacts["metric_gap_uncertainty_table_path"] == (
         tmp_path / "metrics_by_gap_uncertainty.csv"
     )
+    assert artifacts["metric_gap_mean_ci95_path"] == (
+        tmp_path / "metrics_by_gap_mean_ci95.png"
+    )
+    assert artifacts["metric_gap_mean_ci95_path"].exists()
+    assert artifacts["metric_gap_mean_sd_path"] == (
+        tmp_path / "metrics_by_gap_mean_sd.png"
+    )
+    assert artifacts["metric_gap_mean_sd_path"].exists()
+    assert artifacts["metric_gap_risk_path"] == tmp_path / "metrics_by_gap_risk.png"
+    assert artifacts["metric_gap_risk_path"].exists()
+    assert artifacts["metric_gap_risk_table_path"] == (
+        tmp_path / "metrics_by_gap_risk.csv"
+    )
+    assert artifacts["metric_gap_risk_table_path"].exists()
     uncertainty_table = pd.read_csv(tmp_path / "metrics_by_gap_uncertainty.csv")
     assert set(uncertainty_table["Metric"]) == {"MASE", "RMSSE", "R2"}
     assert uncertainty_table["N_Stations"].eq(3).all()
+    risk_table = pd.read_csv(tmp_path / "metrics_by_gap_risk.csv")
+    assert set(risk_table["Metric"]) == {"MASE", "RMSSE", "R2"}
+    assert set(risk_table.loc[risk_table["Metric"] == "R2", "Tail_Statistic"]) == {
+        "P05"
+    }
+    assert set(
+        risk_table.loc[risk_table["Metric"] != "R2", "Tail_Statistic"]
+    ) == {"P95"}
     assert artifacts["station_mean_grid_path"] == (
         tmp_path / "plots" / "media_estaciones_grid.png"
     )
@@ -276,10 +301,10 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         "pairwise_win_rate_plot_paths",
         "error_correlation_plot_paths",
     ):
-        assert set(artifacts[key]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
+        assert set(artifacts[key]) == {"MASE", "RMSSE", "R2"}
         assert all(path.exists() for path in artifacts[key].values())
     for key in ("gap_degradation_plot_paths", "tail_risk_plot_paths"):
-        assert set(artifacts[key]) == {"MAE", "RMSE", "MASE", "RMSSE"}
+        assert set(artifacts[key]) == {"MASE", "RMSSE"}
         assert all(path.exists() for path in artifacts[key].values())
 
     expected_tables = (
@@ -299,7 +324,7 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
         tmp_path / filename for filename in expected_tables
     }
     gap_table = pd.read_csv(tmp_path / "model_performance_by_gap.csv")
-    assert set(gap_table["Metric"]) == {"MAE", "RMSE", "MASE", "RMSSE", "R2"}
+    assert set(gap_table["Metric"]) == {"MASE", "RMSSE", "R2"}
     assert gap_table["N_Stations"].eq(3).all()
     for gap in (1, 2, 5, 10):
         assert (tmp_path / "plots" / f"gap_{gap}" / "media_estaciones.png").exists()
@@ -308,3 +333,56 @@ def test_render_run_figures_adds_compact_global_summaries(tmp_path: Path) -> Non
     )
     assert set(aggregate_rows["gap_size"]) == {1, 2, 5, 10}
     assert all(not (tmp_path / filename).exists() for filename in obsolete_plots)
+
+
+def test_render_comparison_figures_pairs_run_plots_and_keeps_only_station_grid(
+    tmp_path: Path,
+) -> None:
+    left_dir = tmp_path / "montecarlo_no2"
+    right_dir = tmp_path / "montecarlo_o3"
+    output_dir = tmp_path / "comparison"
+    left_dir.mkdir()
+    right_dir.mkdir()
+
+    image = np.zeros((4, 6, 3), dtype=float)
+    plt.imsave(left_dir / "shared.png", image)
+    plt.imsave(right_dir / "shared.png", image + 0.25)
+    plt.imsave(left_dir / "left_only.png", image)
+    plt.imsave(right_dir / "right_only.png", image)
+    (left_dir / "plots" / "gap_1").mkdir(parents=True)
+    (right_dir / "plots" / "gap_1").mkdir(parents=True)
+    plt.imsave(
+        left_dir / "plots" / "media_estaciones_grid.png", image,
+    )
+    plt.imsave(
+        right_dir / "plots" / "media_estaciones_grid.png", image + 0.5,
+    )
+    plt.imsave(left_dir / "plots" / "gap_1" / "AQ1.png", image)
+    plt.imsave(right_dir / "plots" / "gap_1" / "AQ1.png", image)
+
+    artifacts = render_comparison_figures(
+        left_dir,
+        right_dir,
+        output_dir=output_dir,
+    )
+
+    assert set(artifacts["comparison_plot_paths"]) == {
+        "left_only.png",
+        "plots/media_estaciones_grid.png",
+        "right_only.png",
+        "shared.png",
+    }
+    assert all(path.exists() for path in artifacts["comparison_plot_paths"].values())
+    assert (output_dir / "plots" / "media_estaciones_grid.png").exists()
+    assert not (output_dir / "plots" / "gap_1" / "AQ1.png").exists()
+    manifest = pd.read_csv(artifacts["manifest_path"])
+    assert len(manifest) == 4
+    left_only = manifest.set_index("artifact").loc["left_only.png"]
+    assert bool(left_only["left_exists"])
+    assert not bool(left_only["right_exists"])
+    assert _comparison_panel_title(
+        Path("metrics_by_gap_r2.png"), left_dir
+    ) == "R2 NO2"
+    assert _comparison_panel_title(
+        Path("metrics_by_gap_r2.png"), right_dir
+    ) == "R2 O3"

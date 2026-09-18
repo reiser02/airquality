@@ -121,6 +121,14 @@ def main() -> None:
             f"[info] Metric uncertainty table: "
             f"{artifacts['metric_gap_uncertainty_table_path']}"
         )
+    if artifacts.get("metric_gap_mean_ci95_path") is not None:
+        print(f"[info] Mean plus CI95 plot: {artifacts['metric_gap_mean_ci95_path']}")
+    if artifacts.get("metric_gap_mean_sd_path") is not None:
+        print(f"[info] Mean plus SD plot: {artifacts['metric_gap_mean_sd_path']}")
+    if artifacts.get("metric_gap_risk_path") is not None:
+        print(f"[info] Metric risk plot: {artifacts['metric_gap_risk_path']}")
+    if artifacts.get("metric_gap_risk_table_path") is not None:
+        print(f"[info] Metric risk table: {artifacts['metric_gap_risk_table_path']}")
     summary_plot_count = sum(
         len(artifacts.get(key, {}))
         for key in (
