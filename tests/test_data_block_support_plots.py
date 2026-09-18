@@ -29,6 +29,90 @@ def test_gap_recovery_reconciles_support_before_and_after_imputation() -> None:
     assert totals["effective_training_hours"] == 110
 
 
+def test_support_overview_uses_effective_training_hours(
+    tmp_path, monkeypatch
+) -> None:
+    table = pd.DataFrame(
+        [
+            {
+                "arm": "inject-vote+impute",
+                "stage": "imputed",
+                "minimum_hours": 84,
+                "effective_training_hours": 110,
+                "effective_imputed_hours": 10,
+                "used_blocks": 3,
+            }
+        ]
+    )
+    captured = {}
+    monkeypatch.setattr(
+        block_support,
+        "save_figure",
+        lambda figure, _path: captured.setdefault("figure", figure),
+    )
+
+    assert block_support._save_support_overview(
+        tmp_path / "support.png", table, "NO2"
+    )
+
+    patches = captured["figure"].axes[0].patches
+    assert [patch.get_width() for patch in patches] == [100, 10]
+
+
+def test_detected_distribution_labels_raw_without_segment_count(
+    tmp_path, monkeypatch
+) -> None:
+    table = pd.DataFrame(
+        [
+            {
+                "arm": "raw",
+                "stage": "raw",
+                "strategy": "none",
+                "minimum_hours": 84,
+            }
+        ]
+    )
+    blocks = pd.DataFrame(
+        [
+            {"arm": "raw", "stage": "raw", "strategy": "none", "hours": 100},
+            {"arm": "raw", "stage": "raw", "strategy": "none", "hours": 200},
+            {
+                "arm": "inject-vote+noimpute",
+                "stage": "detected",
+                "strategy": "inject-vote",
+                "hours": 90,
+            },
+        ]
+    )
+    captured = {}
+    monkeypatch.setattr(
+        block_support,
+        "save_figure",
+        lambda figure, _path: captured.setdefault("figure", figure),
+    )
+
+    assert block_support._save_detected_block_distribution(
+        tmp_path / "distribution.png", blocks, table, "NO2"
+    )
+
+    texts = [
+        text.get_text()
+        for axis in captured["figure"].axes
+        for text in axis.texts
+    ]
+    titles = [axis.get_title(loc="left") for axis in captured["figure"].axes]
+    legend_labels = [
+        text.get_text()
+        for legend in captured["figure"].legends
+        for text in legend.get_texts()
+    ]
+    assert "Raw" in legend_labels
+    assert not any("Raw (2 segmentos)" in label for label in legend_labels)
+    assert any("Línea verde: mínimo del protocolo (84 h)" in label for label in legend_labels)
+    assert not any("Raw: 2 segmentos" in title for title in titles)
+    assert not any("Raw: 2 segmentos" in text for text in texts)
+
+
 def test_effective_imputation_age_uses_only_training_points() -> None:
     table = pd.DataFrame(
         [
@@ -171,6 +255,7 @@ def test_render_plots_reads_training_support_csv(tmp_path, monkeypatch) -> None:
                 "valid_imputed_preexisting_gap_hours": imputed - imputed // 2,
                 "effective_imputed_hours": imputed,
                 "valid_hours_pct_raw": valid,
+                "effective_hours_pct_raw": 100,
                 "imputation_gain_valid_hours": 30 if stage == "imputed" else 0,
                 "imputation_gain_effective_hours": 30 if stage == "imputed" else 0,
                 "imputed_valid_age_hours_median": 96 if stage == "imputed" else np.nan,
@@ -294,6 +379,7 @@ def test_render_plots_handles_zero_gain_and_missing_strategy_age(tmp_path) -> No
                 "valid_imputed_preexisting_gap_hours": 0,
                 "effective_imputed_hours": 0,
                 "valid_hours_pct_raw": 100,
+                "effective_hours_pct_raw": 100,
                 "imputation_gain_valid_hours": 0,
                 "imputation_gain_effective_hours": 0,
                 "imputed_valid_age_hours_median": float("nan"),

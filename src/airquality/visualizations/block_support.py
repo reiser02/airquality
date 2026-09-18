@@ -59,15 +59,9 @@ SERIES_REQUIRED = {
     "observed_hours",
     "total_blocks",
     "valid_blocks",
-    "valid_hours",
-    "valid_real_hours",
-    "valid_imputed_hours",
-    "valid_imputed_anomaly_hours",
-    "valid_imputed_preexisting_gap_hours",
     "effective_imputed_hours",
     "imputation_gain_effective_hours",
-    "valid_hours_pct_raw",
-    "imputation_gain_valid_hours",
+    "effective_hours_pct_raw",
     "imputed_valid_age_hours_median",
     "used_blocks",
     "effective_training_hours",
@@ -76,18 +70,18 @@ SERIES_REQUIRED = {
 PLOT_GUIDE = """## Figuras
 
 - Todas las comparaciones de deteccion e imputacion usan exclusivamente la estrategia `inject-vote`; `raw` se conserva como referencia.
-- `retention_overview.png`: resume el historial raw. Muestra el porcentaje y la cantidad absoluta de bloques usados y horas efectivas de entrenamiento; las horas ya descuentan la reserva de validación.
-- `block_length_distribution.png`: distribución de longitudes de los bloques raw. Las líneas verticales marcan el mínimo de entrenamiento y el mínimo del bloque anfitrión que además debe alojar la validación.
+- `retention_overview.png`: resume el historial raw. Muestra el porcentaje y la cantidad absoluta de segmentos usados y horas efectivas de entrenamiento; las horas ya descuentan la reserva de validación.
+- `block_length_distribution.png`: distribución de longitudes de los segmentos raw. Las líneas verticales marcan el mínimo de entrenamiento y el mínimo del segmento anfitrión que además debe alojar la validación.
 - `retention_overview_{detected,imputed}.png`: aplica el mismo resumen de retencion al historial tras deteccion `inject-vote`, sin y con imputacion.
-- `block_length_distribution_{detected,imputed}.png`: aplica la misma distribucion de longitudes a los bloques resultantes de `inject-vote`, sin y con imputacion.
+- `block_length_distribution_{detected,imputed}.png`: aplica la misma distribucion de longitudes a los segmentos resultantes de `inject-vote`, sin y con imputacion.
 - `retained_hours_by_series_{detected,imputed}.png`: porcentaje de horas efectivas retenidas por serie tras `inject-vote`, sin y con imputacion.
-- `usable_blocks_by_series_{detected,imputed}.png`: bloques utilizados por serie tras `inject-vote`, sin y con imputacion.
+- `usable_blocks_by_series_{detected,imputed}.png`: segmentos utilizados por serie tras `inject-vote`, sin y con imputacion.
 - `detected_block_length_distribution.png`: muestra, por estrategia, dos paneles consecutivos: raw frente a detección y detección frente a imputación. El panel derecho incorpora el resumen numérico efectivo de `gap_recovery`.
-- `support_overview.png`: horas observadas e imputadas dentro de bloques válidos para cada brazo. La etiqueta indica también cuántos bloques alcanzan el mínimo del protocolo.
-- `support_by_series.png`: soporte válido de cada brazo respecto a raw para cada serie. Un valor de 100 conserva el mismo número de horas; menos de 100 pierde soporte y más de 100 lo amplía.
-- `valid_blocks_by_series.png`: cantidad absoluta de bloques que alcanzan el mínimo del protocolo en cada serie y brazo. Más bloques no implica necesariamente más horas, porque sus longitudes difieren.
-- `block_length_survival.png`: para cada longitud del eje X muestra cuántos bloques tienen al menos esa duración. Permite ver cómo detección e imputación fragmentan o conectan el historial.
-- `gap_recovery.png`: parte de las horas efectivas antes de imputar y añade las horas imputadas y las horas observadas desbloqueadas dentro de los bloques usados; la etiqueta muestra el total efectivo final.
+- `support_overview.png`: horas observadas e imputadas dentro de segmentos efectivamente usados para cada brazo. La etiqueta indica también cuántos segmentos se usan.
+- `support_by_series.png`: soporte efectivo de cada brazo respecto a raw para cada serie. Un valor de 100 conserva el mismo número de horas efectivas; menos de 100 pierde soporte y más de 100 lo amplía.
+- `valid_blocks_by_series.png`: cantidad absoluta de segmentos que alcanzan el mínimo del protocolo en cada serie y brazo. Más segmentos no implica necesariamente más horas, porque sus longitudes difieren.
+- `block_length_survival.png`: para cada longitud del eje X muestra cuántos segmentos tienen al menos esa duración. Permite ver cómo detección e imputación fragmentan o conectan el historial.
+- `gap_recovery.png`: parte de las horas efectivas antes de imputar y añade las horas imputadas y las horas observadas recuperadas dentro de los segmentos usados; la etiqueta muestra el total efectivo final.
 - `detection_strategy_summary.png`: muestra qué porcentaje del historial pudo puntuar `inject-vote` y qué porcentaje terminó retirando como anomalía. Una hora recibe score cuando hay suficientes salidas válidas de detectores para clasificarla.
 - `imputation_age.png`: distribuye por tramos de antigüedad la ganancia efectiva de la imputación, separando las horas rellenadas de las observaciones reales que pasan a formar segmentos suficientemente largos.
 """
@@ -97,20 +91,22 @@ def _arm_order(table: pd.DataFrame) -> list[str]:
     return list(dict.fromkeys(table["arm"].astype(str)))
 
 
-def _stage_rows(table: pd.DataFrame, stage: str) -> pd.DataFrame:
+def _stage_rows(
+    table: pd.DataFrame, stage: str, *, strategy: str = PLOT_STRATEGY
+) -> pd.DataFrame:
     """Select raw or the configured plotting strategy at one processing stage."""
     if stage == "raw":
         return table.loc[table["arm"] == "raw"]
     return table.loc[
-        (table["stage"] == stage) & (table["strategy"] == PLOT_STRATEGY)
+        (table["stage"] == stage) & (table["strategy"] == strategy)
     ]
 
 
-def _stage_description(stage: str) -> str:
+def _stage_description(stage: str, strategy: str = PLOT_STRATEGY) -> str:
     if stage == "detected":
-        return f"tras deteccion {PLOT_STRATEGY}"
+        return f"tras deteccion {strategy}"
     if stage == "imputed":
-        return f"tras deteccion {PLOT_STRATEGY} e imputacion"
+        return f"tras deteccion {strategy} e imputacion"
     return "raw"
 
 
@@ -129,9 +125,14 @@ def _figure_header(
 
 
 def _save_retention_overview(
-    path: Path, table: pd.DataFrame, pollutant: str, *, stage: str = "raw"
+    path: Path,
+    table: pd.DataFrame,
+    pollutant: str,
+    *,
+    stage: str = "raw",
+    strategy: str = PLOT_STRATEGY,
 ) -> bool:
-    selected = _stage_rows(table, stage)
+    selected = _stage_rows(table, stage, strategy=strategy)
     if selected.empty:
         return False
     total_blocks = int(selected["total_blocks"].sum())
@@ -153,7 +154,7 @@ def _save_retention_overview(
         width,
         color="#8c6d4b",
         edgecolor=EDGE_COLOR,
-        label="Bloques usados",
+        label="Segmentos usados",
     )
     hour_bars = axis.bar(
         positions + width / 2,
@@ -164,7 +165,7 @@ def _save_retention_overview(
         label="Horas efectivas",
     )
     for bars, percentages, counts, unit in (
-        (block_bars, block_pct, np.asarray([used_blocks]), "bloques"),
+            (block_bars, block_pct, np.asarray([used_blocks]), "segmentos"),
         (hour_bars, hour_pct, np.asarray([effective_hours]), "horas"),
     ):
         axis.bar_label(
@@ -180,18 +181,18 @@ def _save_retention_overview(
     axis.set_xticks(
         positions,
         [
-            f"{_stage_description(stage)}\ntrain >= {minimum_hours} h; "
+            f"{_stage_description(stage, strategy)}\ntrain >= {minimum_hours} h; "
             f"anfitrión >= {host_minimum_hours} h"
         ],
     )
     axis.set_ylim(0, 105)
-    axis.set_ylabel(f"Porcentaje del historial {_stage_description(stage)}")
+    axis.set_ylabel(f"Porcentaje del historial {_stage_description(stage, strategy)}")
     axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.6)
     axis.legend(loc="lower center", bbox_to_anchor=(0.5, -0.22), ncols=2)
     _figure_header(
         figure,
-        f"Retención del historial {_stage_description(stage)} para entrenamiento",
-        "Compara cuántos bloques se usan y cuántas horas efectivas conserva el protocolo; "
+        f"Retención del historial {_stage_description(stage, strategy)} para entrenamiento",
+        "Compara cuántos segmentos se usan y cuántas horas efectivas conserva el protocolo; "
         "las horas descuentan la reserva de validación.",
         pollutant,
     )
@@ -207,9 +208,10 @@ def _save_block_distribution(
     pollutant: str,
     *,
     stage: str = "raw",
+    strategy: str = PLOT_STRATEGY,
 ) -> bool:
-    selected_blocks = _stage_rows(blocks, stage)
-    selected_table = _stage_rows(table, stage)
+    selected_blocks = _stage_rows(blocks, stage, strategy=strategy)
+    selected_table = _stage_rows(table, stage, strategy=strategy)
     if selected_blocks.empty or selected_table.empty:
         return False
     lengths = selected_blocks["hours"].to_numpy(dtype=float)
@@ -240,16 +242,16 @@ def _save_block_distribution(
     axis.set_xscale("log")
     axis.set_yscale("log")
     axis.set_xlabel(
-        f"Longitud del bloque {_stage_description(stage)} (horas, escala log)"
+        f"Longitud del segmento {_stage_description(stage, strategy)} (horas, escala log)"
     )
-    axis.set_ylabel("Número de bloques (escala log)")
+    axis.set_ylabel("Número de segmentos (escala log)")
     axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
     axis.legend(ncols=2, loc="upper right", fontsize=8)
     _figure_header(
         figure,
-        f"Distribución de bloques del historial {_stage_description(stage)}",
-        "Cada hueco temporal o valor ausente rompe un bloque; las líneas marcan los mínimos "
-        "de entrenamiento y de bloque anfitrión del protocolo único.",
+        f"Distribución de segmentos del historial {_stage_description(stage, strategy)}",
+        "Cada hueco temporal o valor ausente rompe un segmento; las líneas marcan los mínimos "
+        "de entrenamiento y de segmento anfitrión del protocolo único.",
         pollutant,
     )
     figure.tight_layout(rect=(0.03, 0.03, 0.98, 0.86))
@@ -268,9 +270,10 @@ def _save_series_comparison(
     subtitle: str,
     xlabel: str,
     xlim: tuple[float, float] | None = None,
+    strategy: str = PLOT_STRATEGY,
 ) -> bool:
-    """Compare one inject-vote support value across the retained series."""
-    selected = _stage_rows(table, stage).copy()
+    """Compare one strategy support value across the retained series."""
+    selected = _stage_rows(table, stage, strategy=strategy).copy()
     if selected.empty:
         return False
     if value_column == "retained_pct":
@@ -375,12 +378,20 @@ def _save_detected_block_distribution(
                 minimum,
                 color=RECOVERED_COLOR,
                 linestyle="--",
-                label=f"Mínimo: {minimum} h",
+                label=(
+                    f"Línea verde: mínimo del protocolo ({minimum} h); "
+                    f"segmentos >= {minimum} h"
+                ),
             )
             axis.set_xscale("log")
             axis.set_yscale("log")
-            axis.set_xlabel("Longitud del bloque (h, escala log)")
-            axis.set_title(f"{strategy} · {stage_label}", loc="left", fontweight="bold", color=TEXT_COLOR)
+            axis.set_xlabel("Longitud del segmento (h, escala log)")
+            axis.set_title(
+                f"{strategy} · {stage_label}",
+                loc="left",
+                fontweight="bold",
+                color=TEXT_COLOR,
+            )
             axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
             if stage == "imputed":
                 recovery = _gap_recovery_totals(table)
@@ -391,7 +402,7 @@ def _save_detected_block_distribution(
                         "Balance de soporte efectivo\n"
                         f"Base entrenable tras detección: {int(row['valid_before']):,} h\n"
                         f"Relleno hecho por el imputador: {int(row['imputed_valid']):,} h\n"
-                        "Observaciones reales que pasan a bloques utilizables: "
+                        "Observaciones reales que pasan a segmentos utilizables: "
                         f"{int(row['observed_unlocked']):,} h\n"
                         f"Total entrenable final: {int(row['effective_training_hours']):,} h"
                     ).replace(",", ".")
@@ -410,7 +421,7 @@ def _save_detected_block_distribution(
                             "alpha": 0.9,
                         },
                     )
-    axes[0, 0].set_ylabel("Número de bloques (escala log)")
+    axes[0, 0].set_ylabel("Número de segmentos (escala log)")
     handles: list[object] = []
     labels: list[str] = []
     for axis in axes[0]:
@@ -422,7 +433,7 @@ def _save_detected_block_distribution(
     figure.legend(handles, labels, loc="lower center", ncols=4, fontsize=8)
     _figure_header(
         figure,
-        "Evolución de bloques: detección e imputación",
+        "Evolución de segmentos: detección e imputación",
         "Raw frente a detección a la izquierda; detección frente a imputación a la derecha. "
         "Ejes logarítmicos compartidos.",
         pollutant,
@@ -445,9 +456,9 @@ def _save_support_overview(
     if table.empty:
         return False
     totals = table.groupby("arm", sort=False).agg(
-        valid_real_hours=("valid_real_hours", "sum"),
-        valid_imputed_hours=("valid_imputed_hours", "sum"),
-        valid_blocks=("valid_blocks", "sum"),
+        effective_training_hours=("effective_training_hours", "sum"),
+        effective_imputed_hours=("effective_imputed_hours", "sum"),
+        used_blocks=("used_blocks", "sum"),
     )
     arms = _arm_order(table)
     figure, axes = plt.subplots(
@@ -458,8 +469,11 @@ def _save_support_overview(
     style_axis(axis)
     selected = totals.reindex(arms)
     positions = np.arange(len(arms))
-    real = selected["valid_real_hours"].fillna(0).to_numpy(dtype=float)
-    imputed = selected["valid_imputed_hours"].fillna(0).to_numpy(dtype=float)
+    effective = selected["effective_training_hours"].fillna(0).to_numpy(dtype=float)
+    imputed = selected["effective_imputed_hours"].fillna(0).to_numpy(dtype=float)
+    real = effective - imputed
+    if np.any(real < 0):
+        raise ValueError("Las horas imputadas efectivas superan el soporte efectivo total")
     axis.barh(positions, real, color=RAW_COLOR, edgecolor=EDGE_COLOR, label="Observado")
     axis.barh(
         positions, imputed, left=real, color=IMPUTED_COLOR,
@@ -467,18 +481,18 @@ def _save_support_overview(
     )
     for position, total, blocks in zip(
         positions,
-        real + imputed,
-        selected["valid_blocks"].fillna(0).to_numpy(dtype=int),
+        effective,
+        selected["used_blocks"].fillna(0).to_numpy(dtype=int),
         strict=True,
     ):
         axis.text(
-            total, position, f"  {int(total):,} h | {blocks} bloques",
+            total, position, f"  {int(total):,} h | {blocks} segmentos",
             va="center", fontsize=8, color=TEXT_COLOR,
         )
     minimum = int(table["minimum_hours"].iloc[0])
     axis.set_yticks(positions, arms, fontsize=8)
     axis.invert_yaxis()
-    axis.set_xlabel("Horas en bloques validos")
+    axis.set_xlabel("Horas efectivas de entrenamiento")
     axis.set_title(
         f"Protocolo (minimo {minimum} h)",
         loc="left", fontweight="bold", color=TEXT_COLOR,
@@ -489,9 +503,9 @@ def _save_support_overview(
     figure.legend(handles, labels, loc="lower center", ncols=2)
     _figure_header(
         figure,
-        "Soporte válido después de detección e imputación",
-        "Horas observadas e imputadas que pertenecen a bloques suficientemente largos; "
-        "cada etiqueta añade la cantidad de bloques válidos.",
+        "Soporte efectivo después de detección e imputación",
+        "Horas observadas e imputadas dentro de segmentos usados, descontando la reserva de "
+        "validación; cada etiqueta añade la cantidad de segmentos usados.",
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.08, 1, 0.88))
@@ -580,16 +594,16 @@ def _save_block_survival(
     )
     axis.set_xscale("log")
     axis.set_yscale("log")
-    axis.set_xlabel("Longitud mínima del bloque (h)")
-    axis.set_ylabel("Bloques con al menos esa longitud")
+    axis.set_xlabel("Longitud mínima del segmento (h)")
+    axis.set_ylabel("Segmentos con al menos esa longitud")
     axis.set_title("Protocolo", loc="left", fontweight="bold")
     axis.grid(True, which="major", color=GRID_COLOR, linestyle="--", alpha=0.55)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="lower center", ncols=min(4, len(labels)), fontsize=8)
     _figure_header(
         figure,
-        "Cuántos bloques sobreviven a cada longitud mínima",
-        "Cada curva cuenta bloques con al menos la duración del eje X; la línea roja marca "
+        "Cuántos segmentos sobreviven a cada longitud mínima",
+        "Cada curva cuenta segmentos con al menos la duración del eje X; la línea roja marca "
         "el mínimo exigido por el protocolo.",
         pollutant,
     )
@@ -643,7 +657,7 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
         ("imputed_valid", "Puntos rellenados por el imputador", IMPUTED_COLOR),
         (
             "observed_unlocked",
-            "Observaciones reales en bloques utilizables",
+            "Observaciones reales en segmentos utilizables",
             RECOVERED_COLOR,
         ),
     ):
@@ -687,12 +701,12 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
     axis.grid(axis="y", color=GRID_COLOR, linestyle="--", alpha=0.55)
     axis.margins(y=0.22)
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="lower center", ncols=3, fontsize=8)
+    figure.legend(handles, labels, loc="lower center", ncols=2, fontsize=8)
     _figure_header(
         figure,
         "Cómo la imputación convierte segmentos en soporte efectivo",
-        "Solo cuenta los bloques usados antes del holdout y descuenta la reserva de "
-        "validación; separa puntos imputados de observaciones desbloqueadas.",
+        "Solo cuenta los segmentos usados antes del holdout y descuenta la reserva de\n"
+        "validación; separa puntos imputados de observaciones recuperadas.",
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.13, 1, 0.86))
@@ -701,10 +715,16 @@ def _save_gap_recovery(path: Path, table: pd.DataFrame, pollutant: str) -> bool:
 
 
 def _save_detection_summary(
-    path: Path, detection: pd.DataFrame, pollutant: str
+    path: Path,
+    detection: pd.DataFrame,
+    pollutant: str,
+    *,
+    strategy: str | None = None,
 ) -> bool:
     if detection.empty:
         return False
+    strategies = list(dict.fromkeys(detection["strategy"].astype(str)))
+    display_strategy = strategy or (strategies[0] if len(strategies) == 1 else PLOT_STRATEGY)
     totals = detection.groupby("strategy", sort=False).agg(
         observed=("observed_hours", "sum"),
         scored=("scored_hours", "sum"),
@@ -727,9 +747,9 @@ def _save_detection_summary(
     axes[1].set_title("Observaciones retiradas", loc="left", fontweight="bold")
     _figure_header(
         figure,
-        f"Cobertura y agresividad de la estrategia {PLOT_STRATEGY}",
+        f"Cobertura y agresividad de la estrategia {display_strategy}",
         "Una hora recibe score cuando hay suficientes salidas válidas de detectores para "
-        "clasificarla; gaps, bloques demasiado cortos y fallos quedan sin score.",
+        "clasificarla; gaps, segmentos demasiado cortos y fallos quedan sin score.",
         pollutant,
     )
     figure.tight_layout(rect=(0.02, 0.02, 1, 0.84))
@@ -738,12 +758,26 @@ def _save_detection_summary(
 
 
 def _effective_imputation_age_points(
-    table: pd.DataFrame, blocks: pd.DataFrame, gaps: pd.DataFrame
+    table: pd.DataFrame,
+    blocks: pd.DataFrame,
+    gaps: pd.DataFrame,
+    *,
+    strategy: str | None = None,
 ) -> pd.DataFrame:
     """Locate every imputed hour that remains in effective training support."""
+    available_strategies = list(
+        dict.fromkeys(
+            table.loc[table["stage"] == "imputed", "strategy"].astype(str)
+        )
+    )
+    selected_strategy = strategy or (
+        available_strategies[0]
+        if len(available_strategies) == 1
+        else PLOT_STRATEGY
+    )
     selected = table.loc[
         (table["stage"] == "imputed")
-        & (table["strategy"] == PLOT_STRATEGY)
+        & (table["strategy"] == selected_strategy)
         & table["imputed_valid_age_hours_median"].notna()
     ].copy()
     if selected.empty:
@@ -752,10 +786,10 @@ def _effective_imputation_age_points(
         )
 
     support_blocks = blocks.loc[
-        (blocks["strategy"] == PLOT_STRATEGY) & blocks["used"].astype(bool)
+        (blocks["strategy"] == selected_strategy) & blocks["used"].astype(bool)
     ].copy()
     selected_gaps = gaps.loc[
-        (gaps["strategy"] == PLOT_STRATEGY)
+        (gaps["strategy"] == selected_strategy)
         & gaps["fully_filled"].astype(bool)
     ].copy()
     selected["test_target_start"] = pd.to_datetime(selected["test_target_start"])
@@ -835,8 +869,12 @@ def _save_imputation_age(
     blocks: pd.DataFrame,
     gaps: pd.DataFrame,
     pollutant: str,
+    *,
+    strategy: str | None = None,
 ) -> bool:
-    points = _effective_imputation_age_points(table, blocks, gaps)
+    points = _effective_imputation_age_points(
+        table, blocks, gaps, strategy=strategy
+    )
     if points.empty:
         return False
     by_age = (
@@ -923,7 +961,9 @@ def _save_imputation_age(
     return True
 
 
-def render_plots(run_dir: Path) -> list[Path]:
+def render_plots(
+    run_dir: Path, *, strategy: str = PLOT_STRATEGY
+) -> list[Path]:
     """Validate persisted tables and render all support figures."""
     series_path = run_dir / "series_summary.csv"
     blocks_path = run_dir / "blocks.csv"
@@ -945,49 +985,53 @@ def render_plots(run_dir: Path) -> list[Path]:
     blocks = pd.read_csv(blocks_path)
     gaps = pd.read_csv(gaps_path)
     detection = pd.read_csv(detection_path)
-    strategy_rows = series.loc[series["strategy"] == PLOT_STRATEGY]
+    strategy_rows = series.loc[series["strategy"] == strategy]
     if strategy_rows.empty:
         raise ValueError(
-            f"El reporte no contiene resultados para la estrategia {PLOT_STRATEGY}"
+            f"El reporte no contiene resultados para la estrategia {strategy}"
         )
     series = series.loc[
-        (series["arm"] == "raw") | (series["strategy"] == PLOT_STRATEGY)
+        (series["arm"] == "raw") | (series["strategy"] == strategy)
     ].copy()
     blocks = blocks.loc[
-        (blocks["arm"] == "raw") | (blocks["strategy"] == PLOT_STRATEGY)
+        (blocks["arm"] == "raw") | (blocks["strategy"] == strategy)
     ].copy()
-    detection = detection.loc[detection["strategy"] == PLOT_STRATEGY].copy()
+    detection = detection.loc[detection["strategy"] == strategy].copy()
     builders = (
         (
             "retention_overview.png",
-            lambda p: _save_retention_overview(p, series, pollutant),
+            lambda p: _save_retention_overview(
+                p, series, pollutant, strategy=strategy
+            ),
         ),
         (
             "block_length_distribution.png",
-            lambda p: _save_block_distribution(p, blocks, series, pollutant),
+            lambda p: _save_block_distribution(
+                p, blocks, series, pollutant, strategy=strategy
+            ),
         ),
         (
             "retention_overview_detected.png",
             lambda p: _save_retention_overview(
-                p, series, pollutant, stage="detected"
+                p, series, pollutant, stage="detected", strategy=strategy
             ),
         ),
         (
             "retention_overview_imputed.png",
             lambda p: _save_retention_overview(
-                p, series, pollutant, stage="imputed"
+                p, series, pollutant, stage="imputed", strategy=strategy
             ),
         ),
         (
             "block_length_distribution_detected.png",
             lambda p: _save_block_distribution(
-                p, blocks, series, pollutant, stage="detected"
+                p, blocks, series, pollutant, stage="detected", strategy=strategy
             ),
         ),
         (
             "block_length_distribution_imputed.png",
             lambda p: _save_block_distribution(
-                p, blocks, series, pollutant, stage="imputed"
+                p, blocks, series, pollutant, stage="imputed", strategy=strategy
             ),
         ),
         (
@@ -1001,10 +1045,11 @@ def render_plots(run_dir: Path) -> list[Path]:
                 title="Horas de entrenamiento retenidas tras deteccion",
                 subtitle=(
                     "Porcentaje del historial observado tras retirar las anomalias de "
-                    f"{PLOT_STRATEGY}, despues de reservar validacion."
+                    f"{strategy}, despues de reservar validacion."
                 ),
                 xlabel="Horas retenidas (%)",
                 xlim=(0, 101),
+                strategy=strategy,
             ),
         ),
         (
@@ -1017,11 +1062,12 @@ def render_plots(run_dir: Path) -> list[Path]:
                 value_column="retained_pct",
                 title="Horas de entrenamiento retenidas tras deteccion e imputacion",
                 subtitle=(
-                    f"Porcentaje del historial {PLOT_STRATEGY}+impute, despues de "
+                    f"Porcentaje del historial {strategy}+impute, despues de "
                     "reservar validacion."
                 ),
                 xlabel="Horas retenidas (%)",
                 xlim=(0, 101),
+                strategy=strategy,
             ),
         ),
         (
@@ -1032,12 +1078,13 @@ def render_plots(run_dir: Path) -> list[Path]:
                 pollutant,
                 stage="detected",
                 value_column="used_blocks",
-                title="Bloques utilizables tras deteccion",
+                title="Segmentos utilizables tras deteccion",
                 subtitle=(
-                    f"Bloques efectivos por serie despues de aplicar {PLOT_STRATEGY}; "
+                    f"Segmentos efectivos por serie despues de aplicar {strategy}; "
                     "el prefijo anfitrion cuenta como train."
                 ),
-                xlabel="Numero de bloques efectivos",
+                xlabel="Numero de segmentos efectivos",
+                strategy=strategy,
             ),
         ),
         (
@@ -1048,12 +1095,13 @@ def render_plots(run_dir: Path) -> list[Path]:
                 pollutant,
                 stage="imputed",
                 value_column="used_blocks",
-                title="Bloques utilizables tras deteccion e imputacion",
+                title="Segmentos utilizables tras deteccion e imputacion",
                 subtitle=(
-                    f"Bloques efectivos por serie de {PLOT_STRATEGY}+impute; "
+                    f"Segmentos efectivos por serie de {strategy}+impute; "
                     "el prefijo anfitrion cuenta como train."
                 ),
-                xlabel="Numero de bloques efectivos",
+                xlabel="Numero de segmentos efectivos",
+                strategy=strategy,
             ),
         ),
         (
@@ -1069,10 +1117,10 @@ def render_plots(run_dir: Path) -> list[Path]:
         (
             "support_by_series.png",
             lambda p: _save_matrix(
-                p, series, value="valid_hours_pct_raw",
-                title="Cambio del soporte válido respecto a raw, por serie",
-                label="Porcentaje de raw", fmt=".0f", exclude_raw=True,
-                subtitle="Cada celda expresa horas válidas como porcentaje de raw: 100 conserva "
+                p, series, value="effective_hours_pct_raw",
+                title="Cambio del soporte efectivo respecto a raw, por serie",
+                label="Porcentaje de raw (horas efectivas)", fmt=".0f", exclude_raw=True,
+                subtitle="Cada celda expresa horas efectivas como porcentaje de raw: 100 conserva "
                 "el soporte, menos de 100 lo pierde y más de 100 lo amplía.",
                 pollutant=pollutant,
             ),
@@ -1081,10 +1129,10 @@ def render_plots(run_dir: Path) -> list[Path]:
             "valid_blocks_by_series.png",
             lambda p: _save_matrix(
                 p, series, value="valid_blocks",
-                title="Bloques válidos disponibles por serie y brazo",
-                label="Bloques", fmt=".0f",
-                subtitle="Cantidad absoluta de bloques que alcanzan el mínimo del protocolo; "
-                "el número de bloques no representa su longitud total.",
+                title="Segmentos válidos disponibles por serie y brazo",
+                label="Segmentos", fmt=".0f",
+                subtitle="Cantidad absoluta de segmentos que alcanzan el mínimo del protocolo; "
+                "el número de segmentos no representa su longitud total.",
                 pollutant=pollutant,
             ),
         ),
@@ -1110,7 +1158,10 @@ def render_plots(run_dir: Path) -> list[Path]:
     readme_path = run_dir / "README.md"
     existing = readme_path.read_text(encoding="utf-8") if readme_path.is_file() else ""
     base = existing.split("\n## Figuras\n", maxsplit=1)[0].rstrip()
-    readme_path.write_text(f"{base}\n\n{PLOT_GUIDE}", encoding="utf-8")
+    readme_path.write_text(
+        f"{base}\n\n{PLOT_GUIDE.replace(PLOT_STRATEGY, strategy)}",
+        encoding="utf-8",
+    )
     return written
 
 
@@ -1132,9 +1183,14 @@ def main() -> None:
         description="Renderiza el diagnostico raw/deteccion/imputacion"
     )
     parser.add_argument("run_dir", nargs="?", type=Path)
+    parser.add_argument(
+        "--strategy",
+        default=PLOT_STRATEGY,
+        help=f"Estrategia a representar (por defecto: {PLOT_STRATEGY}).",
+    )
     args = parser.parse_args()
     run_dir = args.run_dir or _latest_run()
-    paths = render_plots(run_dir)
+    paths = render_plots(run_dir, strategy=args.strategy)
     print(f"[info] {len(paths)} figuras escritas en {run_dir}")
 
 

@@ -378,7 +378,7 @@ def _summarize(series_summary: pd.DataFrame) -> pd.DataFrame:
 def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
     requirements = manifest["comparative_requirements"]
     lines = [
-        "# Soporte de bloques para forecasting",
+        "# Soporte de segmentos para forecasting",
         "",
         "El informe compara el mismo historial de train en tres estados: raw, ",
         "deteccion sin imputacion e imputacion real. No existe un brazo raw+impute.",
@@ -388,7 +388,7 @@ def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
     ]
     lines.append(
         f"- Horizonte {requirements['horizon_hours']} h, stride "
-        f"{requirements['stride_hours']} h: bloque valido >= "
+        f"{requirements['stride_hours']} h: segmento valido >= "
         f"{requirements['minimum_hours']} h; anfitrion de validacion >= "
         f"{requirements['host_minimum_hours']} h ({requirements['limiting_models']})."
     )
@@ -399,7 +399,7 @@ def _write_readme(path: Path, manifest: dict[str, Any]) -> None:
             "",
             "- `summary.csv`: comparacion agregada frente a raw.",
             "- `series_summary.csv`: soporte por serie y brazo.",
-            "- `blocks.csv`: bloques resultantes y elegibilidad del protocolo.",
+            "- `blocks.csv`: segmentos resultantes y elegibilidad del protocolo.",
             "- `gaps.csv`: origen, longitud, imputador asignado y resultado real de cada gap.",
             "- `detection.csv`: cobertura y tasa por estrategia.",
             "- `excluded_series.csv`: series sin test comun viable.",
