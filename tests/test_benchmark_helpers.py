@@ -422,6 +422,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
         "N_Target_Points",
         "N_Scored_Points",
         "Support_Fraction",
+        "Gap_Plan_ID",
         "Test_Start",
         "Test_End",
         "Test_Block_Points",
@@ -447,6 +448,7 @@ def test_execute_complete_pipeline_smoke_with_explicit_gap_spec() -> None:
     assert results_df.loc[0, "N_Target_Points"] == 2
     assert results_df.loc[0, "N_Scored_Points"] == 2
     assert results_df.loc[0, "Support_Fraction"] == 1.0
+    assert len(results_df.loc[0, "Gap_Plan_ID"]) == 64
 
     assert set(plot_store[2]) == {"series"}
     assert set(plot_store[2]["series"]["S"]) == {"actual", "preds", "naive_mase"}

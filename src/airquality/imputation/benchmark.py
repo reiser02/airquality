@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field  # Structured diagnostics for skipped gaps.
+import hashlib
 from typing import Any, Mapping, Sequence  # Typing utilities for flexible public API.
 
 import numpy as np  # Numeric operations for masks, metrics, and random sampling.
@@ -662,6 +663,10 @@ def _build_metric_row(
     # MAE and RMSE use the station's train-only standard scale. R2 is already
     # scale invariant. MASE and RMSSE retain their seasonal-naive scales.
     pooled_metrics = [m for m in metric_list if m in ("mae", "rmse", "r2")]
+    gap_plan_payload = ";".join(
+        ",".join(str(pd.Timestamp(timestamp).value) for timestamp in gap_index)
+        for gap_index in gap_windows
+    )
     row: dict[str, Any] = {
         "Modelo": str(model_name),
         "Serie": str(series_name),
@@ -678,6 +683,7 @@ def _build_metric_row(
             if n_target_points > 0
             else float("nan")
         ),
+        "Gap_Plan_ID": hashlib.sha256(gap_plan_payload.encode("ascii")).hexdigest(),
     }
 
     if pooled_metrics:
@@ -965,6 +971,7 @@ def execute_complete_pipeline(
         "N_Target_Points",
         "N_Scored_Points",
         "Support_Fraction",
+        "Gap_Plan_ID",
         "Test_Start",
         "Test_End",
         "Test_Block_Points",
