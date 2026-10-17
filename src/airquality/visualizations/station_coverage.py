@@ -28,6 +28,9 @@ from airquality.data.segments import observed_blocks
 
 DEFAULT_POLLUTANTS = ("NO2", "O3")
 POLLUTANT_COLORS = {"CO": SERIES_COLOR, "NO2": "#f28c38", "O3": "#5b8c8a"}
+REDUCED_EXCLUDED_STATIONS = frozenset(
+    {"Aquatec - Salitre", "Aquatec - San Juan"}
+)
 
 
 def _combined_station_name(station: str) -> str:
@@ -43,6 +46,20 @@ def _coverage_summary(series: pd.Series) -> tuple[pd.DataFrame, float]:
     blocks = observed_blocks(series)
     missing_pct = 100.0 * float(series.isna().mean()) if len(series) else 0.0
     return blocks, missing_pct
+
+
+def _representative_station_subset(station_names: list[str]) -> list[str]:
+    """Return a uniformly distributed subset containing about half the stations."""
+    if len(station_names) <= 2:
+        return station_names[:1]
+    target = max(1, len(station_names) // 2)
+    if target == 1:
+        return [station_names[len(station_names) // 2]]
+    indices = [
+        round(index * (len(station_names) - 1) / (target - 1))
+        for index in range(target)
+    ]
+    return [station_names[index] for index in indices]
 
 
 def save_station_coverage(
@@ -332,6 +349,8 @@ def save_comparison_station_coverage(
     output_path: str | Path,
     suppressed_by_pollutant: dict[str, list[tuple[str, pd.DataFrame]]],
     unsuppressed_by_pollutant: dict[str, list[tuple[str, pd.DataFrame]]],
+    *,
+    station_names: list[str] | None = None,
 ) -> Path:
     """Compare 5-minute coverage with and without frozen-value suppression.
 
@@ -359,7 +378,7 @@ def save_comparison_station_coverage(
         }
         for source, source_data in sources.items()
     }
-    station_names = sorted(
+    available_station_names = sorted(
         {
             station
             for source_map in station_maps.values()
@@ -367,6 +386,11 @@ def save_comparison_station_coverage(
             for station in source_map.get(pollutant, {})
         }
     )
+    station_names = [
+        station
+        for station in available_station_names
+        if station_names is None or station in station_names
+    ]
     if not station_names:
         raise ValueError("No hay estaciones que comparar")
 
@@ -587,6 +611,26 @@ def main() -> None:
         stations_without_freeze_filters,
     )
     print(f"Figura guardada en {path}")
+
+    reduced_path = save_comparison_station_coverage(
+        root / "reports" / "figures" / "Gantt-comparison-half.png",
+        stations_by_pollutant,
+        stations_without_freeze_filters,
+        station_names=[
+            station
+            for station in _representative_station_subset(
+                sorted(
+                    {
+                        _combined_station_name(station)
+                        for stations in stations_by_pollutant.values()
+                        for station, _ in stations
+                    }
+                )
+            )
+            if station not in REDUCED_EXCLUDED_STATIONS
+        ],
+    )
+    print(f"Figura reducida guardada en {reduced_path}")
 
 
 if __name__ == "__main__":
