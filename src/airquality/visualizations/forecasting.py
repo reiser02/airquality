@@ -29,7 +29,7 @@ matching ``raw`` arm (see ``airquality.forecasting.pipeline.METRIC_COLS``).
 - ``foundation_preprocessing_recovery_{mase,rmsse}.png`` — paired error recovered
   after preprocessing synthetic context anomalies, by model, strategy and type.
 - ``executive_branch_summary_{relmae,relrmse}.png`` — station-balanced branch
-  improvement vs ``raw`` with interquartile bands and practical win/tie/loss rates.
+  improvement vs ``raw`` with bootstrap intervals and practical win/tie/loss rates.
 - ``raw_model_ranking_{mase,rmsse}.png`` — all models ranked on the common ``raw``
   view; foundation training cost is treated as zero.
 - ``executive_model_arm_{mase,rmsse}.png`` — compact model×arm mean-error matrix.
@@ -69,6 +69,7 @@ from airquality.visualizations.anomaly import (
     TEXT_COLOR,
     style_axis,
 )
+from airquality.visualizations.style import FIGURE_DPI
 from airquality.forecasting.foundation_preprocessing import FOUNDATION_METRICS
 from airquality.forecasting.pipeline import METRIC_COLS, RAW_ARM
 
@@ -102,6 +103,7 @@ MODEL_MODE_COLORS = {
 }
 MODEL_MODE_MARKERS = {"trained": "o", "local": "s", "foundation": "*"}
 PRACTICAL_EQUIVALENCE_PCT = 1.0
+BOOTSTRAP_SAMPLES = 10_000
 
 #: Display names for the benchmark metrics.
 METRIC_LABELS = {
@@ -338,6 +340,24 @@ def _station_arm_scores(results_df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return panel.groupby(level="series", sort=False).mean()
 
 
+def _bootstrap_mean_interval(
+    values: np.ndarray,
+    *,
+    seed: int = 13,
+    samples: int = BOOTSTRAP_SAMPLES,
+) -> tuple[float, float]:
+    """Return a deterministic percentile bootstrap interval for the mean."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(values), size=(samples, len(values)))
+    means = values[indices].mean(axis=1)
+    low, high = np.quantile(means, (0.025, 0.975))
+    return float(low), float(high)
+
+
 def _quartile_interval(values: np.ndarray) -> tuple[float, float]:
     """Return the interquartile spread for a station-level distribution."""
     values = np.asarray(values, dtype=float)
@@ -378,7 +398,7 @@ def save_executive_branch_summary_plot(
         improvement = 100.0 * (raw[valid] - values[valid]) / raw[valid]
         if improvement.size == 0:
             continue
-        low, high = _quartile_interval(improvement)
+        low, high = _bootstrap_mean_interval(improvement, seed=13 + index)
         rows.append(
             {
                 "arm": arm,
@@ -415,7 +435,7 @@ def save_executive_branch_summary_plot(
         figure,
         f"Resumen ejecutivo de ramas — {metric_name}",
         f"{metric_definition}. Positivo = mejora frente a raw.\n"
-        f"Banda = intervalo intercuartílico por estación; empate práctico = ±{PRACTICAL_EQUIVALENCE_PCT:g}%.",
+        f"IC 95% bootstrap por estación; empate práctico = ±{PRACTICAL_EQUIVALENCE_PCT:g}%.",
     )
     y = np.arange(len(summary))
 
@@ -491,7 +511,7 @@ def save_executive_branch_summary_plot(
     outcome_axis.legend(loc="lower center", bbox_to_anchor=(0.5, -0.16), ncols=3, fontsize=8)
 
     figure.tight_layout(rect=(0, 0.12, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -601,7 +621,7 @@ def save_raw_model_ranking_plot(
         fontsize=8,
     )
     figure.tight_layout(rect=(0, 0, 0.79, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -657,7 +677,7 @@ def save_executive_model_arm_plot(
     colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
     colorbar.set_label(f"{_metric_label(metric)} medio")
     figure.tight_layout(rect=(0, 0, 1, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -775,7 +795,7 @@ def save_executive_imputation_plot(
         fontsize=8,
     )
     figure.tight_layout(rect=(0, 0, 0.88, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -894,7 +914,7 @@ def save_executive_cost_accuracy_plot(
         fontsize=8,
     )
     figure.tight_layout(rect=(0, 0.11, 1, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -992,7 +1012,7 @@ def _save_arm_dot_plot(
     )
     height = float(figure.get_size_inches()[1])
     figure.tight_layout(rect=(0, 0.55 / height, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(figure)
     return True
 
@@ -1077,7 +1097,7 @@ def save_train_time_plot(output_path: Path, results_df: pd.DataFrame) -> bool:
         axis.set_xlim(left=0)
     axis.legend(loc="upper right", fontsize=8)
     figure.tight_layout(rect=(0, 0, 1, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -1174,7 +1194,7 @@ def _save_time_vs_error_plot(
     ]
     axis.legend(handles=handles, loc="best", fontsize=8, ncols=2)
     figure.tight_layout(rect=(0, 0, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(figure)
     return True
 
@@ -1267,7 +1287,7 @@ def save_train_time_vs_error_plot(
         )
 
     figure.canvas.draw()
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -1344,7 +1364,7 @@ def save_improvement_heatmap(output_path: Path, results_df: pd.DataFrame, metric
         bar = figure.colorbar(mesh, ax=axes[0].tolist(), fraction=0.04, pad=0.02)
         bar.set_label("% mejora vs raw", color=TEXT_COLOR, fontsize=9)
         bar.ax.tick_params(labelsize=8, colors=TEXT_COLOR)
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
@@ -1435,7 +1455,7 @@ def save_detector_selection_plot(output_path: Path, detection_df: pd.DataFrame) 
     )
     height = float(figure.get_size_inches()[1])
     figure.tight_layout(rect=(0, 0.55 / height, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(figure)
     return True
 
@@ -1501,7 +1521,7 @@ def save_imputation_effect_plot(
     axis.legend(handles=handles, loc="upper left", fontsize=8, ncols=2,
                 bbox_to_anchor=(0.0, 0.93))
     figure.tight_layout(rect=(0, 0, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(figure)
     return True
 
@@ -1575,7 +1595,7 @@ def save_foundation_preprocessing_plot(
     colorbar = figure.colorbar(image, ax=axis, fraction=0.025, pad=0.02)
     colorbar.set_label("Error recuperado")
     figure.tight_layout(rect=(0, 0, 1, top))
-    figure.savefig(output_path, dpi=150)
+    figure.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(figure)
     return True
 
@@ -1680,7 +1700,7 @@ def save_foundation_anomaly_robustness_plot(
         fontsize=8,
     )
     figure.tight_layout(rect=(0, 0.09, 1, top))
-    figure.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=FIGURE_FACE)
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight", facecolor=FIGURE_FACE)
     plt.close(figure)
     return True
 
