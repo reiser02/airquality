@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "Si utilizas este código, desarrollado como parte de un Trabajo de Fin de Grado, cítalo con los metadatos de este archivo."
+type: software
+title: >-
+  Código del TFG: Preprocesamiento de datos avanzado para la mejora de la
+  predicción de contaminación atmosférica en ciudades inteligentes
+authors:
+  - family-names: "Fernández García"
+    given-names: "Daniel"
+    affiliation: "Universidad Politécnica de Cartagena"
+abstract: >-
+  Software desarrollado para el Trabajo de Fin de Grado «Preprocesamiento de
+  datos avanzado para la mejora de la predicción de contaminación atmosférica
+  en ciudades inteligentes», del Grado en Ciencia e Ingeniería de Datos de la
+  Universidad Politécnica de Cartagena. Incluye la preparación de series
+  temporales de calidad del aire y la evaluación de métodos de detección de
+  anomalías, imputación de datos ausentes y predicción.
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/reiser02/airquality"
