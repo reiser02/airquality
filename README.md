@@ -1,6 +1,6 @@
 ## Air Quality Time-Series Benchmark
 
-This repository trains forecasting models on air-quality sensor series, evaluates gap-imputation performance, and supports fine-tuning IBM Granite TSPulse on the same data.
+This repository trains forecasting models on air-quality sensor series, benchmarks gap imputation and anomaly detection, runs a multi-arm forecasting benchmark, and supports fine-tuning IBM Granite TSPulse on the same data.
 
 The installable distribution is named `airquality-benchmark`; its Python package remains `airquality`.
 
@@ -8,6 +8,8 @@ The code is organized as a Python package under `src/airquality`, with config-dr
 
 - training Darts global forecasting models
 - running Monte Carlo imputation benchmarks
+- benchmarking anomaly detectors in unlabeled or synthetic-injection modes
+- comparing forecasting arms with anomaly removal and gap-size imputation policies
 - scraping raw station measurements
 - fine-tuning TSPulse for reconstruction/imputation
 
@@ -44,23 +46,27 @@ uv sync
 - `reports/`: benchmark outputs and training metrics
 - `tests/`: pytest coverage for config, loaders, training, benchmark helpers, and CLIs
 - `notebooks/`: exploratory notebooks
-- `docs/`: extra project documentation if present
+- `docs/`: project protocol and catalog documentation when present locally
 
 ### Main Python modules
 
 - `src/airquality/config.py`: loads config files and exposes typed helpers such as `cfg_get_int()` and `cfg_get_csv_list()`.
 - `src/airquality/train.py`: zero-argument training entrypoint. Reads config, loads data, builds a training bundle, and trains configured Darts models.
 - `src/airquality/benchmark.py`: zero-argument Monte Carlo benchmark entrypoint. Runs imputation evaluation and saves CSV summaries and plot images.
+- `src/airquality/anomaly/`: anomaly-detector registry, benchmark modes, ensemble logic, and anomaly metrics.
+- `src/airquality/forecasting/pipeline.py`: multi-arm forecasting benchmark combining detection, cleaning, imputation, and rolling backtests.
 - `src/airquality/data/fetch.py`: scraper for Cartagena air-quality API data. Saves per-station pollutant CSV files.
 - `src/airquality/data/io.py`: shared data loading, normalization, warning control, and device helpers.
 - `src/airquality/data/loaders.py`: file discovery and low-level CSV/JSON loading.
-- `src/airquality/data/segments.py`: utilities for finding continuous segments, including the held-out longest segment used in evaluation.
+- `src/airquality/data/holdout.py`: station-local retrospective holdout selection and exclusion manifests.
+- `src/airquality/data/segments.py`: utilities for finding continuous observed segments without crossing gaps.
 - `src/airquality/modeling/training.py`: dataset preparation and model training helpers.
 - `src/airquality/modeling/training_config.py`: model configuration and trainer settings for Darts models.
 - `src/airquality/imputation/benchmark.py`: imputation logic and TSPulse integration helpers.
 - `src/airquality/imputation/run_benchmark.py`: high-level orchestration for loading trained models and executing the benchmark pipeline.
 - `src/airquality/imputation/tspulse_finetune.py`: argparse-based CLI for fine-tuning TSPulse on the repository dataset.
-- `src/airquality/visualization/plotting.py`: plotting helpers used by visualization tests and analysis.
+- `src/airquality/visualizations/`: Matplotlib figure builders and rendering CLIs for all benchmark reports.
+- `src/airquality/run_logging.py`: persistent `benchmark.log` setup for long-running benchmark runs.
 
 ## Configuration
 
@@ -87,13 +93,30 @@ Controls where series are loaded from and their shared time-series schema.
 - `freq`: sampling frequency, default `h`
 - `timestamp_column`: datetime column name
 
+#### `[synthetic]`
+
+Controls the anomaly profile used by synthetic benchmark injections. The current
+`injection_variant` is `combined`; supported profiles include `spikes`, `scale`,
+`noise`, and `drift`.
+
+#### `[anomaly]`
+
+Controls the standalone anomaly benchmark.
+
+- `mode`: `unlabeled` (default) screens detectors by their real-series detection rate; `synthetic` evaluates against injected anomalies
+- `models`, `device`, `seed`, and `carla_stride`: detector selection and execution settings
+- `threshold_k`: median-plus-MAD score threshold multiplier
+- `max_detection_rate`: unlabeled-mode per-station detector-rate limit, currently `0.07`
+- `eval_seed`, `ensemble_top_k`, and `min_series_points`: synthetic evaluation and segment settings
+
 #### `[benchmark]`
 
 Controls shared split sizes and direct imputation benchmark behavior.
 
-- `size_k`: forecast/imputation horizon used by the benchmark helpers
+- `size_k`: output length used by trained Darts artifacts and direct imputation; the forecasting rolling horizon is `[forecasting] horizon`
 - `gap_sizes`: synthetic missing-gap sizes
-- `num_gaps`: number of gaps injected per series
+- `gap_counts`: current per-size gap counts; with the shared config this balances 30 hidden points per condition
+- `num_gaps`: fallback number of gaps per series and gap size when `gap_counts` is empty
 - `gap_strategy`: gap placement strategy
 - `metrics`: evaluation metrics such as `mae`, `rmse`, `mase`, and `rmsse`
 - `random_seed`: benchmark seed
@@ -115,11 +138,24 @@ limitations, is documented in
 
 #### `[forecasting]`
 
-Forecasting keeps one `<strategy>+impute` arm, but can select a different
-imputation model for each contiguous gap size through inclusive rules:
+Controls the multi-arm forecasting benchmark. `raw` and `raw+frozen` are always
+included. With the current configuration, each of the four strategies has an
+`+impute` and a `+noimpute` arm because `imputation = both`:
+
+- `unlabeled`: rate-filtered consensus used by the production path
+- `inject-best`: best detector selected by synthetic-injection VUS-PR
+- `inject-vote`: ranked hard vote, currently 2 of the top 3 detectors
+- `inject-soft`: mean of the top three station-normalized detector scores
+
+The benchmark uses a fixed common test window, while each arm has its own
+training and validation values. Detection runs over the complete primary series
+before the common test is selected. Foundation models are evaluated only on the
+`raw` and `raw+frozen` source views; they do not create detection-training arms.
+
+Imputation selects a model for each contiguous gap size through inclusive rules:
 
 ```ini
-imputation_gap_rules = 1=LinearInterp;2-5=TSPulse;6-10=TSPulse_FineTuned
+imputation_gap_rules = 1-5=interp;6-10=TSPulse
 ```
 
 Rules use `size` or `min-max` on the left and an imputer registry name on the
@@ -128,12 +164,15 @@ points on the hourly grid; gaps without a matching rule remain `NaN`. If a
 selected model returns missing predictions, only those selected points use the
 existing seasonal interpolation safety net.
 
-`imputation_gap_rules` is required. The separate foundation-context experiment
-applies the same rules when its first prediction fails because the context
-contains missing values. Gap diagnostics report `fallback_used` and
+`imputation_gap_rules` is required. The separate paired foundation-context
+experiment applies the same rules when its first prediction fails because the
+context contains missing values. Gap diagnostics report `fallback_used` and
 `effective_imputer`; the latter is built dynamically from whichever configured
-model actually supplied values, including mixed results such as
-`TSPulse+interp`.
+model supplied values, including mixed results such as `TSPulse+interp`.
+
+`forecast_models` may contain the trained Darts catalog plus the forecasting-only
+`AutoARIMA`, `AutoETS`, `Chronos2`, `TimesFM2p5`, and `PatchTSTFM` models. These
+forecasting-only names are not part of the imputation artifact catalog.
 
 #### `[tspulse]`
 
@@ -178,6 +217,40 @@ Key assumptions in the loaders:
 - each workflow expects a loaded station to become a single-column time series
 
 ## Main Workflows
+
+### Benchmark anomaly detectors
+
+Run the standalone detector benchmark:
+
+```bash
+uv run python -m airquality.anomaly.run
+```
+
+The default `unlabeled` mode scores the real series, binarizes scores with a
+median-plus-MAD threshold, and discards detectors whose station-level detection
+rate exceeds `max_detection_rate`. The `synthetic` mode injects anomalies into
+real segments and reports coverage-adjusted VUS-PR metrics. Select it explicitly
+with:
+
+```bash
+uv run python -m airquality.anomaly.run --mode synthetic
+```
+
+Runs are written to `reports/anomaly/<pollutant>_YYYYMMDD_HHMMSS/` and contain:
+
+- `results.json`: benchmark configuration and detector summaries
+- `scores.npz`: persisted detector scores and evaluation arrays
+- `benchmark.log`: persistent run log
+
+Render figures separately from a saved run:
+
+```bash
+uv run python -m airquality.visualizations.anomaly_benchmark \
+  reports/anomaly/NO2_YYYYMMDD_HHMMSS/results.json
+```
+
+The figure set follows the mode: detection-rate plots for `unlabeled`, and
+VUS-PR plus coverage diagnostics for `synthetic`.
 
 ### Generate data-block reports
 
@@ -266,6 +339,7 @@ The persisted report contains:
 - `detection.csv`: coverage and anomaly rate per strategy
 - `excluded_series.csv`: stations without a viable common test and training host
 - `manifest.json` and `README.md`: effective protocol and artifact guide
+- `benchmark.log`: persistent analysis log
 
 Render all figures without rerunning detection or imputation:
 
@@ -300,7 +374,8 @@ uv run python -m airquality.train
 What it does:
 
 - loads the configured dataset
-- finds the longest held-out segment
+- selects one fixed retrospective holdout per eligible station
+- records stations excluded when no holdout and training host satisfy the protocol
 - builds train/validation bundles
 - trains the configured Darts models from `training.model_names`
 
@@ -308,6 +383,45 @@ Outputs:
 
 - model checkpoints under `models/{ModelName}_k{size_k}.pt`
 - appended training metrics in `reports/metrics/training_curves_and_times.csv` unless disabled in code/config flow
+- `models/imputation_holdout_manifest.json`, `models/imputation_holdouts.csv`, and `models/imputation_excluded_series.csv`
+
+### Run the multi-arm forecasting benchmark
+
+This uses `src/airquality/forecasting/pipeline.py` and reads the `[forecasting]`
+configuration:
+
+```bash
+uv run python -m airquality.forecasting.pipeline
+```
+
+The current configuration compares `raw`, `raw+frozen`, and two variants for
+each of `unlabeled`, `inject-best`, `inject-vote`, and `inject-soft`. The common
+test timestamps are selected after masking the union of anomaly flags; each arm
+then uses its own training and validation values. Rolling forecasts use
+`forecasting.horizon`, `forecasting.stride`, and `forecasting.validation_len`.
+
+The run directory is `reports/forecasting/YYYYMMDD_HHMMSS/` and contains:
+
+- `results.csv`: one aggregated row per series, arm, and model; rolling origin and
+  target counts are stored in the coverage columns
+- `summary.csv`: arm summaries and deltas against `raw`
+- `detection.csv` and `selection.csv`: detector and common-holdout diagnostics
+- `excluded_series.csv`: stations without a viable common test and training host
+- `foundation_preprocessing_results.csv` and `foundation_preprocessing_summary.csv`: paired foundation-context experiment outputs
+- `manifest.json`: effective protocol, models, arms, and failures
+- `benchmark.log`: persistent run log
+
+Render figures without rerunning detection or backtests:
+
+```bash
+uv run python -m airquality.visualizations.forecasting \
+  reports/forecasting/YYYYMMDD_HHMMSS
+```
+
+The forecasting cache is enabled by default at `reports/forecasting/cache`.
+Interrupted runs resume from cached detections and backtests; relevant data,
+configuration, artifact, or transform changes invalidate affected entries.
+Delete that directory to force a full recomputation.
 
 ### Run the Monte Carlo imputation benchmark
 
@@ -343,7 +457,10 @@ Typical files inside that directory:
 - `results_mc.csv`: raw benchmark results
 - `summary_mc.csv`: aggregated summary metrics
 - `ranking_by_seed.csv`: seed-level ranking output
+- `holdout_coverage.csv`: selected test block and available train-side support per station
 - `excluded_series.csv`: stations omitted because they cannot satisfy the fixed holdout protocol, with the reason and observed support
+- `benchmark.log`: persistent run log, including failures and interruptions
+- `metrics_by_gap.png`: aggregate metric view by gap size
 - `model_performance_by_gap_{mae,rmse,mase,rmsse,r2}.png`: metric value, mean rank, and top-three frequency for every gap size
 - `overall_model_performance_{mae,rmse,mase,rmsse,r2}.png`: compact global scorecards
 - `global_station_error_{mae,rmse,mase,rmsse,r2}.png`: distributions of gap-averaged metric values across stations
@@ -351,7 +468,7 @@ Typical files inside that directory:
 - `gap_degradation_{mae,rmse,mase,rmsse}.png`: relative degradation from each model's shortest gap
 - `tail_risk_{mae,rmse,mase,rmsse}.png`: mean error versus the hardest 10% of stations
 - `error_correlation_{mae,rmse,mase,rmsse,r2}.png`: similarity of station-level metric patterns between models
-- `model_performance_by_gap.csv`, `overall_model_performance.csv`, and the corresponding diagnostic CSVs: data behind the summaries
+- `model_performance_by_gap.csv`, `overall_model_performance.csv`, and diagnostic CSVs (`global_rank_summary.csv`, `global_rank_frequencies.csv`, `global_performance_profiles.csv`, `global_station_errors.csv`, `pairwise_win_rates.csv`, `gap_degradation.csv`, `tail_risk.csv`, `error_correlations.csv`): data behind the summaries
 - `plot_store.csv.gz`: compressed actual values and per-model predictions used by the plots
 - `plot_images.csv`: manifest of saved plot images
 - `plots/gap_*/...png`: per-series benchmark plots
@@ -395,10 +512,21 @@ uv run python -m airquality.imputation.latex_tables \
 
 The tables are written to `<run_dir>/latex_tables/`. The standard deviation is
 computed over station-level means after averaging Monte Carlo seeds. The
-per-series `plots/gap_*/` figures show the temporal context and a horizontal
-boxplot of pointwise absolute errors for every model. The boxplot reports the
-interquartile range, median, mean, and outliers for one representative seed,
-avoiding overlapping prediction lines for short gaps.
+per-series `plots/gap_*/` figures show temporal context from the first Monte
+Carlo execution and a horizontal MASE boxplot aggregated over seeds. Each gap
+directory also contains `media_estaciones.png`, which summarizes station-level
+mean MASE.
+
+To render only the imputation cost figures from a saved results CSV:
+
+```bash
+uv run python -m airquality.visualizations.imputation \
+  reports/benchmark/montecarlo_YYYYMMDD_HHMMSS/results_mc.csv \
+  --darts-train-csv reports/metrics/training_curves_and_times.csv
+```
+
+This writes `imputation_time_by_model.png` and
+`imputation_time_vs_<metric>.png` next to the results CSV.
 
 ### Fine-tune TSPulse
 
@@ -421,8 +549,12 @@ What it does:
 - discovers configured CSV files
 - loads and filters valid series
 - builds a long-format train/validation dataset
-- masks the held-out longest segment to avoid leakage
+- masks one fixed retrospective holdout per eligible station to avoid leakage
 - fine-tunes TSPulse and writes artifacts to `tspulse.output_dir`
+
+Each fine-tuning run stores the model and preprocessor under a directory such as
+`models/tspulse_finetune/airquality_tspulse_ft_var_hybrid_0.7/`, together with
+`holdout_manifest.json`, `holdouts.csv`, and `excluded_series.csv`.
 
 Notes:
 
@@ -440,7 +572,7 @@ uv run python -m airquality.data.fetch
 Options:
 
 ```bash
-uv run python -m airquality.data.fetch --query hourly --pollutants CO NO2 PM10 O3 PM1 PM2.5 --start-date 2026-06-12 --output-dir data/raw/datos_estaciones
+uv run python -m airquality.data.fetch --query 5min --pollutants CO NO2 PM10 O3 PM1 PM2.5 --start-date 2024-01-01 --output-dir data/raw/datos_estaciones_5m
 ```
 
 What it does:
@@ -450,7 +582,7 @@ What it does:
 - fetches `CO`, `NO2`, `PM10`, and `O3` by default
 - can fetch hourly SQL averages with `--query hourly`
 - accepts pollutant lists with `--pollutants`; `PM2.5` and `PM2_5` are normalized to `PM25`
-- saves per-station CSV files under `datos_estaciones/` by default
+- saves per-station CSV files under `datos_estaciones/` by default; use `data/raw/datos_estaciones_5m` for the main workflows
 - accepts `--output-dir` to select another destination
 
 Stations are still defined inside the module; use CLI args for query mode, pollutant lists, the start date, and the output directory.
@@ -471,9 +603,11 @@ Useful lower-level modules:
 
 - `airquality.data.io.load_and_normalize_series()` for loading configured datasets
 - `airquality.data.fetch.ejecutar_scraper(contaminantes=[...], fecha_inicio=..., query="hourly", output_dir=...)` for scraping from Python
-- `airquality.data.segments.get_longest_segment()` for the held-out block selection
+- `airquality.data.holdout.select_retrospective_holdouts_with_exclusions()` for station-local holdouts and exclusion details
 - `airquality.modeling.training.build_training_dataset_bundle()` for train/validation construction
 - `airquality.imputation.run_benchmark.run_imputation_benchmark_parallel()` for direct benchmark orchestration
+- `airquality.anomaly.benchmark.run_benchmark()` for the anomaly benchmark
+- `airquality.forecasting.pipeline.run_benchmark_from_config()` for the forecasting benchmark
 
 ## Testing
 
@@ -502,12 +636,19 @@ Useful test areas:
 - `tests/test_training_pipeline_helpers.py`: training helpers
 - `tests/test_run_imputation_helpers.py`: benchmark orchestration helpers
 - `tests/test_config.py` and `tests/test_config_helpers.py`: config precedence and helper behavior
+- `tests/test_anomaly_benchmark.py`: anomaly benchmark modes and metrics
+- `tests/test_forecasting_pipeline.py`, `tests/test_forecasting_detection.py`, and `tests/test_foundation_preprocessing.py`: forecasting arms, detection, and foundation preprocessing
+- `tests/test_forecasting_cache.py`, `tests/test_forecasting_progress.py`, and `tests/test_run_logging.py`: cache, progress, and persistent logs
+- `tests/test_data_block_support_analysis.py` and `tests/test_retro_holdout.py`: support reports and retrospective holdout exclusions
 
 ## Important Project Behaviors
 
 - Tests import code from `src/` via `tests/conftest.py`; they do not require an editable install.
 - Darts model configs may default to GPU or mixed precision, but runtime device helpers fall back to CPU if CUDA is unavailable.
 - Benchmark loading expects trained Darts checkpoints to follow the naming convention `models/{ModelName}_k{size_k}.pt`.
+- Missing timestamps and `NaN` values delimit observed segments; workflows do not drop them and concatenate across temporal gaps.
+- Training and direct imputation use one fixed retrospective holdout per eligible station. Stations without a valid holdout and training host are reported in exclusion CSVs.
+- Forecasting compares preprocessing arms against matching `raw` results; `raw` is the reference, not a model baseline.
 - The repository contains runtime artifacts such as `models/`, `reports/`, `lightning_logs/`, and `__pycache__/`; avoid treating those as source files when navigating the project.
 
 ## Quick Start
@@ -517,5 +658,7 @@ If you already have processed data in the expected location:
 1. Install dependencies with `uv sync`.
 2. Review `config/pipeline.cfg` and update data paths or model settings.
 3. Train models with `uv run python -m airquality.train`.
-4. Run the benchmark with `uv run python -m airquality.benchmark`.
-5. Inspect outputs in `models/` and `reports/benchmark/`.
+4. Run the imputation benchmark with `uv run python -m airquality.benchmark`.
+5. Run the anomaly benchmark with `uv run python -m airquality.anomaly.run`.
+6. Run the forecasting benchmark with `uv run python -m airquality.forecasting.pipeline`.
+7. Inspect outputs in `models/` and the timestamped directories under `reports/`.
