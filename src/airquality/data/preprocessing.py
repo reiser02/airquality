@@ -31,6 +31,7 @@ DETECTION_LIMITS = {
     "CO": 0.0,
     "NO2": 0.0,
     "O3": 0.0,
+    "PM25": 0.0,
 }
 
 RAW_FREQ = "5min"

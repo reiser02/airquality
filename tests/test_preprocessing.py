@@ -120,7 +120,7 @@ def test_preprocess_can_keep_frozen_and_repeated_hourly_values() -> None:
 
 
 def test_detection_limits_present() -> None:
-    assert set(DETECTION_LIMITS) == {"CO", "NO2", "O3"}
+    assert set(DETECTION_LIMITS) == {"CO", "NO2", "O3", "PM25"}
 
 
 # --- frozen_mask (ramas extra) ------------------------------------------

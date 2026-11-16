@@ -26,8 +26,13 @@ from airquality.data.preprocessing import preprocess
 from airquality.data.segments import observed_blocks
 
 
-DEFAULT_POLLUTANTS = ("NO2", "O3")
-POLLUTANT_COLORS = {"CO": SERIES_COLOR, "NO2": "#f28c38", "O3": "#5b8c8a"}
+DEFAULT_POLLUTANTS = ("NO2", "O3", "PM25")
+POLLUTANT_COLORS = {
+    "CO": SERIES_COLOR,
+    "NO2": "#f28c38",
+    "O3": "#5b8c8a",
+    "PM25": "#7b61a8",
+}
 REDUCED_EXCLUDED_STATIONS = frozenset(
     {"Aquatec - Salitre", "Aquatec - San Juan"}
 )
